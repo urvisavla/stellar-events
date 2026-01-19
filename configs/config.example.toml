@@ -1,0 +1,91 @@
+# Stellar Events Configuration
+# Copy this file to stellar-events.toml or config.toml and modify as needed
+
+# =============================================================================
+# Source Data
+# =============================================================================
+[source]
+# Path to ledger chunk files
+ledger_dir = "./data/ledgers"
+
+# Network: "mainnet", "testnet", or custom passphrase
+network = "mainnet"
+
+# =============================================================================
+# Storage
+# =============================================================================
+[storage]
+# Path to RocksDB database
+db_path = "./rocksdb/events"
+
+# =============================================================================
+# RocksDB Tuning (optional - defaults shown)
+# =============================================================================
+[storage.rocksdb]
+# --- Write Performance ---
+# Memtable size in MB (larger = better write throughput, more memory)
+write_buffer_size_mb = 256
+
+# Number of memtables to keep in memory
+max_write_buffer_number = 4
+
+# Minimum memtables to merge before flushing (reduces write amplification)
+min_write_buffer_number_to_merge = 2
+
+# --- Read Performance ---
+# Block cache size in MB (larger = better read performance for hot data)
+block_cache_size_mb = 512
+
+# Bloom filter bits per key (10 is good balance, 0 to disable)
+bloom_filter_bits_per_key = 10
+
+# Cache index and filter blocks in block cache
+cache_index_and_filter_blocks = true
+
+# --- Background Jobs ---
+# Parallel background threads for flushing memtables
+max_background_jobs = 8
+
+# --- Compression ---
+# Compression algorithm: "none", "snappy", "lz4", "zstd"
+compression = "lz4"
+
+# Compression for bottommost level (oldest data, read less frequently)
+bottommost_compression = "zstd"
+
+# --- WAL (Write-Ahead Log) ---
+# Disable WAL for faster bulk ingestion
+# Safe for bulk ingestion since data can be re-ingested from source if crash occurs
+disable_wal = true
+
+# --- Auto Compaction ---
+# Disable background compaction during ingestion for maximum write throughput
+# Use with final_compaction = true to compact after ingestion completes
+disable_auto_compaction = true
+
+# =============================================================================
+# Ingestion
+# =============================================================================
+[ingestion]
+# Progress file for tracking ingestion (optional)
+# Enables resume capability
+progress_file = "./progress.json"
+
+# Run manual compaction after ingestion completes
+# Optimizes database for reads, reclaims space
+# Set to false for faster ingestion if you plan to compact later
+final_compaction = false
+
+# Ledgers between progress snapshots (for trend analysis)
+# Lower values = more granular data, slightly more overhead
+snapshot_interval = 1000
+
+# =============================================================================
+# Indexes
+# =============================================================================
+[indexes]
+# Secondary indexes to create (improves query performance)
+contract_id = true
+transaction_hash = true
+event_type = true
+topics = true  # Enables topic0, topic1, topic2, topic3 indexes
