@@ -128,7 +128,13 @@ type Tracker struct {
 
 	// Timing tracking for current period
 	periodReadTime  time.Duration
+	periodParseTime time.Duration
 	periodWriteTime time.Duration
+
+	// Cumulative timing totals
+	totalReadTime  time.Duration
+	totalParseTime time.Duration
+	totalWriteTime time.Duration
 
 	// Raw data tracking
 	totalRawBytes int64
@@ -174,18 +180,49 @@ func (t *Tracker) SetStatsProvider(provider StatsProvider) {
 	t.statsProvider = provider
 }
 
-// AddReadTime adds to the read time for the current period
+// AddReadTime adds to the disk read time for the current period and cumulative total
 func (t *Tracker) AddReadTime(d time.Duration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.periodReadTime += d
+	t.totalReadTime += d
 }
 
-// AddWriteTime adds to the write time for the current period
+// AddParseTime adds to the XDR parse time for the current period and cumulative total
+func (t *Tracker) AddParseTime(d time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.periodParseTime += d
+	t.totalParseTime += d
+}
+
+// AddWriteTime adds to the write time for the current period and cumulative total
 func (t *Tracker) AddWriteTime(d time.Duration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.periodWriteTime += d
+	t.totalWriteTime += d
+}
+
+// GetTotalReadTime returns the cumulative disk read time
+func (t *Tracker) GetTotalReadTime() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.totalReadTime
+}
+
+// GetTotalParseTime returns the cumulative XDR parse time
+func (t *Tracker) GetTotalParseTime() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.totalParseTime
+}
+
+// GetTotalWriteTime returns the cumulative write time
+func (t *Tracker) GetTotalWriteTime() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.totalWriteTime
 }
 
 // AddRawBytes adds to the total raw data bytes
@@ -194,21 +231,6 @@ func (t *Tracker) AddRawBytes(bytes int64) {
 	defer t.mu.Unlock()
 	t.totalRawBytes += bytes
 	t.progress.RawDataBytes = t.totalRawBytes
-}
-
-// LoadProgress loads progress from a checkpoint file
-func LoadProgress(filePath string) (*IngestionProgress, error) {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read progress file: %w", err)
-	}
-
-	var progress IngestionProgress
-	if err := json.Unmarshal(data, &progress); err != nil {
-		return nil, fmt.Errorf("failed to parse progress file: %w", err)
-	}
-
-	return &progress, nil
 }
 
 // Start begins periodic progress file updates

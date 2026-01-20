@@ -61,9 +61,16 @@ type RocksDBConfig struct {
 
 // IngestionConfig contains ingestion settings
 type IngestionConfig struct {
-	ProgressFile     string `toml:"progress_file"`
-	FinalCompaction  bool   `toml:"final_compaction"`  // Run manual compaction after ingestion (default: true)
-	SnapshotInterval int    `toml:"snapshot_interval"` // Ledgers between progress snapshots (default: 1000000)
+	ProgressFile      string `toml:"progress_file"`
+	FinalCompaction   bool   `toml:"final_compaction"`    // Run manual compaction after ingestion (default: true)
+	ComputeStats      bool   `toml:"compute_stats"`       // Compute event stats after ingestion (default: false)
+	MaintainUniqueIdx bool   `toml:"maintain_unique_idx"` // Maintain unique indexes during ingestion (default: false)
+	SnapshotInterval  int    `toml:"snapshot_interval"`   // Ledgers between progress snapshots (default: 1000000)
+
+	// Parallelism settings
+	Workers   int `toml:"workers"`    // Number of parallel workers (default: number of CPUs)
+	BatchSize int `toml:"batch_size"` // Ledgers to batch before writing (default: 100)
+	QueueSize int `toml:"queue_size"` // Channel buffer size for pipeline (default: workers * 2)
 }
 
 // IndexConfig contains index settings
@@ -95,7 +102,7 @@ func DefaultConfig() *Config {
 				// Background jobs
 				MaxBackgroundJobs: 4,
 				// Compression
-				Compression:           "lz4",
+				Compression:           "zstd",
 				BottommostCompression: "zstd",
 				// WAL
 				DisableWAL: false,
@@ -104,9 +111,14 @@ func DefaultConfig() *Config {
 			},
 		},
 		Ingestion: IngestionConfig{
-			ProgressFile:     "",
-			FinalCompaction:  true,
-			SnapshotInterval: 1000000,
+			ProgressFile:      "",
+			FinalCompaction:   true,
+			ComputeStats:      false, // Disabled by default (slow operation)
+			MaintainUniqueIdx: false, // Disabled by default (adds XDR parsing overhead)
+			SnapshotInterval:  1000000,
+			Workers:           0, // 0 means use runtime.NumCPU()
+			BatchSize:         100,
+			QueueSize:         0, // 0 means workers * 2
 		},
 		Indexes: IndexConfig{
 			ContractID:      true,
@@ -180,13 +192,4 @@ func FindConfigFile() (string, error) {
 	}
 
 	return "", fmt.Errorf("config file not found. Create config.toml")
-}
-
-// Print prints the loaded configuration
-func (c *Config) Print() {
-	fmt.Fprintf(os.Stderr, "Configuration:\n")
-	fmt.Fprintf(os.Stderr, "  source.ledger_dir:    %s\n", c.Source.LedgerDir)
-	fmt.Fprintf(os.Stderr, "  source.network:       %s\n", c.Source.Network)
-	fmt.Fprintf(os.Stderr, "  storage.db_path:      %s\n", c.Storage.DBPath)
-	fmt.Fprintf(os.Stderr, "\n")
 }

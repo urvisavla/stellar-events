@@ -66,12 +66,28 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 				return nil, fmt.Errorf("failed to marshal event XDR: %w", err)
 			}
 
+			// Extract contract ID and topics for indexing (avoids re-parsing later)
+			var contractID []byte
+			var topics [][]byte
+			if event.Event.ContractId != nil {
+				contractID = event.Event.ContractId[:]
+			}
+			if event.Event.Body.V == 0 {
+				body := event.Event.Body.MustV0()
+				for _, topic := range body.Topics {
+					topicBytes, _ := topic.MarshalBinary()
+					topics = append(topics, topicBytes)
+				}
+			}
+
 			events = append(events, &store.MinimalEvent{
 				LedgerSequence:   ledgerSeq,
 				TransactionIndex: uint16(tx.Index),
 				OperationIndex:   0, // Transaction-level events have no operation
 				EventIndex:       uint16(eventIndex),
 				RawXDR:           rawXDR,
+				ContractID:       contractID,
+				Topics:           topics,
 			})
 		}
 
@@ -88,12 +104,28 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 					return nil, fmt.Errorf("failed to marshal event XDR: %w", err)
 				}
 
+				// Extract contract ID and topics for indexing (avoids re-parsing later)
+				var contractID []byte
+				var topics [][]byte
+				if event.ContractId != nil {
+					contractID = event.ContractId[:]
+				}
+				if event.Body.V == 0 {
+					body := event.Body.MustV0()
+					for _, topic := range body.Topics {
+						topicBytes, _ := topic.MarshalBinary()
+						topics = append(topics, topicBytes)
+					}
+				}
+
 				events = append(events, &store.MinimalEvent{
 					LedgerSequence:   ledgerSeq,
 					TransactionIndex: uint16(tx.Index),
 					OperationIndex:   uint16(opIndex),
 					EventIndex:       uint16(eventIndex),
 					RawXDR:           rawXDR,
+					ContractID:       contractID,
+					Topics:           topics,
 				})
 			}
 		}

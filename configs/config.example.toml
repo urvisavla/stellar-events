@@ -76,9 +76,30 @@ progress_file = "./progress.json"
 # Set to false for faster ingestion if you plan to compact later
 final_compaction = false
 
+# Compute event statistics after ingestion (unique contracts, topics, etc.)
+# This is a slow operation that scans all events - disable for faster ingestion
+compute_stats = false
+
+# Maintain unique indexes during ingestion for fast cardinality counts
+# Adds some overhead (extra XDR parsing) but enables instant unique counts
+# If false, run 'build-indexes' command once after ingestion to build indexes
+maintain_unique_idx = false
+
 # Ledgers between progress snapshots (for trend analysis)
 # Lower values = more granular data, slightly more overhead
 snapshot_interval = 1000
+
+# --- Parallelism ---
+# Number of parallel workers for reading and parsing ledgers
+# 0 = use all available CPU cores
+workers = 0
+
+# Number of ledgers to batch before writing to RocksDB
+# Higher values reduce write overhead but use more memory
+batch_size = 100
+
+# Channel buffer size for the pipeline (0 = workers * 2)
+queue_size = 0
 
 # =============================================================================
 # Indexes
@@ -86,6 +107,4 @@ snapshot_interval = 1000
 [indexes]
 # Secondary indexes to create (improves query performance)
 contract_id = true
-transaction_hash = true
-event_type = true
 topics = true  # Enables topic0, topic1, topic2, topic3 indexes

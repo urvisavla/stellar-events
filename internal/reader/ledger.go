@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -40,10 +42,24 @@ func (r *LedgerReader) Close() {
 	r.decoder.Close()
 }
 
+// LedgerTiming holds timing breakdown for ledger reads
+type LedgerTiming struct {
+	DiskRead   time.Duration
+	Decompress time.Duration
+}
+
 // GetLedger reads a single ledger by sequence number
 func (r *LedgerReader) GetLedger(sequence uint32) ([]byte, error) {
+	data, _, err := r.GetLedgerWithTiming(sequence)
+	return data, err
+}
+
+// GetLedgerWithTiming reads a single ledger and returns timing breakdown
+func (r *LedgerReader) GetLedgerWithTiming(sequence uint32) ([]byte, *LedgerTiming, error) {
+	timing := &LedgerTiming{}
+
 	if sequence < FirstLedgerSequence {
-		return nil, fmt.Errorf("invalid sequence: must be >= %d", FirstLedgerSequence)
+		return nil, timing, fmt.Errorf("invalid sequence: must be >= %d", FirstLedgerSequence)
 	}
 
 	// Calculate chunk location
@@ -56,35 +72,38 @@ func (r *LedgerReader) GetLedger(sequence uint32) ([]byte, error) {
 	indexPath := basePath + ".index"
 	dataPath := basePath + ".data"
 
+	// Start timing disk read
+	diskStart := time.Now()
+
 	// Open index file
 	indexFile, err := os.Open(indexPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open index file: %w", err)
+		return nil, timing, fmt.Errorf("failed to open index file: %w", err)
 	}
 	defer indexFile.Close()
 
 	// Read and validate index header
 	header := make([]byte, IndexHeaderSize)
 	if _, err := indexFile.ReadAt(header, 0); err != nil {
-		return nil, fmt.Errorf("failed to read index header: %w", err)
+		return nil, timing, fmt.Errorf("failed to read index header: %w", err)
 	}
 
 	version := header[0]
 	offsetSize := header[1]
 
 	if version != IndexVersion {
-		return nil, fmt.Errorf("unsupported index version: %d", version)
+		return nil, timing, fmt.Errorf("unsupported index version: %d", version)
 	}
 
 	if offsetSize != 4 && offsetSize != 8 {
-		return nil, fmt.Errorf("invalid offset size: %d", offsetSize)
+		return nil, timing, fmt.Errorf("invalid offset size: %d", offsetSize)
 	}
 
 	// Read two adjacent offsets
 	entryPos := int64(IndexHeaderSize) + int64(localIndex)*int64(offsetSize)
 	offsetBuf := make([]byte, offsetSize*2)
 	if _, err := indexFile.ReadAt(offsetBuf, entryPos); err != nil {
-		return nil, fmt.Errorf("failed to read offsets from index: %w", err)
+		return nil, timing, fmt.Errorf("failed to read offsets from index: %w", err)
 	}
 
 	var startOffset, endOffset uint64
@@ -101,22 +120,31 @@ func (r *LedgerReader) GetLedger(sequence uint32) ([]byte, error) {
 	// Open data file and read compressed data
 	dataFile, err := os.Open(dataPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open data file: %w", err)
+		return nil, timing, fmt.Errorf("failed to open data file: %w", err)
 	}
 	defer dataFile.Close()
 
 	compressed := make([]byte, recordSize)
 	if _, err := dataFile.ReadAt(compressed, int64(startOffset)); err != nil {
-		return nil, fmt.Errorf("failed to read compressed data: %w", err)
+		return nil, timing, fmt.Errorf("failed to read compressed data: %w", err)
 	}
+
+	// Record disk read time
+	timing.DiskRead = time.Since(diskStart)
+
+	// Start timing decompression
+	decompressStart := time.Now()
 
 	// Decompress
 	decompressed, err := r.decoder.DecodeAll(compressed, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decompress ledger: %w", err)
+		return nil, timing, fmt.Errorf("failed to decompress ledger: %w", err)
 	}
 
-	return decompressed, nil
+	// Record decompress time
+	timing.Decompress = time.Since(decompressStart)
+
+	return decompressed, timing, nil
 }
 
 // LedgerIterator efficiently iterates over a range of ledgers by keeping
@@ -346,4 +374,98 @@ func GetLedgerDataStats(dataDir string) (minLedger, maxLedger uint32, chunkCount
 	maxLedger = (maxChunkID+1)*ChunkSize + FirstLedgerSequence - 1
 
 	return minLedger, maxLedger, chunkCount, nil
+}
+
+// ChunkDirInfo holds information about a parent chunk directory
+type ChunkDirInfo struct {
+	DirName    string // e.g., "0000"
+	MinLedger  uint32
+	MaxLedger  uint32
+	ChunkCount int
+	DataSizeMB float64
+}
+
+// GetChunkDirectoryInfo scans the chunks directory and returns info for each parent directory
+func GetChunkDirectoryInfo(dataDir string) ([]ChunkDirInfo, error) {
+	chunksDir := filepath.Join(dataDir, "chunks")
+
+	// First, find all parent directories and their chunks
+	dirChunks := make(map[string][]uint32)  // parent dir -> list of chunk IDs
+	dirSizes := make(map[string]int64)      // parent dir -> total data size
+
+	err := filepath.Walk(chunksDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		// Get parent directory name (e.g., "0000")
+		parentDir := filepath.Base(filepath.Dir(path))
+
+		if filepath.Ext(path) == ".index" {
+			base := filepath.Base(path)
+			var chunkID uint32
+			if _, scanErr := fmt.Sscanf(base, "%06d.index", &chunkID); scanErr == nil {
+				dirChunks[parentDir] = append(dirChunks[parentDir], chunkID)
+			}
+		}
+
+		// Count data file sizes
+		if filepath.Ext(path) == ".data" {
+			dirSizes[parentDir] += info.Size()
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan chunks directory: %w", err)
+	}
+
+	if len(dirChunks) == 0 {
+		return nil, fmt.Errorf("no chunk files found in %s", chunksDir)
+	}
+
+	// Build sorted list of directory info
+	var dirNames []string
+	for name := range dirChunks {
+		dirNames = append(dirNames, name)
+	}
+	sort.Strings(dirNames)
+
+	var results []ChunkDirInfo
+	for _, dirName := range dirNames {
+		chunks := dirChunks[dirName]
+		if len(chunks) == 0 {
+			continue
+		}
+
+		// Find min and max chunk IDs in this directory
+		minChunk := chunks[0]
+		maxChunk := chunks[0]
+		for _, chunkID := range chunks {
+			if chunkID < minChunk {
+				minChunk = chunkID
+			}
+			if chunkID > maxChunk {
+				maxChunk = chunkID
+			}
+		}
+
+		// Calculate ledger range
+		minLedger := minChunk*ChunkSize + FirstLedgerSequence
+		maxLedger := (maxChunk+1)*ChunkSize + FirstLedgerSequence - 1
+
+		results = append(results, ChunkDirInfo{
+			DirName:    dirName,
+			MinLedger:  minLedger,
+			MaxLedger:  maxLedger,
+			ChunkCount: len(chunks),
+			DataSizeMB: float64(dirSizes[dirName]) / (1024 * 1024),
+		})
+	}
+
+	return results, nil
 }
