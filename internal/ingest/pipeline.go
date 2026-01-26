@@ -13,12 +13,13 @@ import (
 
 // PipelineConfig configures the parallel ingestion pipeline
 type PipelineConfig struct {
-	Workers           int    // Number of parallel workers
-	BatchSize         int    // Ledgers to batch before writing
-	QueueSize         int    // Channel buffer size
-	DataDir           string // Ledger data directory
-	NetworkPassphrase string // Network passphrase for XDR parsing
-	MaintainUniqueIdx bool   // Maintain unique indexes during ingestion
+	Workers            int    // Number of parallel workers
+	BatchSize          int    // Ledgers to batch before writing
+	QueueSize          int    // Channel buffer size
+	DataDir            string // Ledger data directory
+	NetworkPassphrase  string // Network passphrase for XDR parsing
+	MaintainUniqueIdx  bool   // Maintain unique indexes during ingestion
+	MaintainBitmapIdx  bool   // Maintain roaring bitmap indexes during ingestion
 }
 
 // PipelineStats tracks pipeline performance
@@ -258,7 +259,7 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 
 			if (batchFull || atEnd) && len(eventBatch) > 0 {
 				writeStart := time.Now()
-				_, err := p.store.StoreMinimalEventsWithIndexes(eventBatch, p.config.MaintainUniqueIdx)
+				_, err := p.store.StoreMinimalEventsWithAllIndexes(eventBatch, p.config.MaintainUniqueIdx, p.config.MaintainBitmapIdx)
 				atomic.AddInt64(&p.stats.WriteTimeNs, time.Since(writeStart).Nanoseconds())
 
 				if err != nil {
@@ -279,6 +280,13 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 			if p.onProgress != nil && ledgersProcessed%1000 == 0 {
 				p.onProgress(nextSeq-1, ledgersProcessed, totalEvents, aggStats)
 			}
+		}
+	}
+
+	// Flush bitmap indexes if enabled
+	if p.config.MaintainBitmapIdx {
+		if err := p.store.FlushBitmapIndexes(); err != nil {
+			return fmt.Errorf("failed to flush bitmap indexes: %w", err)
 		}
 	}
 

@@ -94,6 +94,16 @@ compute_stats = false
 # If false, run 'build-indexes' command once after ingestion to build indexes
 maintain_unique_idx = false
 
+# Maintain roaring bitmap indexes during ingestion
+# Enables fast queries by contract ID and topic values
+# Uses segmented bitmaps (1M ledgers per segment) to avoid write amplification
+maintain_bitmap_idx = true
+
+# Compress event XDR values with zstd before storing
+# Significantly reduces database size with minimal CPU overhead
+# Values are automatically decompressed when reading
+compress_values = true
+
 # Ledgers between progress snapshots (for trend analysis)
 # Lower values = more granular data, slightly more overhead
 snapshot_interval = 1000

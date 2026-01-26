@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -31,9 +32,13 @@ type QueryParams struct {
 	StartLedger uint32
 	EndLedger   uint32
 	ContractID  string
-	TopicPos    int    // -1 means none
-	TopicValue  string // used only if TopicPos >= 0
+	Topic0      string
+	Topic1      string
+	Topic2      string
+	Topic3      string
 	Limit       int
+	UseBitmap   bool
+	ShowStats   bool
 }
 
 type StatsParams struct {
@@ -178,6 +183,8 @@ func runQuery(cfg *config.Config, args []string) {
 	topic2 := fs.String("topic2", "", "Topic2 (base64)")
 	topic3 := fs.String("topic3", "", "Topic3 (base64)")
 	limit := fs.Int("limit", 100, "Max results")
+	useBitmap := fs.Bool("bitmap", true, "Use bitmap index for fast queries (default: true)")
+	showStats := fs.Bool("stats", false, "Show query statistics")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: query --start <seq> --end <seq> [options]\n\n")
@@ -188,6 +195,13 @@ func runQuery(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "  --topic2 <val>    Filter by topic2 (base64)\n")
 		fmt.Fprintf(os.Stderr, "  --topic3 <val>    Filter by topic3 (base64)\n")
 		fmt.Fprintf(os.Stderr, "  --limit <n>       Max results (default: 100)\n")
+		fmt.Fprintf(os.Stderr, "  --bitmap          Use bitmap index for fast queries (default: true)\n")
+		fmt.Fprintf(os.Stderr, "  --stats           Show query statistics\n")
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  # Query events by contract ID using bitmap index\n")
+		fmt.Fprintf(os.Stderr, "  query --start 55000000 --end 56000000 --contract <base64_id>\n")
+		fmt.Fprintf(os.Stderr, "\n  # Combined filter: contract + topic (uses bitmap intersection)\n")
+		fmt.Fprintf(os.Stderr, "  query --start 55000000 --end 56000000 --contract <id> --topic0 <val>\n")
 	}
 
 	if err := fs.Parse(args); err != nil {
@@ -207,32 +221,17 @@ func runQuery(cfg *config.Config, args []string) {
 		*limit = 100
 	}
 
-	// Enforce at most one topic filter
-	topicPos := -1
-	topicVal := ""
-	setTopic := func(pos int, val string) {
-		if val == "" {
-			return
-		}
-		if topicPos != -1 {
-			fmt.Fprintf(os.Stderr, "Error: only one of --topic0..--topic3 may be specified\n")
-			os.Exit(2)
-		}
-		topicPos = pos
-		topicVal = val
-	}
-	setTopic(0, *topic0)
-	setTopic(1, *topic1)
-	setTopic(2, *topic2)
-	setTopic(3, *topic3)
-
 	cmdQuery(cfg, QueryParams{
 		StartLedger: uint32(*start),
 		EndLedger:   uint32(*end),
 		ContractID:  *contract,
-		TopicPos:    topicPos,
-		TopicValue:  topicVal,
+		Topic0:      *topic0,
+		Topic1:      *topic1,
+		Topic2:      *topic2,
+		Topic3:      *topic3,
 		Limit:       *limit,
+		UseBitmap:   *useBitmap,
+		ShowStats:   *showStats,
 	})
 }
 
@@ -597,6 +596,7 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		DataDir:           cfg.Source.LedgerDir,
 		NetworkPassphrase: networkPassphrase,
 		MaintainUniqueIdx: cfg.Ingestion.MaintainUniqueIdx,
+		MaintainBitmapIdx: cfg.Ingestion.MaintainBitmapIdx,
 	}
 
 	pipeline := ingest.NewPipeline(pipelineConfig, eventStore)
@@ -827,28 +827,115 @@ func cmdQuery(cfg *config.Config, p QueryParams) {
 	}
 	defer eventStore.Close()
 
-	var (
-		events []*store.ContractEvent
-	)
+	var events []*store.ContractEvent
+	var queryResult *store.QueryResult
+	startTime := time.Now()
 
-	// Range-only query
-	switch {
-	case p.ContractID != "" && p.TopicPos >= 0:
-		fmt.Fprintf(os.Stderr, "Error: combining --contract and --topic filters is not supported\n")
-		os.Exit(2)
+	// Check if any filter is specified
+	hasContract := p.ContractID != ""
+	hasTopic0 := p.Topic0 != ""
+	hasTopic1 := p.Topic1 != ""
+	hasTopic2 := p.Topic2 != ""
+	hasTopic3 := p.Topic3 != ""
+	hasAnyFilter := hasContract || hasTopic0 || hasTopic1 || hasTopic2 || hasTopic3
 
-	case p.ContractID != "":
-		fmt.Fprintf(os.Stderr, "Querying events for contract %s in ledgers %d-%d...\n", p.ContractID, p.StartLedger, p.EndLedger)
-		events, err = eventStore.GetEventsByContractIDInRange(p.ContractID, p.StartLedger, p.EndLedger)
+	// Try bitmap-accelerated query if enabled and filters are specified
+	if p.UseBitmap && hasAnyFilter {
+		// Build filter
+		filter := &store.QueryFilter{}
 
-	case p.TopicPos >= 0:
-		fmt.Fprintf(os.Stderr, "Querying events with topic%d in ledgers %d-%d...\n", p.TopicPos, p.StartLedger, p.EndLedger)
-		events, err = eventStore.GetEventsByTopicInRange(p.TopicPos, p.TopicValue, p.StartLedger, p.EndLedger)
+		if hasContract {
+			contractBytes, decErr := decodeBase64(p.ContractID)
+			if decErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid contract ID: %v\n", decErr)
+				os.Exit(2)
+			}
+			filter.ContractID = contractBytes
+		}
 
-	default:
-		fmt.Fprintf(os.Stderr, "Querying events in ledgers %d-%d...\n", p.StartLedger, p.EndLedger)
-		events, err = eventStore.GetEventsByLedgerRange(p.StartLedger, p.EndLedger)
+		if hasTopic0 {
+			topicBytes, decErr := decodeBase64(p.Topic0)
+			if decErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid topic0: %v\n", decErr)
+				os.Exit(2)
+			}
+			filter.Topic0 = topicBytes
+		}
+
+		if hasTopic1 {
+			topicBytes, decErr := decodeBase64(p.Topic1)
+			if decErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid topic1: %v\n", decErr)
+				os.Exit(2)
+			}
+			filter.Topic1 = topicBytes
+		}
+
+		if hasTopic2 {
+			topicBytes, decErr := decodeBase64(p.Topic2)
+			if decErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid topic2: %v\n", decErr)
+				os.Exit(2)
+			}
+			filter.Topic2 = topicBytes
+		}
+
+		if hasTopic3 {
+			topicBytes, decErr := decodeBase64(p.Topic3)
+			if decErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid topic3: %v\n", decErr)
+				os.Exit(2)
+			}
+			filter.Topic3 = topicBytes
+		}
+
+		fmt.Fprintf(os.Stderr, "Querying with bitmap index in ledgers %d-%d...\n", p.StartLedger, p.EndLedger)
+		queryResult, err = eventStore.GetEventsWithFilter(filter, p.StartLedger, p.EndLedger, p.Limit)
+		if err != nil {
+			// Fall back to legacy query if bitmap not available
+			fmt.Fprintf(os.Stderr, "Bitmap query failed (%v), falling back to scan...\n", err)
+			p.UseBitmap = false
+		} else {
+			events = queryResult.Events
+		}
 	}
+
+	// Legacy query path (no bitmap or no filter)
+	if !p.UseBitmap || !hasAnyFilter {
+		// Determine which legacy method to use
+		switch {
+		case hasContract && (hasTopic0 || hasTopic1 || hasTopic2 || hasTopic3):
+			fmt.Fprintf(os.Stderr, "Error: combining --contract and --topic filters requires bitmap index\n")
+			fmt.Fprintf(os.Stderr, "Run with --bitmap=true (default) or use single filter\n")
+			os.Exit(2)
+
+		case hasContract:
+			fmt.Fprintf(os.Stderr, "Querying events for contract (scan) in ledgers %d-%d...\n", p.StartLedger, p.EndLedger)
+			events, err = eventStore.GetEventsByContractIDInRange(p.ContractID, p.StartLedger, p.EndLedger)
+
+		case hasTopic0:
+			fmt.Fprintf(os.Stderr, "Querying events with topic0 (scan) in ledgers %d-%d...\n", p.StartLedger, p.EndLedger)
+			events, err = eventStore.GetEventsByTopicInRange(0, p.Topic0, p.StartLedger, p.EndLedger)
+
+		case hasTopic1:
+			fmt.Fprintf(os.Stderr, "Querying events with topic1 (scan) in ledgers %d-%d...\n", p.StartLedger, p.EndLedger)
+			events, err = eventStore.GetEventsByTopicInRange(1, p.Topic1, p.StartLedger, p.EndLedger)
+
+		case hasTopic2:
+			fmt.Fprintf(os.Stderr, "Querying events with topic2 (scan) in ledgers %d-%d...\n", p.StartLedger, p.EndLedger)
+			events, err = eventStore.GetEventsByTopicInRange(2, p.Topic2, p.StartLedger, p.EndLedger)
+
+		case hasTopic3:
+			fmt.Fprintf(os.Stderr, "Querying events with topic3 (scan) in ledgers %d-%d...\n", p.StartLedger, p.EndLedger)
+			events, err = eventStore.GetEventsByTopicInRange(3, p.Topic3, p.StartLedger, p.EndLedger)
+
+		default:
+			fmt.Fprintf(os.Stderr, "Querying all events in ledgers %d-%d...\n", p.StartLedger, p.EndLedger)
+			events, err = eventStore.GetEventsByLedgerRange(p.StartLedger, p.EndLedger)
+		}
+	}
+
+	elapsed := time.Since(startTime)
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
@@ -860,7 +947,21 @@ func cmdQuery(cfg *config.Config, p QueryParams) {
 		events = events[:p.Limit]
 	}
 
-	fmt.Fprintf(os.Stderr, "Found %d events\n\n", len(events))
+	fmt.Fprintf(os.Stderr, "Found %d events in %s\n", len(events), formatElapsed(elapsed))
+
+	// Show query stats if requested
+	if p.ShowStats && queryResult != nil {
+		fmt.Fprintf(os.Stderr, "\nQuery Statistics:\n")
+		fmt.Fprintf(os.Stderr, "  Matching ledgers:  %d\n", queryResult.MatchingLedgers)
+		fmt.Fprintf(os.Stderr, "  Events scanned:    %d\n", queryResult.EventsScanned)
+		fmt.Fprintf(os.Stderr, "  Events returned:   %d\n", queryResult.EventsReturned)
+		if queryResult.EventsScanned > 0 {
+			selectivity := float64(queryResult.EventsReturned) / float64(queryResult.EventsScanned) * 100
+			fmt.Fprintf(os.Stderr, "  Selectivity:       %.2f%%\n", selectivity)
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "\n")
 
 	output, err := json.MarshalIndent(events, "", "  ")
 	if err != nil {
@@ -868,6 +969,11 @@ func cmdQuery(cfg *config.Config, p QueryParams) {
 		os.Exit(1)
 	}
 	fmt.Println(string(output))
+}
+
+// decodeBase64 decodes a base64 string
+func decodeBase64(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
 }
 
 // =============================================================================
@@ -920,10 +1026,29 @@ func cmdStats(cfg *config.Config, p StatsParams) {
 	fmt.Printf("  Files at level 1:      %s\n", storageStats.NumFilesAtLevel1)
 	fmt.Printf("  Block cache usage:     %s MB\n", bytesToMB(storageStats.BlockCacheUsage))
 
+	// Always show bitmap index stats if available
+	bitmapStats := eventStore.GetBitmapIndexStats()
+	if bitmapStats != nil {
+		fmt.Printf("\nBitmap Index Statistics:\n")
+		fmt.Printf("  Current segment ID:    %d (each segment = 1M ledgers)\n", bitmapStats.CurrentSegmentID)
+		fmt.Printf("  Hot segments (memory): %d segments, %d entries, %.2f MB\n",
+			bitmapStats.HotSegmentCount,
+			bitmapStats.HotSegmentCards,
+			float64(bitmapStats.HotSegmentMemBytes)/(1024*1024))
+		fmt.Printf("  Stored bitmap segments:\n")
+		fmt.Printf("    Contract index:      %d segments\n", bitmapStats.ContractIndexCount)
+		fmt.Printf("    Topic0 index:        %d segments\n", bitmapStats.Topic0IndexCount)
+		fmt.Printf("    Topic1 index:        %d segments\n", bitmapStats.Topic1IndexCount)
+		fmt.Printf("    Topic2 index:        %d segments\n", bitmapStats.Topic2IndexCount)
+		fmt.Printf("    Topic3 index:        %d segments\n", bitmapStats.Topic3IndexCount)
+	} else {
+		fmt.Printf("\nBitmap Index: not available\n")
+	}
+
 	if p.ShowIndexes {
 		fmt.Fprintf(os.Stderr, "Counting index entries...\n")
 		indexStats := eventStore.GetIndexStats()
-		fmt.Printf("\nIndex Entry Counts:\n")
+		fmt.Printf("\nUnique Index Entry Counts:\n")
 		fmt.Printf("  Events (primary):      %d\n", indexStats.EventsCount)
 		fmt.Printf("  Contract index:        %d\n", indexStats.ContractCount)
 		fmt.Printf("  TxHash index:          %d\n", indexStats.TxHashCount)

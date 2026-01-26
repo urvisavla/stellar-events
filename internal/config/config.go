@@ -65,11 +65,12 @@ type RocksDBConfig struct {
 
 // IngestionConfig contains ingestion settings
 type IngestionConfig struct {
-	ProgressFile      string `toml:"progress_file"`
-	FinalCompaction   bool   `toml:"final_compaction"`    // Run manual compaction after ingestion (default: true)
-	ComputeStats      bool   `toml:"compute_stats"`       // Compute event stats after ingestion (default: false)
-	MaintainUniqueIdx bool   `toml:"maintain_unique_idx"` // Maintain unique indexes during ingestion (default: false)
-	SnapshotInterval  int    `toml:"snapshot_interval"`   // Ledgers between progress snapshots (default: 1000000)
+	ProgressFile       string `toml:"progress_file"`
+	FinalCompaction    bool   `toml:"final_compaction"`     // Run manual compaction after ingestion (default: true)
+	ComputeStats       bool   `toml:"compute_stats"`        // Compute event stats after ingestion (default: false)
+	MaintainUniqueIdx  bool   `toml:"maintain_unique_idx"`  // Maintain unique indexes during ingestion (default: false)
+	MaintainBitmapIdx  bool   `toml:"maintain_bitmap_idx"`  // Maintain roaring bitmap indexes during ingestion (default: true)
+	SnapshotInterval   int    `toml:"snapshot_interval"`    // Ledgers between progress snapshots (default: 1000000)
 
 	// Parallelism settings
 	Workers   int `toml:"workers"`    // Number of parallel workers (default: number of CPUs)
@@ -118,14 +119,15 @@ func DefaultConfig() *Config {
 			},
 		},
 		Ingestion: IngestionConfig{
-			ProgressFile:      "",
-			FinalCompaction:   true,
-			ComputeStats:      false, // Disabled by default (slow operation)
-			MaintainUniqueIdx: false, // Disabled by default (adds XDR parsing overhead)
-			SnapshotInterval:  1000000,
-			Workers:           0, // 0 means use runtime.NumCPU()
-			BatchSize:         100,
-			QueueSize:         0, // 0 means workers * 2
+			ProgressFile:       "",
+			FinalCompaction:    true,
+			ComputeStats:       false, // Disabled by default (slow operation)
+			MaintainUniqueIdx:  false, // Disabled by default (adds XDR parsing overhead)
+			MaintainBitmapIdx:  true,  // Enabled by default (fast, in-memory during ingestion)
+			SnapshotInterval:   1000000,
+			Workers:            0, // 0 means use runtime.NumCPU()
+			BatchSize:          100,
+			QueueSize:          0, // 0 means workers * 2
 		},
 		Indexes: IndexConfig{
 			ContractID:      true,
