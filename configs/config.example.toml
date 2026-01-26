@@ -63,6 +63,15 @@ disable_wal = true
 # Use with final_compaction = true to compact after ingestion completes
 disable_auto_compaction = true
 
+# --- Compaction Tuning ---
+# Target SST file size in MB (default: 64, we use 256 for fewer files)
+# Larger = fewer files after compaction, better for write-once/read-many
+target_file_size_mb = 256
+
+# Max bytes for level 1 in MB (default: 256, we use 1024)
+# Controls when data moves between levels
+max_bytes_for_level_base_mb = 1024
+
 # =============================================================================
 # Ingestion
 # =============================================================================

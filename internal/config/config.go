@@ -57,6 +57,10 @@ type RocksDBConfig struct {
 
 	// Auto compaction
 	DisableAutoCompaction bool `toml:"disable_auto_compaction"` // Disable background compaction during ingestion (default: false)
+
+	// Compaction tuning
+	TargetFileSizeMB       int `toml:"target_file_size_mb"`        // Target SST file size (default: 256, creates larger files)
+	MaxBytesForLevelBaseMB int `toml:"max_bytes_for_level_base_mb"` // Max bytes for L1 (default: 1024)
 }
 
 // IngestionConfig contains ingestion settings
@@ -108,6 +112,9 @@ func DefaultConfig() *Config {
 				DisableWAL: false,
 				// Auto compaction
 				DisableAutoCompaction: false,
+				// Compaction tuning (larger files = fewer files after compaction)
+				TargetFileSizeMB:       256,  // 256 MB target files (vs default 64 MB)
+				MaxBytesForLevelBaseMB: 1024, // 1 GB for level base
 			},
 		},
 		Ingestion: IngestionConfig{

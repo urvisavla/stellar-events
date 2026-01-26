@@ -41,6 +41,10 @@ type RocksDBOptions struct {
 
 	// Auto compaction
 	DisableAutoCompaction bool
+
+	// Compaction tuning
+	TargetFileSizeMB int // Target size for SST files (default: 64, recommend 256-512 for large DBs)
+	MaxBytesForLevelBaseMB int // Max bytes for L1 (default: 256, recommend 1024+ for large DBs)
 }
 
 // Column family names
@@ -372,6 +376,14 @@ func applyRocksDBOptions(opts *grocksdb.Options, rocksOpts *RocksDBOptions) {
 	// Disable auto compaction
 	if rocksOpts.DisableAutoCompaction {
 		opts.SetDisableAutoCompactions(true)
+	}
+
+	// Compaction tuning - larger files = fewer files after compaction
+	if rocksOpts.TargetFileSizeMB > 0 {
+		opts.SetTargetFileSizeBase(uint64(rocksOpts.TargetFileSizeMB) * 1024 * 1024)
+	}
+	if rocksOpts.MaxBytesForLevelBaseMB > 0 {
+		opts.SetMaxBytesForLevelBase(uint64(rocksOpts.MaxBytesForLevelBaseMB) * 1024 * 1024)
 	}
 }
 
@@ -1007,7 +1019,7 @@ type CompactionResult struct {
 	SpaceSavingsPercent float64 `json:"space_savings_percent"`
 }
 
-// CompactAll runs manual compaction on the entire database
+// CompactAll runs manual compaction on the entire database (all column families)
 func (es *EventStore) CompactAll() *CompactionResult {
 	beforeStats := es.GetSnapshotStats()
 	beforeFiles := beforeStats.L0Files + beforeStats.L1Files + beforeStats.L2Files +
@@ -1019,7 +1031,19 @@ func (es *EventStore) CompactAll() *CompactionResult {
 		BeforeTotalFiles: beforeFiles,
 	}
 
-	es.db.CompactRange(grocksdb.Range{Start: nil, Limit: nil})
+	// Create compaction options for full compaction
+	compactOpts := grocksdb.NewCompactRangeOptions()
+	defer compactOpts.Destroy()
+
+	// Force compaction to bottommost level for maximum compression
+	compactOpts.SetBottommostLevelCompaction(grocksdb.KForceOptimized)
+	compactOpts.SetExclusiveManualCompaction(true)
+
+	// Compact ALL column families, not just default
+	fullRange := grocksdb.Range{Start: nil, Limit: nil}
+	for _, cf := range es.cfHandles {
+		es.db.CompactRangeCFOpt(cf, fullRange, compactOpts)
+	}
 
 	afterStats := es.GetSnapshotStats()
 	afterFiles := afterStats.L0Files + afterStats.L1Files + afterStats.L2Files +

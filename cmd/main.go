@@ -78,6 +78,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  query    Query events from RocksDB\n")
 	fmt.Fprintf(os.Stderr, "  stats    Show database statistics\n")
 	fmt.Fprintf(os.Stderr, "  ledgers  Show available ledger ranges in source data\n")
+	fmt.Fprintf(os.Stderr, "  compact  Run manual compaction on existing database\n")
 	fmt.Fprintf(os.Stderr, "\nConfiguration:\n")
 	fmt.Fprintf(os.Stderr, "  Requires stellar-events.toml or config.toml in current directory\n")
 	fmt.Fprintf(os.Stderr, "  See configs/stellar-events.example.toml for reference\n")
@@ -130,6 +131,8 @@ func main() {
 		runBuildIndexes(cfg, args)
 	case "ledgers":
 		runLedgers(cfg, args)
+	case "compact":
+		runCompact(cfg, args)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
 		printUsage()
@@ -263,6 +266,80 @@ func runStats(cfg *config.Config, args []string) {
 	})
 }
 
+func runCompact(cfg *config.Config, args []string) {
+	fs := flag.NewFlagSet("compact", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: compact\n\n")
+		fmt.Fprintf(os.Stderr, "Runs manual compaction on the existing RocksDB database.\n")
+		fmt.Fprintf(os.Stderr, "This merges L0 files and optimizes storage.\n")
+	}
+
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+
+	cmdCompact(cfg)
+}
+
+func cmdCompact(cfg *config.Config) {
+	fmt.Fprintf(os.Stderr, "Opening database: %s\n", cfg.Storage.DBPath)
+
+	eventStore, err := store.NewEventStoreWithOptions(
+		cfg.Storage.DBPath,
+		configToRocksDBOptions(&cfg.Storage.RocksDB),
+		configToIndexOptions(&cfg.Indexes),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to open event store: %v\n", err)
+		os.Exit(1)
+	}
+	defer eventStore.Close()
+
+	// Show pre-compaction stats
+	preStats := eventStore.GetSnapshotStats()
+	preTotalFiles := preStats.L0Files + preStats.L1Files + preStats.L2Files +
+		preStats.L3Files + preStats.L4Files + preStats.L5Files + preStats.L6Files
+
+	fmt.Fprintf(os.Stderr, "\nPre-compaction stats:\n")
+	fmt.Fprintf(os.Stderr, "  SST files:      %.2f MB (%d files)\n",
+		float64(preStats.SSTFilesSizeBytes)/(1024*1024), preTotalFiles)
+	fmt.Fprintf(os.Stderr, "  Files by level: L0=%d L1=%d L2=%d L3=%d L4=%d L5=%d L6=%d\n",
+		preStats.L0Files, preStats.L1Files, preStats.L2Files,
+		preStats.L3Files, preStats.L4Files, preStats.L5Files, preStats.L6Files)
+
+	fmt.Fprintf(os.Stderr, "\nRunning compaction (this may take a while)...\n")
+
+	startTime := time.Now()
+	result := eventStore.CompactAll()
+	elapsed := time.Since(startTime)
+
+	// Show post-compaction stats
+	postStats := eventStore.GetSnapshotStats()
+	postTotalFiles := postStats.L0Files + postStats.L1Files + postStats.L2Files +
+		postStats.L3Files + postStats.L4Files + postStats.L5Files + postStats.L6Files
+
+	fmt.Fprintf(os.Stderr, "\nPost-compaction stats:\n")
+	fmt.Fprintf(os.Stderr, "  SST files:      %.2f MB (%d files)\n",
+		float64(postStats.SSTFilesSizeBytes)/(1024*1024), postTotalFiles)
+	fmt.Fprintf(os.Stderr, "  Files by level: L0=%d L1=%d L2=%d L3=%d L4=%d L5=%d L6=%d\n",
+		postStats.L0Files, postStats.L1Files, postStats.L2Files,
+		postStats.L3Files, postStats.L4Files, postStats.L5Files, postStats.L6Files)
+
+	fmt.Fprintf(os.Stderr, "\nCompaction complete:\n")
+	fmt.Fprintf(os.Stderr, "  Duration:   %s\n", formatElapsed(elapsed))
+	fmt.Fprintf(os.Stderr, "  Before:     %.2f MB (%d files, %d in L0)\n",
+		float64(result.BeforeSSTBytes)/(1024*1024), result.BeforeTotalFiles, result.BeforeL0Files)
+	fmt.Fprintf(os.Stderr, "  After:      %.2f MB (%d files, %d in L0)\n",
+		float64(result.AfterSSTBytes)/(1024*1024), result.AfterTotalFiles, result.AfterL0Files)
+
+	if result.BytesReclaimed > 0 {
+		fmt.Fprintf(os.Stderr, "  Reclaimed:  %.2f MB (%.1f%%)\n",
+			float64(result.BytesReclaimed)/(1024*1024), result.SpaceSavingsPercent)
+	}
+}
+
 func runLedgers(cfg *config.Config, args []string) {
 	fs := flag.NewFlagSet("ledgers", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -346,8 +423,6 @@ func cmdLedgers(cfg *config.Config) {
 // =============================================================================
 
 func cmdLedgersByYear(cfg *config.Config, archiveURL string) {
-	fmt := message.NewPrinter(language.English)
-
 	// Determine archive URL based on network
 	if archiveURL == "" {
 		switch cfg.Source.Network {
@@ -974,6 +1049,8 @@ func configToRocksDBOptions(cfg *config.RocksDBConfig) *store.RocksDBOptions {
 		BottommostCompression:       cfg.BottommostCompression,
 		DisableWAL:                  cfg.DisableWAL,
 		DisableAutoCompaction:       cfg.DisableAutoCompaction,
+		TargetFileSizeMB:            cfg.TargetFileSizeMB,
+		MaxBytesForLevelBaseMB:      cfg.MaxBytesForLevelBaseMB,
 	}
 }
 
