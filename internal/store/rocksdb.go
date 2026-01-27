@@ -12,10 +12,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/RoaringBitmap/roaring"
 	"github.com/linxGnu/grocksdb"
 	"github.com/stellar/go-stellar-sdk/xdr"
+
 	"github.com/urvisavla/stellar-events/internal/index"
 )
 
@@ -45,7 +47,7 @@ type RocksDBOptions struct {
 	DisableAutoCompaction bool
 
 	// Compaction tuning
-	TargetFileSizeMB int // Target size for SST files (default: 64, recommend 256-512 for large DBs)
+	TargetFileSizeMB       int // Target size for SST files (default: 64, recommend 256-512 for large DBs)
 	MaxBytesForLevelBaseMB int // Max bytes for L1 (default: 256, recommend 1024+ for large DBs)
 }
 
@@ -1024,7 +1026,6 @@ func (es *EventStore) getSSTFileSizeFromDisk() int64 {
 	})
 	return totalSize
 }
-
 
 // Flush forces all memtables to be flushed to SST files
 // This should be called before getting accurate storage stats
@@ -2017,19 +2018,53 @@ func (es *EventStore) GetIndexStats() *IndexStats {
 
 // QueryFilter defines a filter for bitmap-accelerated queries
 type QueryFilter struct {
-	ContractID []byte   // Filter by contract ID (32 bytes)
-	Topic0     []byte   // Filter by topic at position 0
-	Topic1     []byte   // Filter by topic at position 1
-	Topic2     []byte   // Filter by topic at position 2
-	Topic3     []byte   // Filter by topic at position 3
+	ContractID []byte // Filter by contract ID (32 bytes)
+	Topic0     []byte // Filter by topic at position 0
+	Topic1     []byte // Filter by topic at position 1
+	Topic2     []byte // Filter by topic at position 2
+	Topic3     []byte // Filter by topic at position 3
 }
 
 // QueryResult holds the result of a bitmap-accelerated query
 type QueryResult struct {
-	Events           []*ContractEvent
-	MatchingLedgers  uint64        // Number of ledgers that matched the filter
-	EventsScanned    int64         // Number of events scanned (for debugging)
-	EventsReturned   int64         // Number of events returned
+	Events          []*ContractEvent
+	MatchingLedgers uint64 // Number of ledgers that matched the filter
+	EventsScanned   int64  // Number of events scanned (for debugging)
+	EventsReturned  int64  // Number of events returned
+
+	// Timing breakdown
+	BitmapLookupTime time.Duration // Time to query bitmap index
+	EventFetchTime   time.Duration // Time to fetch events from matching ledgers
+	FilterTime       time.Duration // Time spent filtering events
+	TotalTime        time.Duration // Total query time
+
+	// Additional stats
+	LedgerRange     uint32 // Number of ledgers in query range
+	SegmentsQueried int    // Number of bitmap segments queried
+
+	// For benchmarking - stores matching ledger numbers
+	MatchingLedgerSeqs []uint32 // Actual ledger sequence numbers that matched
+}
+
+// FetchBenchmarkResult holds comparison results between RocksDB and ledger file fetching
+type FetchBenchmarkResult struct {
+	// Bitmap phase (same for both)
+	BitmapLookupTime time.Duration
+	MatchingLedgers  int
+	LedgerSeqs       []uint32 // The actual ledger sequences
+
+	// RocksDB fetch
+	RocksDBFetchTime time.Duration
+	RocksDBEvents    int
+	RocksDBBytesRead int64
+
+	// Ledger file fetch
+	LedgerFetchTime     time.Duration
+	LedgerEvents        int
+	LedgerBytesRead     int64
+	LedgerDiskReadTime  time.Duration
+	LedgerDecompressTime time.Duration
+	LedgerUnmarshalTime time.Duration
 }
 
 // GetEventsByContractIDBitmap retrieves events for a contract using bitmap index
@@ -2134,11 +2169,24 @@ func (es *EventStore) GetEventsByTopicBitmap(position int, topicValue []byte, st
 // GetEventsWithFilter retrieves events matching multiple filters using bitmap intersection
 // All specified filters must match (AND logic)
 func (es *EventStore) GetEventsWithFilter(filter *QueryFilter, startLedger, endLedger uint32, limit int) (*QueryResult, error) {
+	totalStart := time.Now()
+
 	if es.bitmapIndex == nil {
 		return nil, fmt.Errorf("bitmap index not available")
 	}
 
-	// Collect bitmaps for each filter
+	result := &QueryResult{
+		LedgerRange: endLedger - startLedger + 1,
+	}
+
+	// Calculate segments that will be queried
+	startSegment := index.SegmentID(startLedger)
+	endSegment := index.SegmentID(endLedger)
+	result.SegmentsQueried = int(endSegment - startSegment + 1)
+
+	// Phase 1: Bitmap lookups
+	bitmapStart := time.Now()
+
 	var bitmaps []*roaring.Bitmap
 
 	if len(filter.ContractID) > 0 {
@@ -2191,13 +2239,19 @@ func (es *EventStore) GetEventsWithFilter(filter *QueryFilter, startLedger, endL
 		resultBitmap.And(bitmaps[i])
 	}
 
-	result := &QueryResult{
-		MatchingLedgers: resultBitmap.GetCardinality(),
-	}
+	result.BitmapLookupTime = time.Since(bitmapStart)
+	result.MatchingLedgers = resultBitmap.GetCardinality()
+
+	// Store matching ledger sequences for benchmarking
+	result.MatchingLedgerSeqs = resultBitmap.ToArray()
 
 	if resultBitmap.GetCardinality() == 0 {
+		result.TotalTime = time.Since(totalStart)
 		return result, nil
 	}
+
+	// Phase 2: Fetch events from matching ledgers
+	fetchStart := time.Now()
 
 	// Build topic filters for post-filtering
 	topicFilters := [][]byte{filter.Topic0, filter.Topic1, filter.Topic2, filter.Topic3}
@@ -2224,6 +2278,9 @@ func (es *EventStore) GetEventsWithFilter(filter *QueryFilter, startLedger, endL
 			result.EventsReturned++
 		}
 	}
+
+	result.EventFetchTime = time.Since(fetchStart)
+	result.TotalTime = time.Since(totalStart)
 
 	return result, nil
 }

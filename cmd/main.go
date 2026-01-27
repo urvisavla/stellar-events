@@ -79,11 +79,12 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "Stellar Events - Extract and query Soroban contract events\n\n")
 	fmt.Fprintf(os.Stderr, "Usage: %s <command> [options]\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "\nCommands:\n")
-	fmt.Fprintf(os.Stderr, "  ingest   Ingest events from ledger files to RocksDB\n")
-	fmt.Fprintf(os.Stderr, "  query    Query events from RocksDB\n")
-	fmt.Fprintf(os.Stderr, "  stats    Show database statistics\n")
-	fmt.Fprintf(os.Stderr, "  ledgers  Show available ledger ranges in source data\n")
-	fmt.Fprintf(os.Stderr, "  compact  Run manual compaction on existing database\n")
+	fmt.Fprintf(os.Stderr, "  ingest    Ingest events from ledger files to RocksDB\n")
+	fmt.Fprintf(os.Stderr, "  query     Query events from RocksDB\n")
+	fmt.Fprintf(os.Stderr, "  stats     Show database statistics\n")
+	fmt.Fprintf(os.Stderr, "  ledgers   Show available ledger ranges in source data\n")
+	fmt.Fprintf(os.Stderr, "  compact   Run manual compaction on existing database\n")
+	fmt.Fprintf(os.Stderr, "  benchmark Compare RocksDB vs ledger file fetch performance\n")
 	fmt.Fprintf(os.Stderr, "\nConfiguration:\n")
 	fmt.Fprintf(os.Stderr, "  Requires stellar-events.toml or config.toml in current directory\n")
 	fmt.Fprintf(os.Stderr, "  See configs/stellar-events.example.toml for reference\n")
@@ -138,6 +139,8 @@ func main() {
 		runLedgers(cfg, args)
 	case "compact":
 		runCompact(cfg, args)
+	case "benchmark":
+		runBenchmark(cfg, args)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
 		printUsage()
@@ -947,18 +950,39 @@ func cmdQuery(cfg *config.Config, p QueryParams) {
 		events = events[:p.Limit]
 	}
 
-	fmt.Fprintf(os.Stderr, "Found %d events in %s\n", len(events), formatElapsed(elapsed))
-
-	// Show query stats if requested
-	if p.ShowStats && queryResult != nil {
-		fmt.Fprintf(os.Stderr, "\nQuery Statistics:\n")
+	// Always show detailed stats for bitmap queries
+	if queryResult != nil {
+		fmt.Fprintf(os.Stderr, "\n=== Bitmap Query Results ===\n")
+		fmt.Fprintf(os.Stderr, "  Ledger range:      %d ledgers\n", queryResult.LedgerRange)
+		fmt.Fprintf(os.Stderr, "  Segments queried:  %d\n", queryResult.SegmentsQueried)
 		fmt.Fprintf(os.Stderr, "  Matching ledgers:  %d\n", queryResult.MatchingLedgers)
 		fmt.Fprintf(os.Stderr, "  Events scanned:    %d\n", queryResult.EventsScanned)
 		fmt.Fprintf(os.Stderr, "  Events returned:   %d\n", queryResult.EventsReturned)
-		if queryResult.EventsScanned > 0 {
-			selectivity := float64(queryResult.EventsReturned) / float64(queryResult.EventsScanned) * 100
-			fmt.Fprintf(os.Stderr, "  Selectivity:       %.2f%%\n", selectivity)
+
+		if queryResult.LedgerRange > 0 {
+			ledgerSelectivity := float64(queryResult.MatchingLedgers) / float64(queryResult.LedgerRange) * 100
+			fmt.Fprintf(os.Stderr, "  Ledger selectivity: %.4f%% (%.0fx reduction)\n",
+				ledgerSelectivity,
+				float64(queryResult.LedgerRange)/float64(max(queryResult.MatchingLedgers, 1)))
 		}
+
+		fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
+		fmt.Fprintf(os.Stderr, "  Bitmap lookup:     %s\n", formatDuration(queryResult.BitmapLookupTime))
+		fmt.Fprintf(os.Stderr, "  Event fetch:       %s\n", formatDuration(queryResult.EventFetchTime))
+		fmt.Fprintf(os.Stderr, "  Total time:        %s\n", formatDuration(queryResult.TotalTime))
+
+		if queryResult.TotalTime > 0 {
+			bitmapPct := float64(queryResult.BitmapLookupTime) / float64(queryResult.TotalTime) * 100
+			fetchPct := float64(queryResult.EventFetchTime) / float64(queryResult.TotalTime) * 100
+			fmt.Fprintf(os.Stderr, "  Time distribution: bitmap=%.1f%%, fetch=%.1f%%\n", bitmapPct, fetchPct)
+		}
+
+		if queryResult.MatchingLedgers > 0 {
+			avgPerLedger := queryResult.EventFetchTime / time.Duration(queryResult.MatchingLedgers)
+			fmt.Fprintf(os.Stderr, "  Avg fetch/ledger:  %s\n", formatDuration(avgPerLedger))
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Found %d events in %s\n", len(events), formatElapsed(elapsed))
 	}
 
 	fmt.Fprintf(os.Stderr, "\n")
@@ -1075,6 +1099,241 @@ func cmdStats(cfg *config.Config, p StatsParams) {
 }
 
 // =============================================================================
+// Benchmark Command
+// =============================================================================
+
+func runBenchmark(cfg *config.Config, args []string) {
+	fs := flag.NewFlagSet("benchmark", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	start := fs.Uint("start", 0, "Start ledger (required)")
+	end := fs.Uint("end", 0, "End ledger (required)")
+	contract := fs.String("contract", "", "Contract ID (base64)")
+	topic0 := fs.String("topic0", "", "Topic0 (base64)")
+	iterations := fs.Int("iterations", 3, "Number of iterations for averaging")
+
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: benchmark --start <seq> --end <seq> --contract <id> [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Compares RocksDB fetch vs ledger file fetch performance.\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		fmt.Fprintf(os.Stderr, "  --contract <id>   Contract ID to query (base64, required)\n")
+		fmt.Fprintf(os.Stderr, "  --topic0 <val>    Topic0 to query (base64, alternative to contract)\n")
+		fmt.Fprintf(os.Stderr, "  --iterations <n>  Number of iterations (default: 3)\n")
+	}
+
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+
+	if *start == 0 || *end == 0 {
+		fmt.Fprintf(os.Stderr, "Error: --start and --end are required\n\n")
+		fs.Usage()
+		os.Exit(2)
+	}
+	if *contract == "" && *topic0 == "" {
+		fmt.Fprintf(os.Stderr, "Error: --contract or --topic0 is required\n\n")
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	cmdBenchmark(cfg, uint32(*start), uint32(*end), *contract, *topic0, *iterations)
+}
+
+func cmdBenchmark(cfg *config.Config, startLedger, endLedger uint32, contractB64, topic0B64 string, iterations int) {
+	fmt.Fprintf(os.Stderr, "=== Fetch Benchmark: RocksDB vs Ledger Files ===\n\n")
+
+	// Open event store
+	eventStore, err := store.NewEventStoreWithOptions(
+		cfg.Storage.DBPath,
+		configToRocksDBOptions(&cfg.Storage.RocksDB),
+		configToIndexOptions(&cfg.Indexes),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to open event store: %v\n", err)
+		os.Exit(1)
+	}
+	defer eventStore.Close()
+
+	// Create ledger reader
+	ledgerReader, err := reader.NewLedgerReader(cfg.Source.LedgerDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create ledger reader: %v\n", err)
+		os.Exit(1)
+	}
+	defer ledgerReader.Close()
+
+	// Build filter
+	filter := &store.QueryFilter{}
+	if contractB64 != "" {
+		contractBytes, err := decodeBase64(contractB64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid contract ID: %v\n", err)
+			os.Exit(1)
+		}
+		filter.ContractID = contractBytes
+		fmt.Fprintf(os.Stderr, "Filter: contract=%s\n", contractB64[:min(20, len(contractB64))]+"...")
+	}
+	if topic0B64 != "" {
+		topicBytes, err := decodeBase64(topic0B64)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid topic0: %v\n", err)
+			os.Exit(1)
+		}
+		filter.Topic0 = topicBytes
+		fmt.Fprintf(os.Stderr, "Filter: topic0=%s\n", topic0B64[:min(20, len(topic0B64))]+"...")
+	}
+
+	fmt.Fprintf(os.Stderr, "Ledger range: %d - %d (%d ledgers)\n", startLedger, endLedger, endLedger-startLedger+1)
+	fmt.Fprintf(os.Stderr, "Iterations: %d\n\n", iterations)
+
+	networkPassphrase := cfg.GetNetworkPassphrase()
+
+	// Run benchmark iterations
+	var totalBitmapTime, totalRocksDBTime, totalLedgerTime time.Duration
+	var totalLedgerDiskRead, totalLedgerDecompress, totalLedgerUnmarshal time.Duration
+	var matchingLedgers int
+	var rocksDBEvents, ledgerEvents int
+
+	for i := 0; i < iterations; i++ {
+		fmt.Fprintf(os.Stderr, "--- Iteration %d/%d ---\n", i+1, iterations)
+
+		// Phase 1: Bitmap lookup (get matching ledgers)
+		queryResult, err := eventStore.GetEventsWithFilter(filter, startLedger, endLedger, 0) // No limit
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Bitmap query failed: %v\n", err)
+			os.Exit(1)
+		}
+		totalBitmapTime += queryResult.BitmapLookupTime
+
+		matchingLedgers = len(queryResult.MatchingLedgerSeqs)
+		fmt.Fprintf(os.Stderr, "  Bitmap lookup: %s (%d matching ledgers)\n",
+			formatDuration(queryResult.BitmapLookupTime), matchingLedgers)
+
+		if matchingLedgers == 0 {
+			fmt.Fprintf(os.Stderr, "  No matching ledgers found\n")
+			continue
+		}
+
+		// Phase 2a: RocksDB fetch (already done in GetEventsWithFilter)
+		totalRocksDBTime += queryResult.EventFetchTime
+		rocksDBEvents = len(queryResult.Events)
+		fmt.Fprintf(os.Stderr, "  RocksDB fetch: %s (%d events)\n",
+			formatDuration(queryResult.EventFetchTime), rocksDBEvents)
+
+		// Phase 2b: Ledger file fetch
+		ledgerStart := time.Now()
+		var ledgerDiskRead, ledgerDecompress, ledgerUnmarshal time.Duration
+		ledgerEventCount := 0
+
+		for _, ledgerSeq := range queryResult.MatchingLedgerSeqs {
+			// Read ledger with timing
+			xdrBytes, timing, err := ledgerReader.GetLedgerWithTiming(ledgerSeq)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to read ledger %d: %v\n", ledgerSeq, err)
+				continue
+			}
+			if timing != nil {
+				ledgerDiskRead += timing.DiskRead
+				ledgerDecompress += timing.Decompress
+			}
+
+			// Parse and extract events
+			unmarshalStart := time.Now()
+			events, err := extractEventsFromLedger(xdrBytes, networkPassphrase, filter)
+			ledgerUnmarshal += time.Since(unmarshalStart)
+
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to parse ledger %d: %v\n", ledgerSeq, err)
+				continue
+			}
+			ledgerEventCount += len(events)
+		}
+
+		ledgerTime := time.Since(ledgerStart)
+		totalLedgerTime += ledgerTime
+		totalLedgerDiskRead += ledgerDiskRead
+		totalLedgerDecompress += ledgerDecompress
+		totalLedgerUnmarshal += ledgerUnmarshal
+		ledgerEvents = ledgerEventCount
+
+		fmt.Fprintf(os.Stderr, "  Ledger fetch:  %s (%d events)\n", formatDuration(ledgerTime), ledgerEventCount)
+		fmt.Fprintf(os.Stderr, "    Disk read:   %s\n", formatDuration(ledgerDiskRead))
+		fmt.Fprintf(os.Stderr, "    Decompress:  %s\n", formatDuration(ledgerDecompress))
+		fmt.Fprintf(os.Stderr, "    Unmarshal:   %s\n", formatDuration(ledgerUnmarshal))
+		fmt.Fprintf(os.Stderr, "\n")
+	}
+
+	// Print summary
+	fmt.Fprintf(os.Stderr, "=== Benchmark Summary (%d iterations) ===\n\n", iterations)
+
+	avgBitmap := totalBitmapTime / time.Duration(iterations)
+	avgRocksDB := totalRocksDBTime / time.Duration(iterations)
+	avgLedger := totalLedgerTime / time.Duration(iterations)
+
+	fmt.Fprintf(os.Stderr, "Matching ledgers: %d\n", matchingLedgers)
+	fmt.Fprintf(os.Stderr, "Events found:     RocksDB=%d, Ledger=%d\n\n", rocksDBEvents, ledgerEvents)
+
+	fmt.Fprintf(os.Stderr, "Average times:\n")
+	fmt.Fprintf(os.Stderr, "  Bitmap lookup:     %s\n", formatDuration(avgBitmap))
+	fmt.Fprintf(os.Stderr, "  RocksDB fetch:     %s\n", formatDuration(avgRocksDB))
+	fmt.Fprintf(os.Stderr, "  Ledger file fetch: %s\n", formatDuration(avgLedger))
+
+	if avgLedger > 0 && avgRocksDB > 0 {
+		speedup := float64(avgLedger) / float64(avgRocksDB)
+		fmt.Fprintf(os.Stderr, "\n  RocksDB is %.2fx faster than ledger files\n", speedup)
+	}
+
+	fmt.Fprintf(os.Stderr, "\nLedger file breakdown (avg):\n")
+	fmt.Fprintf(os.Stderr, "  Disk read:   %s (%.1f%%)\n",
+		formatDuration(totalLedgerDiskRead/time.Duration(iterations)),
+		float64(totalLedgerDiskRead)/float64(totalLedgerTime)*100)
+	fmt.Fprintf(os.Stderr, "  Decompress:  %s (%.1f%%)\n",
+		formatDuration(totalLedgerDecompress/time.Duration(iterations)),
+		float64(totalLedgerDecompress)/float64(totalLedgerTime)*100)
+	fmt.Fprintf(os.Stderr, "  Unmarshal:   %s (%.1f%%)\n",
+		formatDuration(totalLedgerUnmarshal/time.Duration(iterations)),
+		float64(totalLedgerUnmarshal)/float64(totalLedgerTime)*100)
+
+	// Per-ledger stats
+	if matchingLedgers > 0 {
+		fmt.Fprintf(os.Stderr, "\nPer-ledger averages:\n")
+		fmt.Fprintf(os.Stderr, "  RocksDB:     %s/ledger\n", formatDuration(avgRocksDB/time.Duration(matchingLedgers)))
+		fmt.Fprintf(os.Stderr, "  Ledger file: %s/ledger\n", formatDuration(avgLedger/time.Duration(matchingLedgers)))
+	}
+}
+
+// extractEventsFromLedger extracts events from raw ledger XDR bytes and filters them
+func extractEventsFromLedger(xdrBytes []byte, networkPassphrase string, filter *store.QueryFilter) ([]*store.MinimalEvent, error) {
+	// Use the ingest package to extract events
+	events, err := ingest.ExtractEvents(xdrBytes, networkPassphrase, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter events
+	var result []*store.MinimalEvent
+	for _, e := range events {
+		// Check contract filter
+		if len(filter.ContractID) > 0 {
+			if len(e.ContractID) == 0 || string(e.ContractID) != string(filter.ContractID) {
+				continue
+			}
+		}
+
+		// Check topic0 filter
+		if len(filter.Topic0) > 0 {
+			if len(e.Topics) == 0 || string(e.Topics[0]) != string(filter.Topic0) {
+				continue
+			}
+		}
+
+		result = append(result, e)
+	}
+
+	return result, nil
+}
+
+// =============================================================================
 // Helpers (unchanged from your file)
 // =============================================================================
 
@@ -1088,7 +1347,7 @@ func bytesToMB(bytesStr string) string {
 	return fmt.Sprintf("%.2f", mb)
 }
 
-// formatElapsed formats a duration for display
+// formatElapsed formats a duration for display (human readable)
 func formatElapsed(d time.Duration) string {
 	if d < time.Minute {
 		return fmt.Sprintf("%.1fs", d.Seconds())
@@ -1106,6 +1365,20 @@ func formatElapsed(d time.Duration) string {
 		return fmt.Sprintf("%dd %dh %dm", days, hours, mins)
 	}
 	return fmt.Sprintf("%dh %dm", hours, mins)
+}
+
+// formatDuration formats a duration with appropriate precision for benchmarking
+func formatDuration(d time.Duration) string {
+	if d < time.Microsecond {
+		return fmt.Sprintf("%dns", d.Nanoseconds())
+	}
+	if d < time.Millisecond {
+		return fmt.Sprintf("%.2fµs", float64(d.Nanoseconds())/1000)
+	}
+	if d < time.Second {
+		return fmt.Sprintf("%.2fms", float64(d.Nanoseconds())/1000000)
+	}
+	return fmt.Sprintf("%.3fs", d.Seconds())
 }
 
 // printPerformanceTrend reads the history file and prints min/max/avg rates
