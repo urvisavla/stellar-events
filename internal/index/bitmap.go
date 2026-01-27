@@ -329,21 +329,54 @@ func (bi *BitmapIndex) QueryIndex(prefix byte, keyValue []byte, startLedger, end
 			}
 		}
 
-		if bitmap == nil {
+		if bitmap == nil || bitmap.IsEmpty() {
 			continue
 		}
 
-		// Convert local offsets to absolute ledger numbers and filter by range
 		segmentBase := segID * SegmentSize
-		iter := bitmap.Iterator()
-		for iter.HasNext() {
-			localLedger := iter.Next()
-			absLedger := segmentBase + localLedger
 
-			if absLedger >= startLedger && absLedger <= endLedger {
-				result.Add(absLedger)
+		// Apply range mask for partial segments (first and/or last segment)
+		isFirstSegment := segID == startSegment
+		isLastSegment := segID == endSegment
+		needsRangeMask := isFirstSegment || isLastSegment
+
+		if needsRangeMask {
+			// Calculate local range within this segment
+			localStart := uint64(0)
+			localEnd := uint64(SegmentSize)
+
+			if isFirstSegment && startLedger > segmentBase {
+				localStart = uint64(startLedger - segmentBase)
 			}
+			if isLastSegment {
+				segmentEnd := segmentBase + SegmentSize - 1
+				if endLedger < segmentEnd {
+					localEnd = uint64(endLedger - segmentBase + 1)
+				}
+			}
+
+			// Create range mask and apply with AND
+			mask := roaring.New()
+			mask.AddRange(localStart, localEnd)
+			bitmap = roaring.And(bitmap, mask) // Returns new bitmap, doesn't modify original
 		}
+
+		if bitmap.IsEmpty() {
+			continue
+		}
+
+		// Convert local offsets to absolute ledger numbers and merge
+		// Get all values as array, offset them, and add in bulk
+		localValues := bitmap.ToArray()
+		absoluteValues := make([]uint32, len(localValues))
+		for i, local := range localValues {
+			absoluteValues[i] = segmentBase + local
+		}
+
+		// Bulk add and merge with Or
+		segmentResult := roaring.New()
+		segmentResult.AddMany(absoluteValues)
+		result.Or(segmentResult)
 	}
 
 	return result, nil
