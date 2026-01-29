@@ -1654,10 +1654,23 @@ func (es *EventStore) computeStatsForRange(startLedger, endLedger uint32) struct
 	return result
 }
 
-// BuildUniqueIndexes scans all events and builds unique indexes with counts (one-time operation)
-func (es *EventStore) BuildUniqueIndexes(workers int, progressFn func(processed int64)) error {
+// BuildIndexes scans all events and builds indexes based on options (one-time operation)
+// L1 bitmap indexes are always built. L2 and unique indexes are optional.
+func (es *EventStore) BuildIndexes(workers int, opts *BuildIndexOptions, progressFn func(processed int64)) error {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
+	}
+
+	// Default options: L1 bitmap only
+	if opts == nil {
+		opts = &BuildIndexOptions{
+			BitmapIndexes: true,
+		}
+	}
+
+	// Ensure bitmap index is initialized if we're building bitmap indexes
+	if (opts.BitmapIndexes || opts.L2Indexes) && es.bitmapIndex == nil {
+		return fmt.Errorf("bitmap index not initialized - cannot build bitmap indexes")
 	}
 
 	minLedger, maxLedger, err := es.getLedgerRange()
@@ -1690,7 +1703,7 @@ func (es *EventStore) BuildUniqueIndexes(workers int, progressFn func(processed 
 		wg.Add(1)
 		go func(start, end uint32) {
 			defer wg.Done()
-			processed, err := es.buildIndexesForRange(start, end)
+			processed, err := es.buildIndexesForRange(start, end, opts)
 			if err != nil {
 				errCh <- err
 				return
@@ -1711,49 +1724,80 @@ func (es *EventStore) BuildUniqueIndexes(workers int, progressFn func(processed 
 		}
 	}
 
+	// Flush bitmap indexes at the end
+	if (opts.BitmapIndexes || opts.L2Indexes) && es.bitmapIndex != nil {
+		if err := es.bitmapIndex.FlushHotSegments(); err != nil {
+			return fmt.Errorf("failed to flush bitmap indexes: %w", err)
+		}
+	}
+
 	return nil
 }
 
-// buildIndexesForRange builds unique indexes with counts for a ledger range
-func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32) (int64, error) {
+// buildIndexesForRange builds indexes for a ledger range based on options
+func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *BuildIndexOptions) (int64, error) {
 	startKey := eventKeyFromParts(startLedger, 0, 0, 0)
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
 	defer it.Close()
 
 	var processed int64
 
-	// Accumulate counts in memory
-	counts := make(map[string]uint64)
+	// Accumulate unique counts in memory (only if building unique indexes)
+	var counts map[string]uint64
+	if opts.UniqueIndexes {
+		counts = make(map[string]uint64)
+	}
 
 	for it.Seek(startKey); it.Valid(); it.Next() {
 		key := it.Key().Data()
-		if len(key) < 4 {
+		if len(key) < 10 {
 			break
 		}
 
+		// Parse key: [ledger:4][tx:2][op:2][event:2]
 		ledger := binary.BigEndian.Uint32(key[0:4])
 		if ledger > endLedger {
 			break
 		}
+
+		txIdx := binary.BigEndian.Uint16(key[4:6])
+		opIdx := binary.BigEndian.Uint16(key[6:8])
+		eventIdx := binary.BigEndian.Uint16(key[8:10])
 
 		var xdrEvent xdr.ContractEvent
 		if err := xdrEvent.UnmarshalBinary(it.Value().Data()); err != nil {
 			continue
 		}
 
+		// Extract contract ID
+		var contractID []byte
 		if xdrEvent.ContractId != nil {
-			uk := string(uniqueKey(UniqueTypeContract, xdrEvent.ContractId[:]))
-			counts[uk]++
+			contractID = xdrEvent.ContractId[:]
 		}
 
+		// Extract topics
+		var topics [][]byte
 		if xdrEvent.Body.V == 0 {
 			body := xdrEvent.Body.MustV0()
 			for i, topic := range body.Topics {
+				if i > 3 {
+					break
+				}
 				topicBytes, err := topic.MarshalBinary()
 				if err != nil {
 					continue
 				}
+				topics = append(topics, topicBytes)
+			}
+		}
 
+		// Build UNIQUE indexes (counts)
+		if opts.UniqueIndexes {
+			if len(contractID) > 0 {
+				uk := string(uniqueKey(UniqueTypeContract, contractID))
+				counts[uk]++
+			}
+			for i, topicBytes := range topics {
 				var uniqueType byte
 				switch i {
 				case 0:
@@ -1772,22 +1816,44 @@ func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32) (int64
 			}
 		}
 
+		// Build L1 BITMAP indexes (contract/topic -> ledger)
+		if opts.BitmapIndexes && es.bitmapIndex != nil {
+			if len(contractID) > 0 {
+				es.bitmapIndex.AddContractIndex(contractID, ledger)
+			}
+			for i, topicBytes := range topics {
+				es.bitmapIndex.AddTopicIndex(i, topicBytes, ledger)
+			}
+		}
+
+		// Build L2 BITMAP indexes (contract/topic -> ledger:event)
+		if opts.L2Indexes && es.bitmapIndex != nil {
+			if len(contractID) > 0 {
+				es.bitmapIndex.AddContractL2Index(contractID, ledger, txIdx, opIdx, eventIdx)
+			}
+			for i, topicBytes := range topics {
+				es.bitmapIndex.AddTopicL2Index(i, topicBytes, ledger, txIdx, opIdx, eventIdx)
+			}
+		}
+
 		processed++
 	}
 
-	// Write all counts using merge operator (no reads needed!)
-	batch := grocksdb.NewWriteBatch()
-	defer batch.Destroy()
+	// Write unique index counts
+	if opts.UniqueIndexes && len(counts) > 0 {
+		batch := grocksdb.NewWriteBatch()
+		defer batch.Destroy()
 
-	for keyStr, count := range counts {
-		keyBytes := []byte(keyStr)
-		countBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(countBytes, count)
-		batch.MergeCF(es.cfUnique, keyBytes, countBytes)
-	}
+		for keyStr, count := range counts {
+			keyBytes := []byte(keyStr)
+			countBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(countBytes, count)
+			batch.MergeCF(es.cfUnique, keyBytes, countBytes)
+		}
 
-	if err := es.db.Write(es.wo, batch); err != nil {
-		return processed, fmt.Errorf("failed to write batch: %w", err)
+		if err := es.db.Write(es.wo, batch); err != nil {
+			return processed, fmt.Errorf("failed to write unique index batch: %w", err)
+		}
 	}
 
 	if err := it.Err(); err != nil {
@@ -2250,15 +2316,15 @@ func (es *EventStore) GetEventsWithFilterHierarchical(filter *QueryFilter, start
 	var err error
 
 	if len(filter.ContractID) > 0 {
-		hierarchicalResult, err = es.bitmapIndex.QueryContractIndexHierarchical(filter.ContractID, startLedger, endLedger)
+		hierarchicalResult, err = es.bitmapIndex.QueryContractIndexHierarchical(filter.ContractID, startLedger, endLedger, limit)
 	} else if len(filter.Topic0) > 0 {
-		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(0, filter.Topic0, startLedger, endLedger)
+		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(0, filter.Topic0, startLedger, endLedger, limit)
 	} else if len(filter.Topic1) > 0 {
-		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(1, filter.Topic1, startLedger, endLedger)
+		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(1, filter.Topic1, startLedger, endLedger, limit)
 	} else if len(filter.Topic2) > 0 {
-		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(2, filter.Topic2, startLedger, endLedger)
+		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(2, filter.Topic2, startLedger, endLedger, limit)
 	} else if len(filter.Topic3) > 0 {
-		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(3, filter.Topic3, startLedger, endLedger)
+		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(3, filter.Topic3, startLedger, endLedger, limit)
 	} else {
 		return nil, fmt.Errorf("at least one filter must be specified for hierarchical query")
 	}

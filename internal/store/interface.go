@@ -120,6 +120,7 @@ type Store interface {
 	// CompactAll runs manual compaction on the entire database.
 	CompactAll() *CompactionResult
 
-	// BuildUniqueIndexes rebuilds unique indexes from existing events.
-	BuildUniqueIndexes(workers int, progressFn func(processed int64)) error
+	// BuildIndexes rebuilds indexes from existing events.
+	// Options control which index types to build (L1 bitmap always, L2 and unique optional).
+	BuildIndexes(workers int, opts *BuildIndexOptions, progressFn func(processed int64)) error
 }

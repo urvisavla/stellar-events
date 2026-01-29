@@ -295,6 +295,13 @@ type IndexConfig struct {
 	Topics     bool // enables topic0-3
 }
 
+// BuildIndexOptions controls which indexes to build during rebuild.
+type BuildIndexOptions struct {
+	UniqueIndexes bool // Build unique value counts (for stats)
+	BitmapIndexes bool // Build L1 bitmap indexes (ledger-level)
+	L2Indexes     bool // Build L2 bitmap indexes (event-level)
+}
+
 // DefaultIndexConfig returns config with all indexes enabled.
 func DefaultIndexConfig() *IndexConfig {
 	return &IndexConfig{

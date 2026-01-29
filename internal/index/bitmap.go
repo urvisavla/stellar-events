@@ -224,12 +224,23 @@ func (bi *BitmapIndex) FlushL2Segments() error {
 	bi.hotL2SegmentsMu.Lock()
 	defer bi.hotL2SegmentsMu.Unlock()
 
-	if len(bi.hotL2Segments) == 0 {
+	totalSegments := len(bi.hotL2Segments)
+	if totalSegments == 0 {
 		return nil
 	}
 
+	// Log flush start for large flushes
+	if totalSegments > 10000 {
+		fmt.Printf("Flushing %d L2 bitmap segments...\n", totalSegments)
+	}
+
+	start := time.Now()
+
+	// Flush in batches to avoid huge WriteBatch memory usage
+	const maxBatchSize = 10000
 	batch := grocksdb.NewWriteBatch()
-	defer batch.Destroy()
+	batchCount := 0
+	flushedCount := 0
 
 	for cacheKey, bitmap := range bi.hotL2Segments {
 		// Optimize bitmap before storage
@@ -238,6 +249,7 @@ func (bi *BitmapIndex) FlushL2Segments() error {
 		// Serialize
 		data, err := bitmap.ToBytes()
 		if err != nil {
+			batch.Destroy()
 			return fmt.Errorf("failed to serialize L2 bitmap: %w", err)
 		}
 
@@ -250,10 +262,34 @@ func (bi *BitmapIndex) FlushL2Segments() error {
 		copy(value[1:], compressed)
 
 		batch.PutCF(bi.indexCF, []byte(cacheKey), value)
+		batchCount++
+
+		// Write batch when it reaches max size
+		if batchCount >= maxBatchSize {
+			if err := bi.db.Write(bi.wo, batch); err != nil {
+				batch.Destroy()
+				return fmt.Errorf("failed to write L2 bitmap batch: %w", err)
+			}
+			flushedCount += batchCount
+			batch.Destroy()
+			batch = grocksdb.NewWriteBatch()
+			batchCount = 0
+		}
 	}
 
-	if err := bi.db.Write(bi.wo, batch); err != nil {
-		return fmt.Errorf("failed to write L2 bitmap batch: %w", err)
+	// Write remaining entries
+	if batchCount > 0 {
+		if err := bi.db.Write(bi.wo, batch); err != nil {
+			batch.Destroy()
+			return fmt.Errorf("failed to write L2 bitmap batch: %w", err)
+		}
+		flushedCount += batchCount
+	}
+	batch.Destroy()
+
+	// Log flush completion for large flushes
+	if totalSegments > 10000 {
+		fmt.Printf("Flushed %d L2 segments in %v\n", flushedCount, time.Since(start))
 	}
 
 	// Clear hot L2 segments after successful write
@@ -318,7 +354,8 @@ func (bi *BitmapIndex) QueryL2Index(prefix byte, keyValue []byte, ledgerSeq uint
 }
 
 // QueryIndexHierarchical performs a two-level query: L1 for ledgers, L2 for events
-func (bi *BitmapIndex) QueryIndexHierarchical(l1Prefix, l2Prefix byte, keyValue []byte, startLedger, endLedger uint32) (*IndexQueryResult, error) {
+// If limit > 0, stops collecting event keys once limit is reached (early termination)
+func (bi *BitmapIndex) QueryIndexHierarchical(l1Prefix, l2Prefix byte, keyValue []byte, startLedger, endLedger uint32, limit int) (*IndexQueryResult, error) {
 	result := &IndexQueryResult{}
 	totalStart := time.Now()
 
@@ -341,6 +378,11 @@ func (bi *BitmapIndex) QueryIndexHierarchical(l1Prefix, l2Prefix byte, keyValue 
 	ledgers := ledgerBitmap.ToArray()
 
 	for _, ledgerSeq := range ledgers {
+		// Early termination if we have enough events
+		if limit > 0 && len(result.EventKeys) >= limit {
+			break
+		}
+
 		l2Bitmap, err := bi.QueryL2Index(l2Prefix, keyValue, ledgerSeq)
 		if err != nil {
 			return nil, fmt.Errorf("L2 query failed for ledger %d: %w", ledgerSeq, err)
@@ -353,6 +395,10 @@ func (bi *BitmapIndex) QueryIndexHierarchical(l1Prefix, l2Prefix byte, keyValue 
 		// Convert L2 bitmap to event keys
 		eventIndices := l2Bitmap.ToArray()
 		for _, encodedIdx := range eventIndices {
+			// Early termination within ledger
+			if limit > 0 && len(result.EventKeys) >= limit {
+				break
+			}
 			result.EventKeys = append(result.EventKeys, EventKey{
 				LedgerSeq:  ledgerSeq,
 				EventIndex: encodedIdx, // Full 32-bit encoded value: [tx:10][op:10][event:12]
@@ -368,12 +414,12 @@ func (bi *BitmapIndex) QueryIndexHierarchical(l1Prefix, l2Prefix byte, keyValue 
 }
 
 // QueryContractIndexHierarchical queries using hierarchical approach for contract ID
-func (bi *BitmapIndex) QueryContractIndexHierarchical(contractID []byte, startLedger, endLedger uint32) (*IndexQueryResult, error) {
-	return bi.QueryIndexHierarchical(PrefixContractIndex, PrefixContractL2, contractID, startLedger, endLedger)
+func (bi *BitmapIndex) QueryContractIndexHierarchical(contractID []byte, startLedger, endLedger uint32, limit int) (*IndexQueryResult, error) {
+	return bi.QueryIndexHierarchical(PrefixContractIndex, PrefixContractL2, contractID, startLedger, endLedger, limit)
 }
 
 // QueryTopicIndexHierarchical queries using hierarchical approach for topics
-func (bi *BitmapIndex) QueryTopicIndexHierarchical(topicPosition int, topicValue []byte, startLedger, endLedger uint32) (*IndexQueryResult, error) {
+func (bi *BitmapIndex) QueryTopicIndexHierarchical(topicPosition int, topicValue []byte, startLedger, endLedger uint32, limit int) (*IndexQueryResult, error) {
 	var l1Prefix, l2Prefix byte
 	switch topicPosition {
 	case 0:
@@ -387,7 +433,7 @@ func (bi *BitmapIndex) QueryTopicIndexHierarchical(topicPosition int, topicValue
 	default:
 		return nil, fmt.Errorf("invalid topic position: %d", topicPosition)
 	}
-	return bi.QueryIndexHierarchical(l1Prefix, l2Prefix, topicValue, startLedger, endLedger)
+	return bi.QueryIndexHierarchical(l1Prefix, l2Prefix, topicValue, startLedger, endLedger, limit)
 }
 
 // GetL2Stats returns statistics about L2 hot segments

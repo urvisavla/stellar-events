@@ -26,6 +26,7 @@ func runQuery(cfg *config.Config, args []string) {
 	topic2 := fs.String("topic2", "", "Topic2 (base64)")
 	topic3 := fs.String("topic3", "", "Topic3 (base64)")
 	limit := fs.Int("limit", 0, "Max results (0 = use config default)")
+	noL2 := fs.Bool("no-l2", false, "Skip L2 index, use L1 bitmap only")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: query <start> [end] [options]\n\n")
@@ -39,14 +40,16 @@ func runQuery(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "  --topic1 <val>    Filter by topic1 (base64)\n")
 		fmt.Fprintf(os.Stderr, "  --topic2 <val>    Filter by topic2 (base64)\n")
 		fmt.Fprintf(os.Stderr, "  --topic3 <val>    Filter by topic3 (base64)\n")
-		fmt.Fprintf(os.Stderr, "  --limit <n>       Max results (default: %d from config)\n\n", cfg.Query.DefaultLimit)
-		fmt.Fprintf(os.Stderr, "Query uses hierarchical L1+L2 bitmap with auto-fallback.\n")
+		fmt.Fprintf(os.Stderr, "  --limit <n>       Max results (default: %d from config)\n", cfg.Query.DefaultLimit)
+		fmt.Fprintf(os.Stderr, "  --no-l2           Use L1 bitmap only (skip hierarchical L2 lookup)\n\n")
+		fmt.Fprintf(os.Stderr, "By default, query uses hierarchical L1+L2 bitmap with auto-fallback to L1.\n")
 		fmt.Fprintf(os.Stderr, "Timing stats are always shown.\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  query 55000000                              # Query single ledger\n")
 		fmt.Fprintf(os.Stderr, "  query 55000000 56000000                     # Query range\n")
 		fmt.Fprintf(os.Stderr, "  query 55000000 --contract <base64_id>       # Filter by contract\n")
 		fmt.Fprintf(os.Stderr, "  query 55000000 56000000 --topic0 <base64>   # Filter by topic\n")
+		fmt.Fprintf(os.Stderr, "  query 55000000 --contract <id> --no-l2      # Use L1 only\n")
 	}
 
 	// Custom parsing to handle positional args before flags
@@ -109,10 +112,10 @@ func runQuery(cfg *config.Config, args []string) {
 		queryLimit = cfg.Query.DefaultLimit
 	}
 
-	cmdQuery(cfg, uint32(startLedger), uint32(endLedger), *contract, *topic0, *topic1, *topic2, *topic3, queryLimit)
+	cmdQuery(cfg, uint32(startLedger), uint32(endLedger), *contract, *topic0, *topic1, *topic2, *topic3, queryLimit, *noL2)
 }
 
-func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, topic0, topic1, topic2, topic3 string, limit int) {
+func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, topic0, topic1, topic2, topic3 string, limit int, skipL2 bool) {
 	eventStore, err := openEventStore(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open event store: %v\n", err)
@@ -184,15 +187,10 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 		}
 	}
 
-	// Always try hierarchical query first (if filter specified), with auto-fallback
+	// Query with filter - use hierarchical L1+L2 or L1-only based on skipL2 flag
 	if hasAnyFilter {
-		fmt.Fprintf(os.Stderr, "Querying with HIERARCHICAL L1+L2 bitmap in ledgers %d-%d...\n", startLedger, endLedger)
-		hierarchicalResult, err = eventStore.GetEventsWithFilterHierarchical(filter, startLedger, endLedger, limit)
-		if err != nil {
-			// Fallback to L1-only bitmap query
-			fmt.Fprintf(os.Stderr, "Hierarchical query unavailable (%v), falling back to L1 bitmap...\n", err)
-			hierarchicalResult = nil
-
+		if skipL2 {
+			// L1-only bitmap query (skip hierarchical)
 			fmt.Fprintf(os.Stderr, "Querying with L1 bitmap index in ledgers %d-%d...\n", startLedger, endLedger)
 			queryResult, err = eventStore.GetEventsWithFilter(filter, startLedger, endLedger, limit)
 			if err != nil {
@@ -201,7 +199,24 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 			}
 			events = queryResult.Events
 		} else {
-			events = hierarchicalResult.Events
+			// Try hierarchical L1+L2 first, with auto-fallback to L1
+			fmt.Fprintf(os.Stderr, "Querying with HIERARCHICAL L1+L2 bitmap in ledgers %d-%d...\n", startLedger, endLedger)
+			hierarchicalResult, err = eventStore.GetEventsWithFilterHierarchical(filter, startLedger, endLedger, limit)
+			if err != nil {
+				// Fallback to L1-only bitmap query
+				fmt.Fprintf(os.Stderr, "Hierarchical query unavailable (%v), falling back to L1 bitmap...\n", err)
+				hierarchicalResult = nil
+
+				fmt.Fprintf(os.Stderr, "Querying with L1 bitmap index in ledgers %d-%d...\n", startLedger, endLedger)
+				queryResult, err = eventStore.GetEventsWithFilter(filter, startLedger, endLedger, limit)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
+					os.Exit(1)
+				}
+				events = queryResult.Events
+			} else {
+				events = hierarchicalResult.Events
+			}
 		}
 	} else {
 		// No filter - scan all events in range
