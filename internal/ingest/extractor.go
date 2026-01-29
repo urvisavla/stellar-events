@@ -12,7 +12,7 @@ import (
 
 // ExtractEvents extracts events as raw XDR with minimal overhead
 // This is the fastest extraction mode - no field parsing, just raw bytes
-func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats) ([]*store.MinimalEvent, error) {
+func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats) ([]*store.IngestEvent, error) {
 	var lcm xdr.LedgerCloseMeta
 	if err := lcm.UnmarshalBinary(xdrBytes); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal LedgerCloseMeta: %w", err)
@@ -33,7 +33,7 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 	}
 	defer txReader.Close()
 
-	var events []*store.MinimalEvent
+	var events []*store.IngestEvent
 	ledgerSeq := lcm.LedgerSequence()
 
 	for {
@@ -53,6 +53,9 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 		if err != nil {
 			return nil, fmt.Errorf("failed to get transaction events: %w", err)
 		}
+
+		// Capture transaction hash once for all events in this transaction
+		txHash := tx.Hash[:]
 
 		// Process transaction-level events
 		for eventIndex, event := range txEvents.TransactionEvents {
@@ -80,7 +83,7 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 				}
 			}
 
-			events = append(events, &store.MinimalEvent{
+			events = append(events, &store.IngestEvent{
 				LedgerSequence:   ledgerSeq,
 				TransactionIndex: uint16(tx.Index),
 				OperationIndex:   0, // Transaction-level events have no operation
@@ -88,6 +91,7 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 				RawXDR:           rawXDR,
 				ContractID:       contractID,
 				Topics:           topics,
+				TxHash:           txHash,
 			})
 		}
 
@@ -118,7 +122,7 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 					}
 				}
 
-				events = append(events, &store.MinimalEvent{
+				events = append(events, &store.IngestEvent{
 					LedgerSequence:   ledgerSeq,
 					TransactionIndex: uint16(tx.Index),
 					OperationIndex:   uint16(opIndex),
@@ -126,6 +130,7 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 					RawXDR:           rawXDR,
 					ContractID:       contractID,
 					Topics:           topics,
+					TxHash:           txHash,
 				})
 			}
 		}

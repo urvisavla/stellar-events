@@ -4,26 +4,15 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/RoaringBitmap/roaring"
 	"github.com/klauspost/compress/zstd"
 	"github.com/linxGnu/grocksdb"
 )
 
+// Compression markers (internal)
 const (
-	// SegmentSize is the number of ledgers per bitmap segment
-	// 1M ledgers ≈ 2 months of Stellar data
-	// Small enough to limit write amplification, large enough to amortize overhead
-	SegmentSize uint32 = 1_000_000
-
-	// Index type prefixes
-	PrefixContractIndex byte = 0x01
-	PrefixTopic0Index   byte = 0x02
-	PrefixTopic1Index   byte = 0x03
-	PrefixTopic2Index   byte = 0x04
-	PrefixTopic3Index   byte = 0x05
-
-	// Compression marker
 	compressionMarker byte = 0x01
 	noCompression     byte = 0x00
 )
@@ -33,9 +22,13 @@ type BitmapIndex struct {
 	db      *grocksdb.DB
 	indexCF *grocksdb.ColumnFamilyHandle
 
-	// Hot segment cache - maps "prefix:keyHash:segmentID" to bitmap
+	// Level 1: Hot segment cache - maps "prefix:keyHash:segmentID" to bitmap of ledgers
 	hotSegments   map[string]*roaring.Bitmap
 	hotSegmentsMu sync.RWMutex
+
+	// Level 2: Hot cache - maps "L2prefix:keyHash:ledger" to bitmap of event indices
+	hotL2Segments   map[string]*roaring.Bitmap
+	hotL2SegmentsMu sync.RWMutex
 
 	// Current hot segment ID (the one being actively written)
 	currentSegmentID uint32
@@ -66,13 +59,14 @@ func NewBitmapIndex(db *grocksdb.DB, indexCF *grocksdb.ColumnFamilyHandle) (*Bit
 	wo.DisableWAL(true) // WAL disabled for bulk ingestion
 
 	return &BitmapIndex{
-		db:           db,
-		indexCF:      indexCF,
-		hotSegments:  make(map[string]*roaring.Bitmap),
-		zstdEncoder:  encoder,
-		zstdDecoder:  decoder,
-		wo:           wo,
-		ro:           grocksdb.NewDefaultReadOptions(),
+		db:            db,
+		indexCF:       indexCF,
+		hotSegments:   make(map[string]*roaring.Bitmap),
+		hotL2Segments: make(map[string]*roaring.Bitmap),
+		zstdEncoder:   encoder,
+		zstdDecoder:   decoder,
+		wo:            wo,
+		ro:            grocksdb.NewDefaultReadOptions(),
 	}, nil
 }
 
@@ -82,18 +76,6 @@ func (bi *BitmapIndex) Close() {
 	bi.zstdDecoder.Close()
 	bi.wo.Destroy()
 	bi.ro.Destroy()
-}
-
-// SegmentID returns the segment ID for a given ledger sequence
-func SegmentID(ledgerSeq uint32) uint32 {
-	return ledgerSeq / SegmentSize
-}
-
-// SegmentRange returns the ledger range for a segment
-func SegmentRange(segmentID uint32) (start, end uint32) {
-	start = segmentID * SegmentSize
-	end = start + SegmentSize - 1
-	return
 }
 
 // makeDBKey creates a database key for a bitmap segment
@@ -167,8 +149,272 @@ func (bi *BitmapIndex) AddTopicIndex(topicPosition int, topicValue []byte, ledge
 	bi.AddToIndex(prefix, topicValue, ledgerSeq)
 }
 
-// FlushHotSegments writes all hot segments to the database
+// =============================================================================
+// Level 2 Index (Event-level granularity)
+// =============================================================================
+
+// makeL2DBKey creates a database key for an L2 bitmap
+// Format: <L2prefix:1><keyValue:32><ledger:4>
+func makeL2DBKey(prefix byte, keyValue []byte, ledgerSeq uint32) []byte {
+	key := make([]byte, 1+32+4)
+	key[0] = prefix
+
+	// Pad or truncate keyValue to 32 bytes
+	if len(keyValue) >= 32 {
+		copy(key[1:33], keyValue[:32])
+	} else {
+		copy(key[1:1+len(keyValue)], keyValue)
+	}
+
+	// Big-endian ledger sequence for proper sorting
+	binary.BigEndian.PutUint32(key[33:37], ledgerSeq)
+	return key
+}
+
+// makeL2CacheKey creates a cache key for the hot L2 segments map
+func makeL2CacheKey(prefix byte, keyValue []byte, ledgerSeq uint32) string {
+	dbKey := makeL2DBKey(prefix, keyValue, ledgerSeq)
+	return string(dbKey)
+}
+
+// AddToL2Index adds an event index to the L2 bitmap for a given key and ledger
+// eventIndex encodes tx:op:event as a single uint32
+func (bi *BitmapIndex) AddToL2Index(prefix byte, keyValue []byte, ledgerSeq uint32, eventIndex uint32) {
+	cacheKey := makeL2CacheKey(prefix, keyValue, ledgerSeq)
+
+	bi.hotL2SegmentsMu.Lock()
+	defer bi.hotL2SegmentsMu.Unlock()
+
+	bitmap, exists := bi.hotL2Segments[cacheKey]
+	if !exists {
+		bitmap = roaring.New()
+		bi.hotL2Segments[cacheKey] = bitmap
+	}
+
+	bitmap.Add(eventIndex)
+}
+
+// AddContractL2Index adds an event to the contract ID L2 index
+func (bi *BitmapIndex) AddContractL2Index(contractID []byte, ledgerSeq uint32, txIndex, opIndex, eventIndex uint16) {
+	encoded := EncodeEventIndex(txIndex, opIndex, eventIndex)
+	bi.AddToL2Index(PrefixContractL2, contractID, ledgerSeq, encoded)
+}
+
+// AddTopicL2Index adds an event to a topic L2 index
+func (bi *BitmapIndex) AddTopicL2Index(topicPosition int, topicValue []byte, ledgerSeq uint32, txIndex, opIndex, eventIndex uint16) {
+	var prefix byte
+	switch topicPosition {
+	case 0:
+		prefix = PrefixTopic0L2
+	case 1:
+		prefix = PrefixTopic1L2
+	case 2:
+		prefix = PrefixTopic2L2
+	case 3:
+		prefix = PrefixTopic3L2
+	default:
+		return // Invalid topic position
+	}
+	encoded := EncodeEventIndex(txIndex, opIndex, eventIndex)
+	bi.AddToL2Index(prefix, topicValue, ledgerSeq, encoded)
+}
+
+// FlushL2Segments writes all hot L2 segments to the database
+func (bi *BitmapIndex) FlushL2Segments() error {
+	bi.hotL2SegmentsMu.Lock()
+	defer bi.hotL2SegmentsMu.Unlock()
+
+	if len(bi.hotL2Segments) == 0 {
+		return nil
+	}
+
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+
+	for cacheKey, bitmap := range bi.hotL2Segments {
+		// Optimize bitmap before storage
+		bitmap.RunOptimize()
+
+		// Serialize
+		data, err := bitmap.ToBytes()
+		if err != nil {
+			return fmt.Errorf("failed to serialize L2 bitmap: %w", err)
+		}
+
+		// Compress
+		compressed := bi.zstdEncoder.EncodeAll(data, nil)
+
+		// Add compression marker
+		value := make([]byte, 1+len(compressed))
+		value[0] = compressionMarker
+		copy(value[1:], compressed)
+
+		batch.PutCF(bi.indexCF, []byte(cacheKey), value)
+	}
+
+	if err := bi.db.Write(bi.wo, batch); err != nil {
+		return fmt.Errorf("failed to write L2 bitmap batch: %w", err)
+	}
+
+	// Clear hot L2 segments after successful write
+	bi.hotL2Segments = make(map[string]*roaring.Bitmap)
+
+	return nil
+}
+
+// loadL2Bitmap loads an L2 bitmap from the database
+func (bi *BitmapIndex) loadL2Bitmap(prefix byte, keyValue []byte, ledgerSeq uint32) (*roaring.Bitmap, error) {
+	dbKey := makeL2DBKey(prefix, keyValue, ledgerSeq)
+
+	value, err := bi.db.GetCF(bi.ro, bi.indexCF, dbKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get L2 bitmap: %w", err)
+	}
+	defer value.Free()
+
+	if value.Size() == 0 {
+		return nil, nil // No data for this key
+	}
+
+	data := value.Data()
+
+	// Check compression marker
+	if data[0] == compressionMarker {
+		decompressed, err := bi.zstdDecoder.DecodeAll(data[1:], nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress L2 bitmap: %w", err)
+		}
+		data = decompressed
+	} else {
+		data = data[1:] // Skip marker
+	}
+
+	bitmap := roaring.New()
+	if err := bitmap.UnmarshalBinary(data); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal L2 bitmap: %w", err)
+	}
+
+	return bitmap, nil
+}
+
+// QueryL2Index returns event indices for a specific ledger
+func (bi *BitmapIndex) QueryL2Index(prefix byte, keyValue []byte, ledgerSeq uint32) (*roaring.Bitmap, error) {
+	// Check hot cache first
+	cacheKey := makeL2CacheKey(prefix, keyValue, ledgerSeq)
+
+	bi.hotL2SegmentsMu.RLock()
+	bitmap, inCache := bi.hotL2Segments[cacheKey]
+	if inCache {
+		bitmap = bitmap.Clone()
+	}
+	bi.hotL2SegmentsMu.RUnlock()
+
+	if inCache {
+		return bitmap, nil
+	}
+
+	// Load from DB
+	return bi.loadL2Bitmap(prefix, keyValue, ledgerSeq)
+}
+
+// QueryIndexHierarchical performs a two-level query: L1 for ledgers, L2 for events
+func (bi *BitmapIndex) QueryIndexHierarchical(l1Prefix, l2Prefix byte, keyValue []byte, startLedger, endLedger uint32) (*IndexQueryResult, error) {
+	result := &IndexQueryResult{}
+	totalStart := time.Now()
+
+	// Phase 1: Query L1 to get matching ledgers
+	l1Start := time.Now()
+	ledgerBitmap, err := bi.QueryIndex(l1Prefix, keyValue, startLedger, endLedger)
+	if err != nil {
+		return nil, fmt.Errorf("L1 query failed: %w", err)
+	}
+	result.L1LookupTime = time.Since(l1Start)
+	result.MatchingLedgers = int(ledgerBitmap.GetCardinality())
+
+	if ledgerBitmap.IsEmpty() {
+		result.TotalTime = time.Since(totalStart)
+		return result, nil
+	}
+
+	// Phase 2: For each matching ledger, query L2 to get event indices
+	l2Start := time.Now()
+	ledgers := ledgerBitmap.ToArray()
+
+	for _, ledgerSeq := range ledgers {
+		l2Bitmap, err := bi.QueryL2Index(l2Prefix, keyValue, ledgerSeq)
+		if err != nil {
+			return nil, fmt.Errorf("L2 query failed for ledger %d: %w", ledgerSeq, err)
+		}
+
+		if l2Bitmap == nil || l2Bitmap.IsEmpty() {
+			continue
+		}
+
+		// Convert L2 bitmap to event keys
+		eventIndices := l2Bitmap.ToArray()
+		for _, encodedIdx := range eventIndices {
+			result.EventKeys = append(result.EventKeys, EventKey{
+				LedgerSeq:  ledgerSeq,
+				EventIndex: encodedIdx, // Full 32-bit encoded value: [tx:10][op:10][event:12]
+			})
+		}
+	}
+
+	result.L2LookupTime = time.Since(l2Start)
+	result.TotalEvents = len(result.EventKeys)
+	result.TotalTime = time.Since(totalStart)
+
+	return result, nil
+}
+
+// QueryContractIndexHierarchical queries using hierarchical approach for contract ID
+func (bi *BitmapIndex) QueryContractIndexHierarchical(contractID []byte, startLedger, endLedger uint32) (*IndexQueryResult, error) {
+	return bi.QueryIndexHierarchical(PrefixContractIndex, PrefixContractL2, contractID, startLedger, endLedger)
+}
+
+// QueryTopicIndexHierarchical queries using hierarchical approach for topics
+func (bi *BitmapIndex) QueryTopicIndexHierarchical(topicPosition int, topicValue []byte, startLedger, endLedger uint32) (*IndexQueryResult, error) {
+	var l1Prefix, l2Prefix byte
+	switch topicPosition {
+	case 0:
+		l1Prefix, l2Prefix = PrefixTopic0Index, PrefixTopic0L2
+	case 1:
+		l1Prefix, l2Prefix = PrefixTopic1Index, PrefixTopic1L2
+	case 2:
+		l1Prefix, l2Prefix = PrefixTopic2Index, PrefixTopic2L2
+	case 3:
+		l1Prefix, l2Prefix = PrefixTopic3Index, PrefixTopic3L2
+	default:
+		return nil, fmt.Errorf("invalid topic position: %d", topicPosition)
+	}
+	return bi.QueryIndexHierarchical(l1Prefix, l2Prefix, topicValue, startLedger, endLedger)
+}
+
+// GetL2Stats returns statistics about L2 hot segments
+func (bi *BitmapIndex) GetL2Stats() (count int, totalCards uint64) {
+	bi.hotL2SegmentsMu.RLock()
+	defer bi.hotL2SegmentsMu.RUnlock()
+
+	count = len(bi.hotL2Segments)
+	for _, bm := range bi.hotL2Segments {
+		totalCards += bm.GetCardinality()
+	}
+	return
+}
+
+// FlushHotSegments writes all hot segments (L1 and L2) to the database
 func (bi *BitmapIndex) FlushHotSegments() error {
+	// Flush L1 segments
+	if err := bi.flushL1Segments(); err != nil {
+		return err
+	}
+
+	// Flush L2 segments
+	return bi.FlushL2Segments()
+}
+
+// flushL1Segments writes L1 hot segments to the database
+func (bi *BitmapIndex) flushL1Segments() error {
 	bi.hotSegmentsMu.Lock()
 	defer bi.hotSegmentsMu.Unlock()
 
@@ -416,19 +662,6 @@ func (bi *BitmapIndex) GetHotSegmentStats() (count int, totalCards uint64, memBy
 		memBytes += bitmap.GetSizeInBytes()
 	}
 	return
-}
-
-// BitmapIndexStats holds statistics about the bitmap index
-type BitmapIndexStats struct {
-	HotSegmentCount     int
-	HotSegmentCards     uint64
-	HotSegmentMemBytes  uint64
-	CurrentSegmentID    uint32
-	ContractIndexCount  int64
-	Topic0IndexCount    int64
-	Topic1IndexCount    int64
-	Topic2IndexCount    int64
-	Topic3IndexCount    int64
 }
 
 // GetStats returns statistics about the bitmap index

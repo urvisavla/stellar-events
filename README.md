@@ -1,16 +1,16 @@
 # Stellar Events
 
-A Go tool to extract Soroban contract events from Stellar ledger files and store them in RocksDB for fast querying.
+A Go CLI tool to extract Soroban contract events from Stellar ledger files and store them in RocksDB for fast querying. Uses roaring bitmap indexes for efficient range queries across millions of ledgers.
 
 ## Features
 
-- Extract events from ledger files
-- Store events in RocksDB with secondary indexes
-- Query by ledger, contract ID, transaction hash, event type, or topics
+- Extract events from chunked ledger files (zstd-compressed XDR)
+- Store events in RocksDB with roaring bitmap indexes
+- Query by ledger range, contract ID, or topics
+- Parallel ingestion pipeline with configurable workers
 - Progress tracking with performance snapshots
 - Resume capability for interrupted ingestion
 - Configurable RocksDB tuning for optimal performance
-- Final compaction for read-optimized storage
 
 ## Prerequisites
 
@@ -29,14 +29,30 @@ apt-get install librocksdb-dev
 ## Installation
 
 ```bash
-go mod download
+# Install dependencies
+make deps
 
-# macOS with Homebrew
-CGO_CFLAGS="-I/opt/homebrew/include" \
-CGO_LDFLAGS="-L/opt/homebrew/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd" \
+# Build (auto-detects macOS vs Linux)
+make build
+
+# Or build for specific platform
+make build-macos
+make build-linux
+```
+
+### Manual Build (if not using Make)
+
+RocksDB requires CGO:
+
+```bash
+# macOS (Homebrew)
+CGO_ENABLED=1 \
+CGO_CFLAGS="-I$(brew --prefix)/include" \
+CGO_LDFLAGS="-L$(brew --prefix)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd" \
 go build -o stellar-events ./cmd/
 
-# Linux (adjust paths as needed)
+# Linux
+CGO_ENABLED=1 \
 CGO_CFLAGS="-I/usr/include" \
 CGO_LDFLAGS="-L/usr/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd" \
 go build -o stellar-events ./cmd/
@@ -62,85 +78,56 @@ The tool looks for `config.toml` in the current directory.
 
 # Override ledger range
 ./stellar-events ingest --start 1000 --end 2000
-
-# Resume from a previous progress file
-./stellar-events ingest --resume progress_20240118T143052.json
 ```
 
 ### Query Events
 
 ```bash
-# Query by ledger
-./stellar-events query --ledger 12345
+# Query by ledger range
 ./stellar-events query --start 100 --end 200
 
 # Query by contract ID (base64)
-./stellar-events query --contract <base64_id>
-
-# Query by transaction hash (hex)
-./stellar-events query --txhash <hex_hash>
-
-# Query by event type
-./stellar-events query --type contract
-./stellar-events query --type system
-./stellar-events query --type diagnostic
+./stellar-events query --start 100 --end 200 --contract <base64_id>
 
 # Query by topic (base64)
-./stellar-events query --topic0 <base64_value>
-./stellar-events query --topic1 <base64_value>
+./stellar-events query --start 100 --end 200 --topic0 <base64_value>
+
+# Use bitmap index for fast queries (default)
+./stellar-events query --start 100 --end 200 --contract <id> --bitmap
+
+# Show query statistics
+./stellar-events query --start 100 --end 200 --stats
 ```
 
-### Database Statistics
+### Other Commands
 
 ```bash
-# Basic stats
+# Show database statistics
 ./stellar-events stats
+./stellar-events stats --storage --indexes
 
-# Include RocksDB storage metrics
-./stellar-events stats --storage
+# Show available ledger ranges in source data
+./stellar-events ledgers
 
-# Include index entry counts
-./stellar-events stats --indexes
+# Run manual RocksDB compaction
+./stellar-events compact
 
-# Show source ledger data stats
-./stellar-events stats --source
-
-# Dump all stats to JSON
-./stellar-events stats --storage --indexes --dump stats.json
+# Benchmark RocksDB vs ledger file performance
+./stellar-events benchmark
 ```
 
 ## Progress Tracking
 
-Ingestion automatically creates progress files for monitoring and resume capability:
+Ingestion automatically creates progress files:
 
 | File | Description |
 |------|-------------|
 | `progress_<timestamp>.json` | Current state, updated every 5 seconds |
-| `progress_<timestamp>.jsonl` | Historical snapshots for trend analysis |
-| `progress_<timestamp>_summary.txt` | Final summary after ingestion |
+| `progress_<timestamp>_history.jsonl` | Historical snapshots for trend analysis |
 
-### Snapshot Metrics
-
-Snapshots are recorded every 1M ledgers and include:
-
-- Throughput (ledgers/sec, events/sec)
-- Timing breakdown (read vs write time)
-- Storage metrics (SST size, memtable)
-- RocksDB state (L0 files, compaction status)
-
-## Ingestion Summary
-
-After ingestion completes, a summary is printed with:
-
-- **Results**: Ledgers, events, transactions processed
-- **Performance**: Average throughput rates
-- **Storage**: Raw data size, RocksDB size, compression savings
-- **Compaction**: Before/after metrics if final compaction ran
-- **RocksDB State**: File counts by level
+Snapshots are recorded every 1M ledgers and include throughput, timing breakdown, storage metrics, and RocksDB state.
 
 ## RocksDB Tuning
-
-The config supports tuning for different workloads:
 
 ```toml
 [storage.rocksdb]
@@ -152,10 +139,6 @@ max_write_buffer_number = 2
 block_cache_size_mb = 64
 bloom_filter_bits_per_key = 10
 
-# Compaction (increase for write-heavy ingestion)
-level0_file_num_compaction_trigger = 4
-max_background_compactions = 4
-
 # Compression
 compression = "lz4"
 bottommost_compression = "zstd"
@@ -163,12 +146,8 @@ bottommost_compression = "zstd"
 
 ### Final Compaction
 
-After ingestion, manual compaction runs by default to:
-- Merge L0 files for faster reads
-- Apply bottommost compression
-- Reclaim space from deleted tombstones
+After ingestion, manual compaction runs by default to merge L0 files and apply compression. Disable for faster ingestion:
 
-Disable for faster ingestion if you'll compact later:
 ```toml
 [ingestion]
 final_compaction = false
@@ -179,35 +158,43 @@ final_compaction = false
 ```
 stellar-events/
 ├── cmd/
-│   └── main.go                  # CLI entry point
+│   └── main.go              # CLI entry point, all commands
 ├── internal/
-│   ├── config/
-│   │   └── config.go            # TOML config loading
-│   ├── reader/
-│   │   └── ledger.go            # Ledger file reader
-│   ├── ingest/
-│   │   └── extractor.go         # Event extraction from XDR
-│   ├── store/
-│   │   └── rocksdb.go           # RocksDB storage & queries
-│   └── progress/
-│       └── tracker.go           # Ingestion progress tracking
+│   ├── auth/                # Authentication (placeholder for future use)
+│   ├── config/              # TOML configuration loading
+│   ├── index/               # Roaring bitmap indexes
+│   ├── ingest/              # Event extraction pipeline
+│   ├── progress/            # Ingestion progress tracking
+│   ├── reader/              # Ledger file reader (chunked, zstd)
+│   └── store/               # RocksDB storage and queries
 ├── configs/
-│   └── config.example.toml
-├── go.mod
-└── README.md
+│   └── config.example.toml  # Example configuration
+├── Makefile                 # Build automation
+└── config.toml              # Runtime configuration
 ```
 
-## Secondary Indexes
+## Storage Architecture
 
-The following indexes are created for efficient querying:
+### RocksDB Column Families
 
-| Index | Key Format | Description |
-|-------|-----------|-------------|
-| Primary | `events:<ledger>:<tx>:<event>` | All events by ledger |
-| Contract | `contract:<id>:<ledger>:<tx>:<event>` | Events by contract ID |
-| TxHash | `txhash:<hash>:<event>` | Events by transaction |
-| Type | `type:<type>:<ledger>:<tx>:<event>` | Events by type |
-| Topic0-3 | `topic0:<value>:<ledger>:<tx>:<event>` | Events by topic position |
+| Column Family | Purpose |
+|---------------|---------|
+| `default` | Metadata (last_processed_ledger, etc.) |
+| `events` | Primary event storage (raw XDR) |
+| `unique` | Unique value indexes with counts |
+| `bitmap` | Roaring bitmap inverted indexes |
+
+### Binary Key Format
+
+Events use a 10-byte binary key: `[ledger:4][tx:2][op:2][event:2]`
+
+### Bitmap Indexes
+
+Roaring bitmap indexes provide fast range queries:
+- **L1 (Ledger-level)**: Which ledgers contain events for a given contract/topic
+- **L2 (Event-level)**: Which events within a ledger match (optional, for precise lookups)
+
+Segments of 1M ledgers are used to limit write amplification while amortizing overhead.
 
 ## Source Data Format
 
@@ -217,19 +204,19 @@ The tool reads from ledger chunk files:
 <ledger_dir>/
 └── chunks/
     ├── 0000/
-    │   ├── 000000.data    # Compressed ledger data
-    │   ├── 000000.index   # Byte offsets
+    │   ├── 000000.data    # Zstd-compressed XDR records
+    │   ├── 000000.index   # Byte offsets for random access
     │   └── ...
     └── ...
 ```
 
 - Each chunk contains 10,000 ledgers
-- Data files contain zstd-compressed XDR records
+- Data files contain zstd-compressed LedgerCloseMeta XDR
 - Index files contain byte offsets for random access
 
-## Event Data Structure
+## Event Data
 
-Events are stored as JSON with the following fields:
+Events are stored as raw XDR for minimal overhead. When queried, they're decoded to include:
 
 | Field | Description |
 |-------|-------------|
@@ -239,8 +226,5 @@ Events are stored as JSON with the following fields:
 | `event_index` | Event position in transaction |
 | `contract_id` | Base64-encoded contract ID |
 | `type` | `contract`, `system`, or `diagnostic` |
-| `event_stage` | Event stage for transaction events |
 | `topics` | Array of base64-encoded topic values |
 | `data` | Base64-encoded event data |
-| `transaction_hash` | Hex transaction hash |
-| `successful` | Whether transaction succeeded |

@@ -1,5 +1,5 @@
 # Stellar Events Configuration
-# Copy this file to stellar-events.toml or config.toml and modify as needed
+# Copy this file to config.toml and modify as needed
 
 # =============================================================================
 # Source Data
@@ -12,16 +12,12 @@ ledger_dir = "./data/ledgers"
 network = "mainnet"
 
 # =============================================================================
-# Storage
+# Storage (RocksDB)
 # =============================================================================
 [storage]
-# Path to RocksDB database
+# Path to RocksDB database directory
 db_path = "./rocksdb/events"
 
-# =============================================================================
-# RocksDB Tuning (optional - defaults shown)
-# =============================================================================
-[storage.rocksdb]
 # --- Write Performance ---
 # Memtable size in MB (larger = better write throughput, more memory)
 write_buffer_size_mb = 256
@@ -29,11 +25,11 @@ write_buffer_size_mb = 256
 # Number of memtables to keep in memory
 max_write_buffer_number = 4
 
-# Minimum memtables to merge before flushing (reduces write amplification)
+# Minimum memtables to merge before flushing
 min_write_buffer_number_to_merge = 2
 
 # --- Read Performance ---
-# Block cache size in MB (larger = better read performance for hot data)
+# Block cache size in MB (larger = better read performance)
 block_cache_size_mb = 512
 
 # Bloom filter bits per key (10 is good balance, 0 to disable)
@@ -50,80 +46,78 @@ max_background_jobs = 8
 # Compression algorithm: "none", "snappy", "lz4", "zstd"
 compression = "lz4"
 
-# Compression for bottommost level (oldest data, read less frequently)
+# Compression for bottommost level (oldest data)
 bottommost_compression = "zstd"
 
 # --- WAL (Write-Ahead Log) ---
-# Disable WAL for faster bulk ingestion
-# Safe for bulk ingestion since data can be re-ingested from source if crash occurs
+# Disable WAL for faster bulk ingestion (safe - data can be re-ingested)
 disable_wal = true
 
-# --- Auto Compaction ---
-# Disable background compaction during ingestion for maximum write throughput
-# Use with final_compaction = true to compact after ingestion completes
+# --- Compaction ---
+# Disable background compaction during ingestion
 disable_auto_compaction = true
 
-# --- Compaction Tuning ---
-# Target SST file size in MB (default: 64, we use 256 for fewer files)
-# Larger = fewer files after compaction, better for write-once/read-many
+# Target SST file size in MB (larger = fewer files)
 target_file_size_mb = 256
 
-# Max bytes for level 1 in MB (default: 256, we use 1024)
-# Controls when data moves between levels
+# Max bytes for level 1 in MB
 max_bytes_for_level_base_mb = 1024
 
 # =============================================================================
 # Ingestion
 # =============================================================================
 [ingestion]
-# Progress file for tracking ingestion (optional)
-# Enables resume capability
+# Progress file for resume capability
 progress_file = "./progress.json"
 
-# Run manual compaction after ingestion completes
-# Optimizes database for reads, reclaims space
-# Set to false for faster ingestion if you plan to compact later
+# --- Post-processing ---
+# Run compaction after ingestion (optimizes for reads)
 final_compaction = false
 
-# Compute event statistics after ingestion (unique contracts, topics, etc.)
-# This is a slow operation that scans all events - disable for faster ingestion
+# Compute event stats after ingestion (slow)
 compute_stats = false
 
-# Maintain unique indexes during ingestion for fast cardinality counts
-# Adds some overhead (extra XDR parsing) but enables instant unique counts
-# If false, run 'build-indexes' command once after ingestion to build indexes
-maintain_unique_idx = false
+# --- Index Maintenance ---
+# Maintain L1 bitmap indexes during ingestion (fast queries)
+bitmap_indexes = true
 
-# Maintain roaring bitmap indexes during ingestion
-# Enables fast queries by contract ID and topic values
-# Uses segmented bitmaps (1M ledgers per segment) to avoid write amplification
-maintain_bitmap_idx = true
+# Maintain unique value counts during ingestion
+# If false, run 'build-indexes' command after ingestion
+unique_indexes = false
 
-# Compress event XDR values with zstd before storing
-# Significantly reduces database size with minimal CPU overhead
-# Values are automatically decompressed when reading
-compress_values = true
+# Maintain L2 hierarchical indexes (precise event lookup)
+l2_indexes = false
 
-# Ledgers between progress snapshots (for trend analysis)
-# Lower values = more granular data, slightly more overhead
+# --- Progress Tracking ---
+# Ledgers between progress snapshots
 snapshot_interval = 1000
 
 # --- Parallelism ---
-# Number of parallel workers for reading and parsing ledgers
-# 0 = use all available CPU cores
+# Number of parallel workers (0 = all CPUs)
 workers = 0
 
-# Number of ledgers to batch before writing to RocksDB
-# Higher values reduce write overhead but use more memory
+# Ledgers to batch before writing
 batch_size = 100
 
-# Channel buffer size for the pipeline (0 = workers * 2)
+# Pipeline buffer size (0 = workers * 2)
 queue_size = 0
+
+# =============================================================================
+# Query
+# =============================================================================
+[query]
+# Max ledgers to scan if end not specified
+max_ledger_range = 100000
+
+# Default max events to return
+default_limit = 100
 
 # =============================================================================
 # Indexes
 # =============================================================================
 [indexes]
-# Secondary indexes to create (improves query performance)
+# Index by contract ID
 contract_id = true
-topics = true  # Enables topic0, topic1, topic2, topic3 indexes
+
+# Index by topic0-3
+topics = true

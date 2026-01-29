@@ -13,30 +13,31 @@ import (
 
 // PipelineConfig configures the parallel ingestion pipeline
 type PipelineConfig struct {
-	Workers            int    // Number of parallel workers
-	BatchSize          int    // Ledgers to batch before writing
-	QueueSize          int    // Channel buffer size
-	DataDir            string // Ledger data directory
-	NetworkPassphrase  string // Network passphrase for XDR parsing
-	MaintainUniqueIdx  bool   // Maintain unique indexes during ingestion
-	MaintainBitmapIdx  bool   // Maintain roaring bitmap indexes during ingestion
+	Workers           int    // Number of parallel workers
+	BatchSize         int    // Ledgers to batch before writing
+	QueueSize         int    // Channel buffer size
+	DataDir           string // Ledger data directory
+	NetworkPassphrase string // Network passphrase for XDR parsing
+	MaintainUniqueIdx bool   // Maintain unique indexes during ingestion
+	MaintainBitmapIdx bool   // Maintain roaring bitmap indexes during ingestion
+	MaintainL2Idx     bool   // Maintain L2 hierarchical indexes during ingestion
 }
 
 // PipelineStats tracks pipeline performance
 type PipelineStats struct {
-	LedgersProcessed   int64
-	EventsExtracted    int64
-	RawBytesTotal      int64 // Total raw event data bytes
-	DiskReadTimeNs     int64 // Time reading from disk
-	DecompressTimeNs   int64 // Time decompressing zstd
-	UnmarshalTimeNs    int64 // Time unmarshalling XDR
-	WriteTimeNs        int64
+	LedgersProcessed int64
+	EventsExtracted  int64
+	RawBytesTotal    int64 // Total raw event data bytes
+	DiskReadTimeNs   int64 // Time reading from disk
+	DecompressTimeNs int64 // Time decompressing zstd
+	UnmarshalTimeNs  int64 // Time unmarshalling XDR
+	WriteTimeNs      int64
 }
 
 // LedgerResult represents the result of processing a single ledger
 type LedgerResult struct {
 	Sequence       uint32
-	Events         []*store.MinimalEvent
+	Events         []*store.IngestEvent
 	RawBytes       int64
 	Stats          *LedgerStats
 	DiskReadTime   time.Duration // Time reading from disk
@@ -49,7 +50,7 @@ type LedgerResult struct {
 type Pipeline struct {
 	config PipelineConfig
 	stats  PipelineStats
-	store  *store.EventStore
+	store  store.Store
 
 	// Channels
 	jobs    chan uint32        // Ledger sequences to process
@@ -66,7 +67,7 @@ type Pipeline struct {
 }
 
 // NewPipeline creates a new parallel ingestion pipeline
-func NewPipeline(config PipelineConfig, store *store.EventStore) *Pipeline {
+func NewPipeline(config PipelineConfig, store store.Store) *Pipeline {
 	if config.Workers <= 0 {
 		config.Workers = runtime.NumCPU()
 	}
@@ -206,7 +207,7 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 	aggStats := NewLedgerStats()
 
 	// Event batch for writing
-	var eventBatch []*store.MinimalEvent
+	var eventBatch []*store.IngestEvent
 	var batchRawBytes int64
 	batchStartSeq := startLedger
 
@@ -259,7 +260,11 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 
 			if (batchFull || atEnd) && len(eventBatch) > 0 {
 				writeStart := time.Now()
-				_, err := p.store.StoreMinimalEventsWithAllIndexes(eventBatch, p.config.MaintainUniqueIdx, p.config.MaintainBitmapIdx)
+				_, err := p.store.StoreEvents(eventBatch, &store.StoreOptions{
+					UniqueIndexes: p.config.MaintainUniqueIdx,
+					BitmapIndexes: p.config.MaintainBitmapIdx,
+					L2Indexes:     p.config.MaintainL2Idx,
+				})
 				atomic.AddInt64(&p.stats.WriteTimeNs, time.Since(writeStart).Nanoseconds())
 
 				if err != nil {
@@ -308,13 +313,13 @@ func (p *Pipeline) Stop() {
 // GetStats returns the current pipeline stats
 func (p *Pipeline) GetStats() PipelineStats {
 	return PipelineStats{
-		LedgersProcessed:   atomic.LoadInt64(&p.stats.LedgersProcessed),
-		EventsExtracted:    atomic.LoadInt64(&p.stats.EventsExtracted),
-		RawBytesTotal:      atomic.LoadInt64(&p.stats.RawBytesTotal),
-		DiskReadTimeNs:     atomic.LoadInt64(&p.stats.DiskReadTimeNs),
-		DecompressTimeNs:   atomic.LoadInt64(&p.stats.DecompressTimeNs),
-		UnmarshalTimeNs:    atomic.LoadInt64(&p.stats.UnmarshalTimeNs),
-		WriteTimeNs:        atomic.LoadInt64(&p.stats.WriteTimeNs),
+		LedgersProcessed: atomic.LoadInt64(&p.stats.LedgersProcessed),
+		EventsExtracted:  atomic.LoadInt64(&p.stats.EventsExtracted),
+		RawBytesTotal:    atomic.LoadInt64(&p.stats.RawBytesTotal),
+		DiskReadTimeNs:   atomic.LoadInt64(&p.stats.DiskReadTimeNs),
+		DecompressTimeNs: atomic.LoadInt64(&p.stats.DecompressTimeNs),
+		UnmarshalTimeNs:  atomic.LoadInt64(&p.stats.UnmarshalTimeNs),
+		WriteTimeNs:      atomic.LoadInt64(&p.stats.WriteTimeNs),
 	}
 }
 

@@ -13,28 +13,37 @@ const (
 	MainnetPassphrase = "Public Global Stellar Network ; September 2015"
 )
 
+// =============================================================================
+// Main Config Structure
+// =============================================================================
+
 // Config represents the application configuration
 type Config struct {
 	Source    SourceConfig    `toml:"source"`
 	Storage   StorageConfig   `toml:"storage"`
 	Ingestion IngestionConfig `toml:"ingestion"`
+	Query     QueryConfig     `toml:"query"`
 	Indexes   IndexConfig     `toml:"indexes"`
 }
 
+// =============================================================================
+// Source Config
+// =============================================================================
+
 // SourceConfig contains ledger source settings
 type SourceConfig struct {
-	LedgerDir string `toml:"ledger_dir"`
-	Network   string `toml:"network"` // mainnet, testnet, or custom passphrase
+	LedgerDir string `toml:"ledger_dir"` // Path to ledger chunk files
+	Network   string `toml:"network"`    // "mainnet", "testnet", or custom passphrase
 }
 
-// StorageConfig contains RocksDB settings
+// =============================================================================
+// Storage Config (flattened - RocksDB only)
+// =============================================================================
+
+// StorageConfig contains storage settings
 type StorageConfig struct {
-	DBPath  string        `toml:"db_path"`
-	RocksDB RocksDBConfig `toml:"rocksdb"`
-}
+	DBPath string `toml:"db_path"` // Path to RocksDB database directory
 
-// RocksDBConfig contains RocksDB tuning parameters
-type RocksDBConfig struct {
 	// Write performance
 	WriteBufferSizeMB           int `toml:"write_buffer_size_mb"`             // Memtable size (default: 64)
 	MaxWriteBufferNumber        int `toml:"max_write_buffer_number"`          // Number of memtables (default: 2)
@@ -46,45 +55,70 @@ type RocksDBConfig struct {
 	CacheIndexAndFilterBlocks bool `toml:"cache_index_and_filter_blocks"` // Cache indexes in block cache (default: true)
 
 	// Background jobs
-	MaxBackgroundJobs int `toml:"max_background_jobs"` // Parallel background threads for flushing (default: 4)
+	MaxBackgroundJobs int `toml:"max_background_jobs"` // Parallel background threads (default: 4)
 
 	// Compression
-	Compression           string `toml:"compression"`            // Compression: "none", "snappy", "lz4", "zstd" (default: "lz4")
+	Compression           string `toml:"compression"`            // "none", "snappy", "lz4", "zstd" (default: "zstd")
 	BottommostCompression string `toml:"bottommost_compression"` // Compression for oldest data (default: "zstd")
 
 	// WAL
-	DisableWAL bool `toml:"disable_wal"` // Disable write-ahead log for faster bulk ingestion (default: false)
+	DisableWAL bool `toml:"disable_wal"` // Disable write-ahead log for faster bulk ingestion
 
-	// Auto compaction
-	DisableAutoCompaction bool `toml:"disable_auto_compaction"` // Disable background compaction during ingestion (default: false)
-
-	// Compaction tuning
-	TargetFileSizeMB       int `toml:"target_file_size_mb"`        // Target SST file size (default: 256, creates larger files)
-	MaxBytesForLevelBaseMB int `toml:"max_bytes_for_level_base_mb"` // Max bytes for L1 (default: 1024)
+	// Compaction
+	DisableAutoCompaction  bool `toml:"disable_auto_compaction"`     // Disable background compaction during ingestion
+	TargetFileSizeMB       int  `toml:"target_file_size_mb"`         // Target SST file size (default: 256)
+	MaxBytesForLevelBaseMB int  `toml:"max_bytes_for_level_base_mb"` // Max bytes for L1 (default: 1024)
 }
+
+// =============================================================================
+// Ingestion Config
+// =============================================================================
 
 // IngestionConfig contains ingestion settings
 type IngestionConfig struct {
-	ProgressFile       string `toml:"progress_file"`
-	FinalCompaction    bool   `toml:"final_compaction"`     // Run manual compaction after ingestion (default: true)
-	ComputeStats       bool   `toml:"compute_stats"`        // Compute event stats after ingestion (default: false)
-	MaintainUniqueIdx  bool   `toml:"maintain_unique_idx"`  // Maintain unique indexes during ingestion (default: false)
-	MaintainBitmapIdx  bool   `toml:"maintain_bitmap_idx"`  // Maintain roaring bitmap indexes during ingestion (default: true)
-	SnapshotInterval   int    `toml:"snapshot_interval"`    // Ledgers between progress snapshots (default: 1000000)
+	ProgressFile string `toml:"progress_file"` // Progress file for resume capability
 
-	// Parallelism settings
-	Workers   int `toml:"workers"`    // Number of parallel workers (default: number of CPUs)
-	BatchSize int `toml:"batch_size"` // Ledgers to batch before writing (default: 100)
-	QueueSize int `toml:"queue_size"` // Channel buffer size for pipeline (default: workers * 2)
+	// Post-processing
+	FinalCompaction bool `toml:"final_compaction"` // Run compaction after ingestion (default: true)
+	ComputeStats    bool `toml:"compute_stats"`    // Compute event stats after ingestion (default: false)
+
+	// Index maintenance during ingestion
+	BitmapIndexes bool `toml:"bitmap_indexes"` // Maintain L1 bitmap indexes (default: true)
+	UniqueIndexes bool `toml:"unique_indexes"` // Maintain unique value counts (default: false)
+	L2Indexes     bool `toml:"l2_indexes"`     // Maintain L2 hierarchical indexes (default: false)
+
+	// Progress tracking
+	SnapshotInterval int `toml:"snapshot_interval"` // Ledgers between progress snapshots (default: 1000000)
+
+	// Parallelism
+	Workers   int `toml:"workers"`    // Parallel workers (0 = NumCPU)
+	BatchSize int `toml:"batch_size"` // Ledgers per batch (default: 100)
+	QueueSize int `toml:"queue_size"` // Pipeline buffer (0 = workers * 2)
 }
+
+// =============================================================================
+// Query Config
+// =============================================================================
+
+// QueryConfig contains query command settings
+type QueryConfig struct {
+	MaxLedgerRange int `toml:"max_ledger_range"` // Max ledgers if end not specified (default: 100000)
+	DefaultLimit   int `toml:"default_limit"`    // Default max events to return (default: 100)
+}
+
+// =============================================================================
+// Index Config
+// =============================================================================
 
 // IndexConfig contains index settings
 type IndexConfig struct {
-	ContractID      bool `toml:"contract_id"`
-	TransactionHash bool `toml:"transaction_hash"`
-	EventType       bool `toml:"event_type"`
-	Topics          bool `toml:"topics"` // enables topic0-3
+	ContractID bool `toml:"contract_id"` // Index by contract ID
+	Topics     bool `toml:"topics"`      // Index by topic0-3
 }
+
+// =============================================================================
+// Defaults
+// =============================================================================
 
 // DefaultConfig returns a config with default values
 func DefaultConfig() *Config {
@@ -95,48 +129,52 @@ func DefaultConfig() *Config {
 		},
 		Storage: StorageConfig{
 			DBPath: "./events.db",
-			RocksDB: RocksDBConfig{
-				// Write performance
-				WriteBufferSizeMB:           64,
-				MaxWriteBufferNumber:        2,
-				MinWriteBufferNumberToMerge: 1,
-				// Read performance
-				BlockCacheSizeMB:          64,
-				BloomFilterBitsPerKey:     10,
-				CacheIndexAndFilterBlocks: true,
-				// Background jobs
-				MaxBackgroundJobs: 4,
-				// Compression
-				Compression:           "zstd",
-				BottommostCompression: "zstd",
-				// WAL
-				DisableWAL: false,
-				// Auto compaction
-				DisableAutoCompaction: false,
-				// Compaction tuning (larger files = fewer files after compaction)
-				TargetFileSizeMB:       256,  // 256 MB target files (vs default 64 MB)
-				MaxBytesForLevelBaseMB: 1024, // 1 GB for level base
-			},
+			// Write performance
+			WriteBufferSizeMB:           64,
+			MaxWriteBufferNumber:        2,
+			MinWriteBufferNumberToMerge: 1,
+			// Read performance
+			BlockCacheSizeMB:          64,
+			BloomFilterBitsPerKey:     10,
+			CacheIndexAndFilterBlocks: true,
+			// Background jobs
+			MaxBackgroundJobs: 4,
+			// Compression
+			Compression:           "zstd",
+			BottommostCompression: "zstd",
+			// WAL
+			DisableWAL: false,
+			// Compaction
+			DisableAutoCompaction:  false,
+			TargetFileSizeMB:       256,
+			MaxBytesForLevelBaseMB: 1024,
 		},
 		Ingestion: IngestionConfig{
-			ProgressFile:       "",
-			FinalCompaction:    true,
-			ComputeStats:       false, // Disabled by default (slow operation)
-			MaintainUniqueIdx:  false, // Disabled by default (adds XDR parsing overhead)
-			MaintainBitmapIdx:  true,  // Enabled by default (fast, in-memory during ingestion)
-			SnapshotInterval:   1000000,
-			Workers:            0, // 0 means use runtime.NumCPU()
-			BatchSize:          100,
-			QueueSize:          0, // 0 means workers * 2
+			ProgressFile:     "",
+			FinalCompaction:  true,
+			ComputeStats:     false,
+			BitmapIndexes:    true,
+			UniqueIndexes:    false,
+			L2Indexes:        false,
+			SnapshotInterval: 1000000,
+			Workers:          0, // 0 = NumCPU
+			BatchSize:        100,
+			QueueSize:        0, // 0 = workers * 2
+		},
+		Query: QueryConfig{
+			MaxLedgerRange: 100000,
+			DefaultLimit:   100,
 		},
 		Indexes: IndexConfig{
-			ContractID:      true,
-			TransactionHash: true,
-			EventType:       true,
-			Topics:          true,
+			ContractID: true,
+			Topics:     true,
 		},
 	}
 }
+
+// =============================================================================
+// Loading and Validation
+// =============================================================================
 
 // LoadConfig loads configuration from a TOML file
 func LoadConfig(path string) (*Config, error) {
@@ -151,7 +189,6 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	// Validate config
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}

@@ -21,36 +21,6 @@ import (
 	"github.com/urvisavla/stellar-events/internal/index"
 )
 
-// RocksDBOptions contains tuning parameters for RocksDB
-type RocksDBOptions struct {
-	// Write performance
-	WriteBufferSizeMB           int
-	MaxWriteBufferNumber        int
-	MinWriteBufferNumberToMerge int
-
-	// Read performance
-	BlockCacheSizeMB          int
-	BloomFilterBitsPerKey     int
-	CacheIndexAndFilterBlocks bool
-
-	// Background jobs
-	MaxBackgroundJobs int
-
-	// Compression
-	Compression           string
-	BottommostCompression string
-
-	// WAL
-	DisableWAL bool
-
-	// Auto compaction
-	DisableAutoCompaction bool
-
-	// Compaction tuning
-	TargetFileSizeMB       int // Target size for SST files (default: 64, recommend 256-512 for large DBs)
-	MaxBytesForLevelBaseMB int // Max bytes for L1 (default: 256, recommend 1024+ for large DBs)
-}
-
 // Column family names
 const (
 	CFDefault = "default" // Metadata (last_processed_ledger, etc.)
@@ -110,38 +80,9 @@ func (m *uint64AddMergeOperator) PartialMerge(key, leftOperand, rightOperand []b
 	return result, true
 }
 
-// ContractEvent represents a contract event extracted from a ledger (full JSON format)
-type ContractEvent struct {
-	LedgerSequence   uint32   `json:"ledger_sequence"`
-	TransactionIndex int      `json:"transaction_index"`
-	OperationIndex   int      `json:"operation_index,omitempty"`
-	EventIndex       int      `json:"event_index"`
-	ContractID       string   `json:"contract_id,omitempty"`
-	Type             string   `json:"type"`
-	EventStage       string   `json:"event_stage,omitempty"`
-	Topics           []string `json:"topics"`
-	Data             string   `json:"data"`
-	TransactionHash  string   `json:"transaction_hash"`
-	Successful       bool     `json:"successful"`
-}
-
-// MinimalEvent represents an event with just position info and raw XDR
-// Used for fast ingestion - no JSON serialization overhead
-type MinimalEvent struct {
-	LedgerSequence   uint32
-	TransactionIndex uint16
-	OperationIndex   uint16
-	EventIndex       uint16
-	RawXDR           []byte
-
-	// Pre-extracted fields for indexing (avoids re-parsing XDR)
-	ContractID []byte   // 32 bytes if present, nil otherwise
-	Topics     [][]byte // Pre-marshaled topic XDR bytes
-}
-
 // eventKey generates a 10-byte binary key for events
 // Format: [ledger:4][tx:2][op:2][event:2]
-func eventKey(e *MinimalEvent) []byte {
+func eventKey(e *IngestEvent) []byte {
 	key := make([]byte, 10)
 	binary.BigEndian.PutUint32(key[0:4], e.LedgerSequence)
 	binary.BigEndian.PutUint16(key[4:6], e.TransactionIndex)
@@ -226,20 +167,6 @@ func parseRawXDRToEvent(rawXDR []byte, ledger uint32, tx, op, eventIdx uint16) (
 	}
 
 	return event, nil
-}
-
-// IndexConfig controls which secondary indexes to create
-type IndexConfig struct {
-	ContractID bool
-	Topics     bool // enables topic0-3
-}
-
-// DefaultIndexConfig returns config with all indexes enabled
-func DefaultIndexConfig() *IndexConfig {
-	return &IndexConfig{
-		ContractID: true,
-		Topics:     true,
-	}
 }
 
 // EventStore manages storing events in RocksDB
@@ -462,17 +389,18 @@ func (es *EventStore) Close() {
 	// A proper fix would require grocksdb to handle this case.
 }
 
-// StoreMinimalEventsWithIndexes stores events and optionally updates unique indexes with counts
-func (es *EventStore) StoreMinimalEventsWithIndexes(events []*MinimalEvent, updateUniqueIndexes bool) (int64, error) {
-	return es.StoreMinimalEventsWithAllIndexes(events, updateUniqueIndexes, false)
-}
-
-// StoreMinimalEventsWithAllIndexes stores events with optional unique and bitmap indexes
-func (es *EventStore) StoreMinimalEventsWithAllIndexes(events []*MinimalEvent, updateUniqueIndexes, updateBitmapIndexes bool) (int64, error) {
+// StoreEvents stores events with optional index updates based on options.
+// Returns the number of bytes written.
+func (es *EventStore) StoreEvents(events []*IngestEvent, opts *StoreOptions) (int64, error) {
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
 
 	var totalBytes int64
+
+	// Ensure opts is not nil
+	if opts == nil {
+		opts = &StoreOptions{}
+	}
 
 	// Track counts to increment for this batch
 	// Map from unique key -> count to add
@@ -484,24 +412,52 @@ func (es *EventStore) StoreMinimalEventsWithAllIndexes(events []*MinimalEvent, u
 		totalBytes += int64(len(event.RawXDR))
 
 		// Update bitmap indexes (fast, in-memory operation)
-		if updateBitmapIndexes && es.bitmapIndex != nil {
-			// Index contract ID
+		if opts.BitmapIndexes && es.bitmapIndex != nil {
+			// L1: Index contract ID -> ledger
 			if len(event.ContractID) > 0 {
 				es.bitmapIndex.AddContractIndex(event.ContractID, event.LedgerSequence)
 			}
 
-			// Index topics
+			// L1: Index topics -> ledger
 			for i, topicBytes := range event.Topics {
 				if i > 3 {
 					break // Only index first 4 topics
 				}
 				es.bitmapIndex.AddTopicIndex(i, topicBytes, event.LedgerSequence)
 			}
+
+			// L2: Index contract ID -> (ledger, event) for hierarchical queries
+			if opts.L2Indexes {
+				if len(event.ContractID) > 0 {
+					es.bitmapIndex.AddContractL2Index(
+						event.ContractID,
+						event.LedgerSequence,
+						event.TransactionIndex,
+						event.OperationIndex,
+						event.EventIndex,
+					)
+				}
+
+				// L2: Index topics -> (ledger, event)
+				for i, topicBytes := range event.Topics {
+					if i > 3 {
+						break
+					}
+					es.bitmapIndex.AddTopicL2Index(
+						i,
+						topicBytes,
+						event.LedgerSequence,
+						event.TransactionIndex,
+						event.OperationIndex,
+						event.EventIndex,
+					)
+				}
+			}
 		}
 
 		// Optionally update unique indexes with counts
-		// Uses pre-extracted fields from MinimalEvent (no XDR parsing needed!)
-		if updateUniqueIndexes {
+		// Uses pre-extracted fields from IngestEvent (no XDR parsing needed!)
+		if opts.UniqueIndexes {
 			// Count contract ID
 			if len(event.ContractID) > 0 {
 				uk := string(uniqueKey(UniqueTypeContract, event.ContractID))
@@ -532,7 +488,7 @@ func (es *EventStore) StoreMinimalEventsWithAllIndexes(events []*MinimalEvent, u
 	}
 
 	// Apply count updates using merge operator (no reads needed!)
-	if updateUniqueIndexes && len(countUpdates) > 0 {
+	if opts.UniqueIndexes && len(countUpdates) > 0 {
 		for keyStr, addCount := range countUpdates {
 			keyBytes := []byte(keyStr)
 			countBytes := make([]byte, 8)
@@ -556,17 +512,26 @@ func (es *EventStore) FlushBitmapIndexes() error {
 	return es.bitmapIndex.FlushHotSegments()
 }
 
-// GetBitmapIndex returns the bitmap index manager
-func (es *EventStore) GetBitmapIndex() *index.BitmapIndex {
-	return es.bitmapIndex
-}
-
-// GetBitmapIndexStats returns statistics about the bitmap index
-func (es *EventStore) GetBitmapIndexStats() *index.BitmapIndexStats {
+// GetBitmapStats returns bitmap index statistics
+func (es *EventStore) GetBitmapStats() *BitmapStats {
 	if es.bitmapIndex == nil {
 		return nil
 	}
-	return es.bitmapIndex.GetStats()
+	internalStats := es.bitmapIndex.GetStats()
+	if internalStats == nil {
+		return nil
+	}
+	return &BitmapStats{
+		CurrentSegmentID:   internalStats.CurrentSegmentID,
+		HotSegmentCount:    internalStats.HotSegmentCount,
+		HotSegmentCards:    internalStats.HotSegmentCards,
+		HotSegmentMemBytes: internalStats.HotSegmentMemBytes,
+		ContractIndexCount: internalStats.ContractIndexCount,
+		Topic0IndexCount:   internalStats.Topic0IndexCount,
+		Topic1IndexCount:   internalStats.Topic1IndexCount,
+		Topic2IndexCount:   internalStats.Topic2IndexCount,
+		Topic3IndexCount:   internalStats.Topic3IndexCount,
+	}
 }
 
 // SetLastProcessedLedger stores the last processed ledger sequence
@@ -645,12 +610,7 @@ func (es *EventStore) GetEventsByLedger(ledgerSequence uint32) ([]*ContractEvent
 // =============================================================================
 
 // GetEventsByContractID retrieves events for a specific contract (scans all events)
-func (es *EventStore) GetEventsByContractID(contractIDBase64 string, limit int) ([]*ContractEvent, error) {
-	contractBytes, err := base64.StdEncoding.DecodeString(contractIDBase64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid contract ID: %w", err)
-	}
-
+func (es *EventStore) GetEventsByContractID(contractID []byte, limit int) ([]*ContractEvent, error) {
 	var events []*ContractEvent
 
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
@@ -673,7 +633,7 @@ func (es *EventStore) GetEventsByContractID(contractIDBase64 string, limit int) 
 			continue
 		}
 
-		if xdrEvent.ContractId != nil && string(xdrEvent.ContractId[:]) == string(contractBytes) {
+		if xdrEvent.ContractId != nil && string(xdrEvent.ContractId[:]) == string(contractID) {
 			event, err := parseRawXDRToEvent(it.Value().Data(), ledger, tx, op, eventIdx)
 			if err != nil {
 				continue
@@ -690,12 +650,7 @@ func (es *EventStore) GetEventsByContractID(contractIDBase64 string, limit int) 
 }
 
 // GetEventsByContractIDInRange retrieves events for a contract within a ledger range
-func (es *EventStore) GetEventsByContractIDInRange(contractIDBase64 string, startLedger, endLedger uint32) ([]*ContractEvent, error) {
-	contractBytes, err := base64.StdEncoding.DecodeString(contractIDBase64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid contract ID: %w", err)
-	}
-
+func (es *EventStore) GetEventsByContractIDInRange(contractID []byte, startLedger, endLedger uint32) ([]*ContractEvent, error) {
 	var events []*ContractEvent
 
 	startKey := eventKeyFromParts(startLedger, 0, 0, 0)
@@ -718,7 +673,7 @@ func (es *EventStore) GetEventsByContractIDInRange(contractIDBase64 string, star
 			continue
 		}
 
-		if xdrEvent.ContractId != nil && string(xdrEvent.ContractId[:]) == string(contractBytes) {
+		if xdrEvent.ContractId != nil && string(xdrEvent.ContractId[:]) == string(contractID) {
 			event, err := parseRawXDRToEvent(it.Value().Data(), ledger, tx, op, eventIdx)
 			if err != nil {
 				continue
@@ -739,14 +694,9 @@ func (es *EventStore) GetEventsByContractIDInRange(contractIDBase64 string, star
 // =============================================================================
 
 // GetEventsByTopic retrieves events with a specific topic value at the given position
-func (es *EventStore) GetEventsByTopic(position int, topicValueBase64 string, limit int) ([]*ContractEvent, error) {
+func (es *EventStore) GetEventsByTopic(position int, topicValue []byte, limit int) ([]*ContractEvent, error) {
 	if position < 0 || position > 3 {
 		return nil, fmt.Errorf("topic position must be 0-3, got %d", position)
-	}
-
-	topicBytes, err := base64.StdEncoding.DecodeString(topicValueBase64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid topic value: %w", err)
 	}
 
 	var events []*ContractEvent
@@ -773,7 +723,7 @@ func (es *EventStore) GetEventsByTopic(position int, topicValueBase64 string, li
 			body := xdrEvent.Body.MustV0()
 			if position < len(body.Topics) {
 				topicXDR, _ := body.Topics[position].MarshalBinary()
-				if string(topicXDR) == string(topicBytes) {
+				if string(topicXDR) == string(topicValue) {
 					ledger, tx, op, eventIdx := parseEventKey(key)
 					event, err := parseRawXDRToEvent(it.Value().Data(), ledger, tx, op, eventIdx)
 					if err != nil {
@@ -793,14 +743,9 @@ func (es *EventStore) GetEventsByTopic(position int, topicValueBase64 string, li
 }
 
 // GetEventsByTopicInRange retrieves events with a specific topic within a ledger range
-func (es *EventStore) GetEventsByTopicInRange(position int, topicValueBase64 string, startLedger, endLedger uint32) ([]*ContractEvent, error) {
+func (es *EventStore) GetEventsByTopicInRange(position int, topicValue []byte, startLedger, endLedger uint32) ([]*ContractEvent, error) {
 	if position < 0 || position > 3 {
 		return nil, fmt.Errorf("topic position must be 0-3, got %d", position)
-	}
-
-	topicBytes, err := base64.StdEncoding.DecodeString(topicValueBase64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid topic value: %w", err)
 	}
 
 	var events []*ContractEvent
@@ -829,7 +774,7 @@ func (es *EventStore) GetEventsByTopicInRange(position int, topicValueBase64 str
 			body := xdrEvent.Body.MustV0()
 			if position < len(body.Topics) {
 				topicXDR, _ := body.Topics[position].MarshalBinary()
-				if string(topicXDR) == string(topicBytes) {
+				if string(topicXDR) == string(topicValue) {
 					_, tx, op, eventIdx := parseEventKey(key)
 					event, err := parseRawXDRToEvent(it.Value().Data(), ledger, tx, op, eventIdx)
 					if err != nil {
@@ -868,40 +813,6 @@ func (es *EventStore) CountEvents() (int64, error) {
 	}
 
 	return count, nil
-}
-
-// DBStats holds statistics about the event database
-type DBStats struct {
-	TotalEvents     int64  `json:"total_events"`
-	MinLedger       uint32 `json:"min_ledger"`
-	MaxLedger       uint32 `json:"max_ledger"`
-	LastProcessed   uint32 `json:"last_processed_ledger"`
-	UniqueContracts int    `json:"unique_contracts"`
-}
-
-// StorageStats holds RocksDB storage statistics
-type StorageStats struct {
-	EstimatedNumKeys     string `json:"estimated_num_keys"`
-	EstimateLiveDataSize string `json:"estimate_live_data_size"`
-	TotalSstFilesSize    string `json:"total_sst_files_size"`
-	LiveSstFilesSize     string `json:"live_sst_files_size"`
-	SizeAllMemTables     string `json:"size_all_mem_tables"`
-	CurSizeAllMemTables  string `json:"cur_size_all_mem_tables"`
-
-	EstimatePendingCompactionBytes string `json:"estimate_pending_compaction_bytes"`
-	NumRunningCompactions          string `json:"num_running_compactions"`
-	NumRunningFlushes              string `json:"num_running_flushes"`
-
-	NumFilesAtLevel0 string `json:"num_files_at_level0"`
-	NumFilesAtLevel1 string `json:"num_files_at_level1"`
-	NumFilesAtLevel2 string `json:"num_files_at_level2"`
-	NumFilesAtLevel3 string `json:"num_files_at_level3"`
-
-	BlockCacheUsage       string `json:"block_cache_usage"`
-	BlockCachePinnedUsage string `json:"block_cache_pinned_usage"`
-	BackgroundErrors      string `json:"background_errors"`
-	NumLiveVersions       string `json:"num_live_versions"`
-	NumSnapshots          string `json:"num_snapshots"`
 }
 
 // GetStorageStats retrieves RocksDB storage statistics
@@ -944,25 +855,6 @@ func (es *EventStore) GetStorageStats() *StorageStats {
 	stats.NumSnapshots = es.db.GetProperty("rocksdb.num-snapshots")
 
 	return stats
-}
-
-// SnapshotStats holds numeric RocksDB stats for progress snapshots
-type SnapshotStats struct {
-	SSTFilesSizeBytes   int64 `json:"sst_files_size_bytes"`
-	MemtableSizeBytes   int64 `json:"memtable_size_bytes"`
-	EstimatedNumKeys    int64 `json:"estimated_num_keys"`
-	PendingCompactBytes int64 `json:"pending_compact_bytes"`
-
-	L0Files int `json:"l0_files"`
-	L1Files int `json:"l1_files"`
-	L2Files int `json:"l2_files"`
-	L3Files int `json:"l3_files"`
-	L4Files int `json:"l4_files"`
-	L5Files int `json:"l5_files"`
-	L6Files int `json:"l6_files"`
-
-	RunningCompactions int  `json:"running_compactions"`
-	CompactionPending  bool `json:"compaction_pending"`
 }
 
 // GetSnapshotStats returns numeric RocksDB stats for progress snapshots
@@ -1090,18 +982,6 @@ func (es *EventStore) GetStats() (*DBStats, error) {
 	return stats, nil
 }
 
-// CompactionResult holds before/after metrics from manual compaction
-type CompactionResult struct {
-	BeforeSSTBytes      int64   `json:"before_sst_bytes"`
-	BeforeL0Files       int     `json:"before_l0_files"`
-	BeforeTotalFiles    int     `json:"before_total_files"`
-	AfterSSTBytes       int64   `json:"after_sst_bytes"`
-	AfterL0Files        int     `json:"after_l0_files"`
-	AfterTotalFiles     int     `json:"after_total_files"`
-	BytesReclaimed      int64   `json:"bytes_reclaimed"`
-	SpaceSavingsPercent float64 `json:"space_savings_percent"`
-}
-
 // CompactAll runs manual compaction on the entire database (all column families)
 func (es *EventStore) CompactAll() *CompactionResult {
 	beforeStats := es.GetSnapshotStats()
@@ -1142,22 +1022,6 @@ func (es *EventStore) CompactAll() *CompactionResult {
 	}
 
 	return result
-}
-
-// UniqueIndexCounts holds counts from unique indexes
-type UniqueIndexCounts struct {
-	UniqueContracts int64 `json:"unique_contracts"`
-	UniqueTopic0    int64 `json:"unique_topic0"`
-	UniqueTopic1    int64 `json:"unique_topic1"`
-	UniqueTopic2    int64 `json:"unique_topic2"`
-	UniqueTopic3    int64 `json:"unique_topic3"`
-
-	// Total event counts for each type
-	TotalContractEvents int64 `json:"total_contract_events"`
-	TotalTopic0Events   int64 `json:"total_topic0_events"`
-	TotalTopic1Events   int64 `json:"total_topic1_events"`
-	TotalTopic2Events   int64 `json:"total_topic2_events"`
-	TotalTopic3Events   int64 `json:"total_topic3_events"`
 }
 
 // CountUniqueIndexes counts entries in unique indexes and sums their event counts (parallel)
@@ -1263,35 +1127,6 @@ func (es *EventStore) countIndexTypePartition(indexType byte, partition, totalPa
 	}
 
 	return uniqueCount, totalEvents, nil
-}
-
-// DistributionStats holds percentile statistics for event counts
-type DistributionStats struct {
-	Count int64      `json:"count"`           // Number of unique values
-	Min   int64      `json:"min"`             // Minimum event count
-	Max   int64      `json:"max"`             // Maximum event count
-	Mean  float64    `json:"mean"`            // Average event count
-	P50   int64      `json:"p50"`             // Median (50th percentile)
-	P75   int64      `json:"p75"`             // 75th percentile
-	P90   int64      `json:"p90"`             // 90th percentile
-	P99   int64      `json:"p99"`             // 99th percentile
-	Total int64      `json:"total"`           // Total events across all values
-	TopN  []TopEntry `json:"top_n,omitempty"` // Top N by event count
-}
-
-// TopEntry represents a top item by event count
-type TopEntry struct {
-	Value      string `json:"value"`       // Base64-encoded value (contract ID or topic)
-	EventCount int64  `json:"event_count"` // Number of events
-}
-
-// IndexDistribution holds distribution stats for all index types
-type IndexDistribution struct {
-	Contracts *DistributionStats `json:"contracts"`
-	Topic0    *DistributionStats `json:"topic0"`
-	Topic1    *DistributionStats `json:"topic1"`
-	Topic2    *DistributionStats `json:"topic2"`
-	Topic3    *DistributionStats `json:"topic3"`
 }
 
 // topNHeap is a min-heap for tracking top N entries by count
@@ -1569,92 +1404,19 @@ func (es *EventStore) getLedgerRange() (uint32, uint32, error) {
 	return minLedger, maxLedger, it.Err()
 }
 
-// EventStats holds computed statistics from scanning all events
-type EventStats struct {
-	TotalEvents      int64 `json:"total_events"`
-	UniqueContracts  int   `json:"unique_contracts"`
-	UniqueTopic0     int   `json:"unique_topic0"`
-	UniqueTopic1     int   `json:"unique_topic1"`
-	UniqueTopic2     int   `json:"unique_topic2"`
-	UniqueTopic3     int   `json:"unique_topic3"`
-	ContractEvents   int64 `json:"contract_events"`
-	SystemEvents     int64 `json:"system_events"`
-	DiagnosticEvents int64 `json:"diagnostic_events"`
-}
-
-// ComputeEventStats scans all events and computes unique counts
-func (es *EventStore) ComputeEventStats() (*EventStats, error) {
-	stats := &EventStats{}
-
-	contracts := make(map[string]struct{})
-	topic0s := make(map[string]struct{})
-	topic1s := make(map[string]struct{})
-	topic2s := make(map[string]struct{})
-	topic3s := make(map[string]struct{})
-
-	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
-	defer it.Close()
-
-	for it.SeekToFirst(); it.Valid(); it.Next() {
-		stats.TotalEvents++
-
-		var xdrEvent xdr.ContractEvent
-		if err := xdrEvent.UnmarshalBinary(it.Value().Data()); err != nil {
-			continue
-		}
-
-		switch xdrEvent.Type {
-		case xdr.ContractEventTypeContract:
-			stats.ContractEvents++
-		case xdr.ContractEventTypeSystem:
-			stats.SystemEvents++
-		case xdr.ContractEventTypeDiagnostic:
-			stats.DiagnosticEvents++
-		}
-
-		if xdrEvent.ContractId != nil {
-			contractID := base64.StdEncoding.EncodeToString(xdrEvent.ContractId[:])
-			contracts[contractID] = struct{}{}
-		}
-
-		if xdrEvent.Body.V == 0 {
-			body := xdrEvent.Body.MustV0()
-			for i, topic := range body.Topics {
-				topicBytes, _ := topic.MarshalBinary()
-				topicStr := base64.StdEncoding.EncodeToString(topicBytes)
-				switch i {
-				case 0:
-					topic0s[topicStr] = struct{}{}
-				case 1:
-					topic1s[topicStr] = struct{}{}
-				case 2:
-					topic2s[topicStr] = struct{}{}
-				case 3:
-					topic3s[topicStr] = struct{}{}
-				}
-			}
-		}
-	}
-
-	if err := it.Err(); err != nil {
-		return nil, fmt.Errorf("iterator error: %w", err)
-	}
-
-	stats.UniqueContracts = len(contracts)
-	stats.UniqueTopic0 = len(topic0s)
-	stats.UniqueTopic1 = len(topic1s)
-	stats.UniqueTopic2 = len(topic2s)
-	stats.UniqueTopic3 = len(topic3s)
-
-	return stats, nil
-}
-
-// ComputeEventStatsParallel computes event statistics using multiple goroutines
-func (es *EventStore) ComputeEventStatsParallel(workers int) (*EventStats, error) {
+// ComputeEventStats scans all events and computes unique counts.
+// Workers controls parallelism: 0 uses NumCPU, 1 for single-threaded, >1 for parallel.
+func (es *EventStore) ComputeEventStats(workers int) (*EventStats, error) {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
 
+	// For single worker, use simple sequential scan (more memory efficient)
+	if workers == 1 {
+		return es.computeEventStatsSingleThread()
+	}
+
+	// Parallel implementation
 	minLedger, maxLedger, err := es.getLedgerRange()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ledger range: %w", err)
@@ -1745,6 +1507,73 @@ func (es *EventStore) ComputeEventStatsParallel(workers int) (*EventStats, error
 	finalStats.UniqueTopic3 = len(topic3s)
 
 	return finalStats, nil
+}
+
+// computeEventStatsSingleThread is the single-threaded implementation
+func (es *EventStore) computeEventStatsSingleThread() (*EventStats, error) {
+	stats := &EventStats{}
+
+	contracts := make(map[string]struct{})
+	topic0s := make(map[string]struct{})
+	topic1s := make(map[string]struct{})
+	topic2s := make(map[string]struct{})
+	topic3s := make(map[string]struct{})
+
+	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
+	defer it.Close()
+
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		stats.TotalEvents++
+
+		var xdrEvent xdr.ContractEvent
+		if err := xdrEvent.UnmarshalBinary(it.Value().Data()); err != nil {
+			continue
+		}
+
+		switch xdrEvent.Type {
+		case xdr.ContractEventTypeContract:
+			stats.ContractEvents++
+		case xdr.ContractEventTypeSystem:
+			stats.SystemEvents++
+		case xdr.ContractEventTypeDiagnostic:
+			stats.DiagnosticEvents++
+		}
+
+		if xdrEvent.ContractId != nil {
+			contractID := base64.StdEncoding.EncodeToString(xdrEvent.ContractId[:])
+			contracts[contractID] = struct{}{}
+		}
+
+		if xdrEvent.Body.V == 0 {
+			body := xdrEvent.Body.MustV0()
+			for i, topic := range body.Topics {
+				topicBytes, _ := topic.MarshalBinary()
+				topicStr := base64.StdEncoding.EncodeToString(topicBytes)
+				switch i {
+				case 0:
+					topic0s[topicStr] = struct{}{}
+				case 1:
+					topic1s[topicStr] = struct{}{}
+				case 2:
+					topic2s[topicStr] = struct{}{}
+				case 3:
+					topic3s[topicStr] = struct{}{}
+				}
+			}
+		}
+	}
+
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("iterator error: %w", err)
+	}
+
+	stats.UniqueContracts = len(contracts)
+	stats.UniqueTopic0 = len(topic0s)
+	stats.UniqueTopic1 = len(topic1s)
+	stats.UniqueTopic2 = len(topic2s)
+	stats.UniqueTopic3 = len(topic3s)
+
+	return stats, nil
 }
 
 // computeStatsForRange computes stats for a specific ledger range
@@ -1979,25 +1808,6 @@ func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32) (int64
 	return processed, nil
 }
 
-// AllStats combines all statistics
-type AllStats struct {
-	Database *DBStats      `json:"database"`
-	Storage  *StorageStats `json:"storage"`
-	Indexes  *IndexStats   `json:"indexes"`
-}
-
-// IndexStats holds per-index entry counts (for compatibility)
-type IndexStats struct {
-	EventsCount   int64 `json:"events_count"`
-	ContractCount int64 `json:"contract_index_count"`
-	TxHashCount   int64 `json:"txhash_index_count"`
-	TypeCount     int64 `json:"type_index_count"`
-	Topic0Count   int64 `json:"topic0_index_count"`
-	Topic1Count   int64 `json:"topic1_index_count"`
-	Topic2Count   int64 `json:"topic2_index_count"`
-	Topic3Count   int64 `json:"topic3_index_count"`
-}
-
 // GetIndexStats counts entries in each index
 func (es *EventStore) GetIndexStats() *IndexStats {
 	stats := &IndexStats{}
@@ -2016,57 +1826,6 @@ func (es *EventStore) GetIndexStats() *IndexStats {
 // Bitmap-Accelerated Queries
 // =============================================================================
 
-// QueryFilter defines a filter for bitmap-accelerated queries
-type QueryFilter struct {
-	ContractID []byte // Filter by contract ID (32 bytes)
-	Topic0     []byte // Filter by topic at position 0
-	Topic1     []byte // Filter by topic at position 1
-	Topic2     []byte // Filter by topic at position 2
-	Topic3     []byte // Filter by topic at position 3
-}
-
-// QueryResult holds the result of a bitmap-accelerated query
-type QueryResult struct {
-	Events          []*ContractEvent
-	MatchingLedgers uint64 // Number of ledgers that matched the filter
-	EventsScanned   int64  // Number of events scanned (for debugging)
-	EventsReturned  int64  // Number of events returned
-
-	// Timing breakdown
-	BitmapLookupTime time.Duration // Time to query bitmap index
-	EventFetchTime   time.Duration // Time to fetch events from matching ledgers
-	FilterTime       time.Duration // Time spent filtering events
-	TotalTime        time.Duration // Total query time
-
-	// Additional stats
-	LedgerRange     uint32 // Number of ledgers in query range
-	SegmentsQueried int    // Number of bitmap segments queried
-
-	// For benchmarking - stores matching ledger numbers
-	MatchingLedgerSeqs []uint32 // Actual ledger sequence numbers that matched
-}
-
-// FetchBenchmarkResult holds comparison results between RocksDB and ledger file fetching
-type FetchBenchmarkResult struct {
-	// Bitmap phase (same for both)
-	BitmapLookupTime time.Duration
-	MatchingLedgers  int
-	LedgerSeqs       []uint32 // The actual ledger sequences
-
-	// RocksDB fetch
-	RocksDBFetchTime time.Duration
-	RocksDBEvents    int
-	RocksDBBytesRead int64
-
-	// Ledger file fetch
-	LedgerFetchTime     time.Duration
-	LedgerEvents        int
-	LedgerBytesRead     int64
-	LedgerDiskReadTime  time.Duration
-	LedgerDecompressTime time.Duration
-	LedgerUnmarshalTime time.Duration
-}
-
 // GetEventsByContractIDBitmap retrieves events for a contract using bitmap index
 // This is much faster than GetEventsByContractIDInRange for sparse data
 func (es *EventStore) GetEventsByContractIDBitmap(contractID []byte, startLedger, endLedger uint32, limit int) (*QueryResult, error) {
@@ -2084,9 +1843,9 @@ func (es *EventStore) GetEventsByContractIDBitmap(contractID []byte, startLedger
 		MatchingLedgers: bitmap.GetCardinality(),
 	}
 
-	if bitmap.GetCardinality() == 0 {
-		return result, nil
-	}
+	//if bitmap.GetCardinality() == 0 {
+	//	return result, nil
+	//}
 
 	// Fetch events only from matching ledgers
 	iter := bitmap.Iterator()
@@ -2481,4 +2240,119 @@ func (es *EventStore) CountEventsByTopicBitmap(position int, topicValue []byte, 
 	}
 
 	return bitmap.GetCardinality(), nil
+}
+
+// =============================================================================
+// Hierarchical Bitmap Queries (L1 + L2)
+// =============================================================================
+
+// GetEventsWithFilterHierarchical uses two-level bitmap for precise event lookup
+func (es *EventStore) GetEventsWithFilterHierarchical(filter *QueryFilter, startLedger, endLedger uint32, limit int) (*HierarchicalQueryResult, error) {
+	totalStart := time.Now()
+
+	if es.bitmapIndex == nil {
+		return nil, fmt.Errorf("bitmap index not available")
+	}
+
+	result := &HierarchicalQueryResult{}
+
+	// Determine which index to query (contract or topic)
+	var hierarchicalResult *index.IndexQueryResult
+	var err error
+
+	if len(filter.ContractID) > 0 {
+		hierarchicalResult, err = es.bitmapIndex.QueryContractIndexHierarchical(filter.ContractID, startLedger, endLedger)
+	} else if len(filter.Topic0) > 0 {
+		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(0, filter.Topic0, startLedger, endLedger)
+	} else if len(filter.Topic1) > 0 {
+		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(1, filter.Topic1, startLedger, endLedger)
+	} else if len(filter.Topic2) > 0 {
+		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(2, filter.Topic2, startLedger, endLedger)
+	} else if len(filter.Topic3) > 0 {
+		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(3, filter.Topic3, startLedger, endLedger)
+	} else {
+		return nil, fmt.Errorf("at least one filter must be specified for hierarchical query")
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	result.L1LookupTime = hierarchicalResult.L1LookupTime
+	result.L2LookupTime = hierarchicalResult.L2LookupTime
+	result.MatchingLedgers = hierarchicalResult.MatchingLedgers
+	result.MatchingEvents = hierarchicalResult.TotalEvents
+
+	if hierarchicalResult.TotalEvents == 0 {
+		result.TotalTime = time.Since(totalStart)
+		return result, nil
+	}
+
+	// Phase 3: Fetch events by exact keys using MultiGet
+	fetchStart := time.Now()
+
+	// Build exact event keys
+	keysToFetch := make([][]byte, 0, len(hierarchicalResult.EventKeys))
+	for i, ek := range hierarchicalResult.EventKeys {
+		if limit > 0 && i >= limit {
+			break
+		}
+		// Decode the event index to get tx, op, event
+		txIdx, opIdx, evtIdx := index.DecodeEventIndex(uint32(ek.EventIndex))
+		key := eventKeyFromParts(ek.LedgerSeq, txIdx, opIdx, evtIdx)
+		keysToFetch = append(keysToFetch, key)
+	}
+
+	// Use MultiGet for batch fetching
+	values, err := es.db.MultiGetCF(es.ro, es.cfEvents, keysToFetch...)
+	if err != nil {
+		return nil, fmt.Errorf("MultiGet failed: %w", err)
+	}
+
+	for i, value := range values {
+		if value.Size() == 0 {
+			value.Free()
+			continue
+		}
+
+		key := keysToFetch[i]
+		ledger := binary.BigEndian.Uint32(key[0:4])
+		txIdx := binary.BigEndian.Uint16(key[4:6])
+		opIdx := binary.BigEndian.Uint16(key[6:8])
+		evtIdx := binary.BigEndian.Uint16(key[8:10])
+
+		event, err := parseRawXDRToEvent(value.Data(), ledger, txIdx, opIdx, evtIdx)
+		value.Free()
+		if err != nil {
+			continue
+		}
+
+		result.Events = append(result.Events, event)
+		result.EventsFetched++
+	}
+
+	result.EventFetchTime = time.Since(fetchStart)
+	result.TotalTime = time.Since(totalStart)
+
+	return result, nil
+}
+
+// AddEventToL2Index adds an event to the L2 hierarchical index
+func (es *EventStore) AddEventToL2Index(contractID []byte, topics [][]byte, ledgerSeq uint32, txIdx, opIdx, eventIdx uint16) {
+	if es.bitmapIndex == nil {
+		return
+	}
+
+	// Add to contract L2 index
+	if len(contractID) > 0 {
+		es.bitmapIndex.AddContractL2Index(contractID, ledgerSeq, txIdx, opIdx, eventIdx)
+	}
+
+	// Add to topic L2 indexes
+	for i, topic := range topics {
+		if i > 3 || len(topic) == 0 {
+			break
+		}
+		es.bitmapIndex.AddTopicL2Index(i, topic, ledgerSeq, txIdx, opIdx, eventIdx)
+	}
 }
