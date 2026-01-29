@@ -55,7 +55,9 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 		}
 
 		// Capture transaction hash once for all events in this transaction
-		txHash := tx.Hash[:]
+		// IMPORTANT: Copy the hash to avoid keeping the entire tx structure alive in memory
+		txHash := make([]byte, 32)
+		copy(txHash, tx.Hash[:])
 
 		// Process transaction-level events
 		for eventIndex, event := range txEvents.TransactionEvents {
@@ -70,10 +72,12 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 			}
 
 			// Extract contract ID and topics for indexing (avoids re-parsing later)
+			// IMPORTANT: Copy contractID to avoid keeping the entire XDR structure alive
 			var contractID []byte
 			var topics [][]byte
 			if event.Event.ContractId != nil {
-				contractID = event.Event.ContractId[:]
+				contractID = make([]byte, 32)
+				copy(contractID, event.Event.ContractId[:])
 			}
 			if event.Event.Body.V == 0 {
 				body := event.Event.Body.MustV0()
@@ -109,10 +113,12 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 				}
 
 				// Extract contract ID and topics for indexing (avoids re-parsing later)
+				// IMPORTANT: Copy contractID to avoid keeping the entire XDR structure alive
 				var contractID []byte
 				var topics [][]byte
 				if event.ContractId != nil {
-					contractID = event.ContractId[:]
+					contractID = make([]byte, 32)
+					copy(contractID, event.ContractId[:])
 				}
 				if event.Body.V == 0 {
 					body := event.Body.MustV0()
