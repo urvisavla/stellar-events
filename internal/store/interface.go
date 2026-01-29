@@ -88,17 +88,8 @@ type Store interface {
 	// GetStats returns database statistics.
 	GetStats() (*DBStats, error)
 
-	// GetStorageStats returns storage-level statistics.
-	GetStorageStats() *StorageStats
-
-	// GetSnapshotStats returns numeric stats for progress snapshots (fast path, L0 only).
-	GetSnapshotStats() *SnapshotStats
-
-	// GetDetailedSnapshotStats returns full stats including all level file counts.
-	GetDetailedSnapshotStats() *SnapshotStats
-
-	// GetIndexStats returns per-index entry counts.
-	GetIndexStats() *IndexStats
+	// GetStorageSnapshot returns per-column-family storage statistics.
+	GetStorageSnapshot() (*StorageSnapshot, error)
 
 	// GetBitmapStats returns bitmap index statistics (may return nil if not available).
 	GetBitmapStats() *BitmapStats
@@ -117,8 +108,8 @@ type Store interface {
 	// Maintenance
 	// ==========================================================================
 
-	// CompactAll runs manual compaction on the entire database.
-	CompactAll() *CompactionResult
+	// CompactAllWithStats runs manual compaction and returns before/after stats per column family.
+	CompactAllWithStats() (*CompactionSummary, error)
 
 	// BuildIndexes rebuilds indexes from existing events.
 	// Options control which index types to build (L1 bitmap always, L2 and unique optional).

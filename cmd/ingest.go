@@ -34,7 +34,7 @@ func runIngest(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fmt.Fprintf(os.Stderr, "  --start <ledger>   Start ledger (default: %d)\n", reader.FirstLedgerSequence)
 		fmt.Fprintf(os.Stderr, "  --end <ledger>     End ledger (0 = auto-detect max)\n\n")
-		fmt.Fprintf(os.Stderr, "Progress/workers/batch/queue are configured in config.toml [ingestion]\n")
+		fmt.Fprintf(os.Stderr, "Parallelism configured in config.toml [ingestion]\n")
 	}
 
 	if err := fs.Parse(args); err != nil {
@@ -62,13 +62,6 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		fmt.Fprintf(os.Stderr, "Source ledger range: %d - %d\n", minLedger, maxLedger)
 	}
 
-	// Config-only progress file (required)
-	progressFile := cfg.Ingestion.ProgressFile
-	if progressFile == "" {
-		fmt.Fprintf(os.Stderr, "Error: ingestion.progress_file must be set in config\n")
-		os.Exit(2)
-	}
-
 	// Validate
 	if startLedger < reader.FirstLedgerSequence {
 		fmt.Fprintf(os.Stderr, "Error: start ledger must be >= %d\n", reader.FirstLedgerSequence)
@@ -86,20 +79,6 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		os.Exit(1)
 	}
 	defer eventStore.Close()
-
-	// Setup progress tracker (always enabled)
-	progressTracker := progress.NewTracker(progressFile, startLedger, endLedger)
-	progressTracker.SetStatsProvider(&statsProviderAdapter{store: eventStore})
-	if cfg.Ingestion.SnapshotInterval > 0 {
-		progressTracker.SetSnapshotInterval(cfg.Ingestion.SnapshotInterval)
-	}
-	fmt.Fprintf(os.Stderr, "Progress file: %s\n", progressFile)
-	fmt.Fprintf(os.Stderr, "History file:  %s\n", progressTracker.GetHistoryFile())
-	progressTracker.Start()
-	defer func() {
-		progressTracker.SetStatus("completed")
-		progressTracker.Stop()
-	}()
 
 	networkPassphrase := cfg.GetNetworkPassphrase()
 
@@ -120,6 +99,13 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	fmt.Fprintf(os.Stderr, "Ingesting events from ledgers %d to %d...\n", startLedger, endLedger)
 	fmt.Fprintf(os.Stderr, "Parallel mode: %d workers, batch size %d, queue size %d\n", workers, batchSize, queueSize)
 
+	// Create progress writer if configured
+	var progressWriter *progress.Writer
+	if cfg.Ingestion.ProgressFile != "" {
+		progressWriter = progress.NewWriter(cfg.Ingestion.ProgressFile, startLedger, endLedger)
+		fmt.Fprintf(os.Stderr, "Progress file: %s\n", cfg.Ingestion.ProgressFile)
+	}
+
 	pipelineConfig := ingest.PipelineConfig{
 		Workers:             workers,
 		BatchSize:           batchSize,
@@ -137,12 +123,11 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	// Aggregated stats for tracking
 	stats := ingest.NewLedgerStats()
 	var ledgerCount, totalEvents int
-	var lastReportedLedger uint32
+	startTime := time.Now()
 
 	pipeline.SetProgressCallback(func(ledger uint32, ledgersProcessed, eventsTotal int, pipeStats *ingest.LedgerStats) {
 		ledgerCount = ledgersProcessed
 		totalEvents = eventsTotal
-		lastReportedLedger = ledger
 
 		stats.TotalLedgers = pipeStats.TotalLedgers
 		stats.TotalTransactions = pipeStats.TotalTransactions
@@ -150,19 +135,35 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		stats.OperationEvents = pipeStats.OperationEvents
 		stats.TransactionEvents = pipeStats.TransactionEvents
 
-		progressTracker.Update(ledger, ledgersProcessed, eventsTotal, stats)
 		fmt.Fprintf(os.Stderr, "Processed %d ledgers, %d events (ledger %d)...\n", ledgersProcessed, eventsTotal, ledger)
+
+		// Update progress file
+		if progressWriter != nil {
+			if err := progressWriter.Update(ledger, ledgersProcessed, eventsTotal); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to write progress: %v\n", err)
+			}
+		}
 	})
 
 	pipeline.SetErrorCallback(func(ledger uint32, err error) {
 		fmt.Fprintf(os.Stderr, "Error processing ledger %d: %v\n", ledger, err)
-		progressTracker.AddError(err)
 	})
 
 	if err := pipeline.Run(startLedger, endLedger); err != nil {
+		// Write failure to progress file
+		if progressWriter != nil {
+			_ = progressWriter.Failed(endLedger, ledgerCount, totalEvents, err)
+		}
 		fmt.Fprintf(os.Stderr, "Pipeline failed: %v\n", err)
-		progressTracker.SetStatus("failed")
 		os.Exit(1)
+	}
+
+	// Write completion to progress file
+	if progressWriter != nil {
+		pipeStats := pipeline.GetStats()
+		if err := progressWriter.Complete(int(pipeStats.LedgersProcessed), int(pipeStats.EventsExtracted)); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to write progress: %v\n", err)
+		}
 	}
 
 	pipeStats := pipeline.GetStats()
@@ -174,12 +175,7 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	unmarshalTime := pipeline.GetUnmarshalTime()
 	writeTime := pipeline.GetWriteTime()
 	rawBytesTotal := pipeline.GetRawBytesTotal()
-
-	progressTracker.AddRawBytes(rawBytesTotal)
-	progressTracker.Update(lastReportedLedger, ledgerCount, totalEvents, stats)
-
-	finalProgress := progressTracker.GetProgress()
-	ingestionElapsed := time.Since(finalProgress.StartedAt)
+	ingestionElapsed := time.Since(startTime)
 
 	// Flush memtables to SST files before getting accurate storage stats
 	fmt.Fprintf(os.Stderr, "\nFlushing memtables to disk...\n")
@@ -193,12 +189,12 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 
 	var summary strings.Builder
 	rawDataMB := float64(rawBytesTotal) / (1024 * 1024)
-	preCompactStats := eventStore.GetDetailedSnapshotStats() // Use detailed stats for full level breakdown
-	sstSizeMB := float64(preCompactStats.SSTFilesSizeBytes) / (1024 * 1024)
-	memtableMB := float64(preCompactStats.MemtableSizeBytes) / (1024 * 1024)
-	storedSizeMB := sstSizeMB + memtableMB
-	totalFiles := preCompactStats.L0Files + preCompactStats.L1Files + preCompactStats.L2Files +
-		preCompactStats.L3Files + preCompactStats.L4Files + preCompactStats.L5Files + preCompactStats.L6Files
+
+	// Get pre-compaction storage snapshot
+	preSnapshot, err := eventStore.GetStorageSnapshot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to get storage stats: %v\n", err)
+	}
 
 	summary.WriteString("\n")
 	summary.WriteString("=== Ingestion Complete ===\n")
@@ -206,8 +202,13 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	summary.WriteString(fmt.Sprintf("  Ledgers processed:       %d\n", ledgerCount))
 	summary.WriteString(fmt.Sprintf("  Transactions processed:  %d\n", stats.TotalTransactions))
 	summary.WriteString(fmt.Sprintf("  Events ingested:         %d\n", totalEvents))
-	summary.WriteString(fmt.Sprintf("  Avg ledgers/sec:         %.0f\n", finalProgress.LedgersPerSec))
-	summary.WriteString(fmt.Sprintf("  Avg events/sec:          %.0f\n", finalProgress.EventsPerSec))
+
+	if ingestionElapsed.Seconds() > 0 {
+		ledgersPerSec := float64(ledgerCount) / ingestionElapsed.Seconds()
+		eventsPerSec := float64(totalEvents) / ingestionElapsed.Seconds()
+		summary.WriteString(fmt.Sprintf("  Avg ledgers/sec:         %.0f\n", ledgersPerSec))
+		summary.WriteString(fmt.Sprintf("  Avg events/sec:          %.0f\n", eventsPerSec))
+	}
 
 	totalWorkerTime := diskReadTime + decompressTime + unmarshalTime + writeTime
 	summary.WriteString("\n")
@@ -229,27 +230,14 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		summary.WriteString(fmt.Sprintf("  Avg bytes/event:         %.f\n", rawBytesPerEvent))
 	}
 
-	summary.WriteString("\n")
-	summary.WriteString("RocksDB Storage (pre-compaction):\n")
-	summary.WriteString(fmt.Sprintf("  SST files:               %.2f MB (%d files)\n", sstSizeMB, totalFiles))
-	summary.WriteString(fmt.Sprintf("  Memtable:                %.2f MB\n", memtableMB))
-	summary.WriteString(fmt.Sprintf("  Total stored:            %.2f MB\n", storedSizeMB))
-	if totalEvents > 0 && storedSizeMB > 0 {
-		bytesPerEvent := (storedSizeMB * 1024 * 1024) / float64(totalEvents)
-		summary.WriteString(fmt.Sprintf("  Avg bytes/event:         %.f\n", bytesPerEvent))
+	// Pre-compaction storage stats by column family
+	if preSnapshot != nil {
+		summary.WriteString("\n")
+		summary.WriteString("RocksDB Storage (pre-compaction):\n")
+		printStorageSnapshot(&summary, preSnapshot)
 	}
-	if rawDataMB > 0 && storedSizeMB > 0 {
-		compressionRatio := rawDataMB / storedSizeMB
-		savings := (rawDataMB - storedSizeMB) / rawDataMB * 100
-		summary.WriteString(fmt.Sprintf("  Compression:             %.1fx (%.1f%% savings)\n", compressionRatio, savings))
-	}
-	summary.WriteString(fmt.Sprintf("  Pending compaction:      %.2f MB\n", float64(preCompactStats.PendingCompactBytes)/(1024*1024)))
-	summary.WriteString(fmt.Sprintf("  Files by level:          L0=%d L1=%d L2=%d L3=%d L4=%d L5=%d L6=%d\n",
-		preCompactStats.L0Files, preCompactStats.L1Files, preCompactStats.L2Files,
-		preCompactStats.L3Files, preCompactStats.L4Files, preCompactStats.L5Files, preCompactStats.L6Files))
 
 	fmt.Fprint(os.Stderr, summary.String())
-	printPerformanceTrend(progressTracker.GetHistoryFile())
 
 	// Write ingestion summary to file (timestamped)
 	filetime := time.Now().Format("20060102T150405")
@@ -259,58 +247,26 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	}
 
 	var postSummary strings.Builder
+
+	// Run compaction if enabled
 	if cfg.Ingestion.FinalCompaction {
-		var compactionResult *store.CompactionResult
-		var compactionTime time.Duration
 		fmt.Fprintf(os.Stderr, "\nRunning final compaction...\n")
-		compactStart := time.Now()
-		compactionResult = eventStore.CompactAll()
-		compactionTime = time.Since(compactStart)
-		fmt.Fprintf(os.Stderr, "Compaction completed in %s\n", formatElapsed(compactionTime))
-
-		if compactionResult != nil {
-			rocksStats := eventStore.GetDetailedSnapshotStats() // Use detailed stats for full level breakdown
-			postTotalFiles := rocksStats.L0Files + rocksStats.L1Files + rocksStats.L2Files +
-				rocksStats.L3Files + rocksStats.L4Files + rocksStats.L5Files + rocksStats.L6Files
-			postSstSizeMB := float64(rocksStats.SSTFilesSizeBytes) / (1024 * 1024)
-
-			postSummary.WriteString("\n")
-			postSummary.WriteString("RocksDB Storage (post-compaction):\n")
-			postSummary.WriteString(fmt.Sprintf("  SST files:               %.2f MB (%d files)\n", postSstSizeMB, postTotalFiles))
-			if totalEvents > 0 && postSstSizeMB > 0 {
-				bytesPerEvent := (postSstSizeMB * 1024 * 1024) / float64(totalEvents)
-				postSummary.WriteString(fmt.Sprintf("  Avg bytes/event:         %.0f\n", bytesPerEvent))
-			}
-			if rawDataMB > 0 && postSstSizeMB > 0 {
-				compressionRatio := rawDataMB / postSstSizeMB
-				savings := (rawDataMB - postSstSizeMB) / rawDataMB * 100
-				postSummary.WriteString(fmt.Sprintf("  Compression:             %.1fx (%.1f%% savings)\n", compressionRatio, savings))
-			}
-			postSummary.WriteString(fmt.Sprintf("  Files by level:          L0=%d L1=%d L2=%d L3=%d L4=%d L5=%d L6=%d\n",
-				rocksStats.L0Files, rocksStats.L1Files, rocksStats.L2Files,
-				rocksStats.L3Files, rocksStats.L4Files, rocksStats.L5Files, rocksStats.L6Files))
-
-			postSummary.WriteString("\n")
-			postSummary.WriteString("Compaction Results:\n")
-			postSummary.WriteString(fmt.Sprintf("  Duration:                %s\n", formatElapsed(compactionTime)))
-			postSummary.WriteString(fmt.Sprintf("  Before:                  %.2f MB\n", float64(compactionResult.BeforeSSTBytes)/(1024*1024)))
-			postSummary.WriteString(fmt.Sprintf("  After:                   %.2f MB\n", float64(compactionResult.AfterSSTBytes)/(1024*1024)))
-			if compactionResult.BytesReclaimed > 0 {
-				postSummary.WriteString(fmt.Sprintf("  Reclaimed:               %.2f MB (%.1f%%)\n",
-					float64(compactionResult.BytesReclaimed)/(1024*1024),
-					compactionResult.SpaceSavingsPercent))
-			}
+		compactionSummary, err := eventStore.CompactAllWithStats()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: compaction failed: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "Compaction completed in %s\n", formatElapsed(compactionSummary.Duration))
+			printCompactionSummary(&postSummary, compactionSummary)
 		}
 	}
 
+	// Compute event stats if enabled
 	if cfg.Ingestion.ComputeStats {
 		fmt.Fprintf(os.Stderr, "\nComputing event statistics using %d workers...\n", workers)
 
-		var eventStats *store.EventStats
-		var statsTime time.Duration
 		statsStart := time.Now()
-		eventStats, err = eventStore.ComputeEventStats(workers)
-		statsTime = time.Since(statsStart)
+		eventStats, err := eventStore.ComputeEventStats(workers)
+		statsTime := time.Since(statsStart)
 		fmt.Fprintf(os.Stderr, "Stats computed in %s\n", formatElapsed(statsTime))
 
 		if err != nil {
@@ -339,4 +295,63 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		_, _ = f.WriteString(postSummary.String())
 		_ = f.Close()
 	}
+}
+
+// printStorageSnapshot prints a storage snapshot in a formatted table
+func printStorageSnapshot(sb *strings.Builder, snapshot *store.StorageSnapshot) {
+	p := message.NewPrinter(language.English)
+
+	sb.WriteString("  Column Family      Keys          SST Files    Memtable     Files\n")
+	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
+
+	// Print in a consistent order
+	cfOrder := []string{"events", "bitmap", "unique", "default"}
+	for _, name := range cfOrder {
+		cf, ok := snapshot.ColumnFamilies[name]
+		if !ok {
+			continue
+		}
+		sstMB := float64(cf.SSTFilesBytes) / (1024 * 1024)
+		memMB := float64(cf.MemtableBytes) / (1024 * 1024)
+		sb.WriteString(p.Sprintf("  %-16s %12d    %8.1f MB  %8.1f MB  %5d\n",
+			cf.Name, cf.EstimatedKeys, sstMB, memMB, cf.NumFiles))
+	}
+
+	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
+	totalSSTMB := float64(snapshot.TotalSST) / (1024 * 1024)
+	totalMemMB := float64(snapshot.TotalMemtable) / (1024 * 1024)
+	sb.WriteString(p.Sprintf("  %-16s %12s    %8.1f MB  %8.1f MB  %5d\n",
+		"TOTAL", "", totalSSTMB, totalMemMB, snapshot.TotalFiles))
+}
+
+// printCompactionSummary prints the compaction results in a formatted table
+func printCompactionSummary(sb *strings.Builder, cs *store.CompactionSummary) {
+	p := message.NewPrinter(language.English)
+
+	sb.WriteString("\n")
+	sb.WriteString(p.Sprintf("=== Compaction Summary (%s) ===\n", formatElapsed(cs.Duration)))
+	sb.WriteString("\n")
+	sb.WriteString("  Column Family      Before       After        Reclaimed    Savings\n")
+	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
+
+	// Print in a consistent order
+	cfOrder := []string{"events", "bitmap", "unique", "default"}
+	for _, name := range cfOrder {
+		cf, ok := cs.PerCF[name]
+		if !ok {
+			continue
+		}
+		beforeMB := float64(cf.BeforeBytes) / (1024 * 1024)
+		afterMB := float64(cf.AfterBytes) / (1024 * 1024)
+		reclaimedMB := float64(cf.Reclaimed) / (1024 * 1024)
+		sb.WriteString(p.Sprintf("  %-16s %8.1f MB  %8.1f MB  %8.1f MB  %6.1f%%\n",
+			cf.Name, beforeMB, afterMB, reclaimedMB, cf.SavingsPercent))
+	}
+
+	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
+	beforeMB := float64(cs.Before.TotalSST) / (1024 * 1024)
+	afterMB := float64(cs.After.TotalSST) / (1024 * 1024)
+	reclaimedMB := float64(cs.TotalReclaimed) / (1024 * 1024)
+	sb.WriteString(p.Sprintf("  %-16s %8.1f MB  %8.1f MB  %8.1f MB  %6.1f%%\n",
+		"TOTAL", beforeMB, afterMB, reclaimedMB, cs.SavingsPercent))
 }

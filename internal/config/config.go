@@ -76,7 +76,8 @@ type StorageConfig struct {
 
 // IngestionConfig contains ingestion settings
 type IngestionConfig struct {
-	ProgressFile string `toml:"progress_file"` // Progress file for resume capability
+	// Progress tracking
+	ProgressFile string `toml:"progress_file"` // Progress file path (empty = disabled)
 
 	// Post-processing
 	FinalCompaction bool `toml:"final_compaction"` // Run compaction after ingestion (default: true)
@@ -87,8 +88,7 @@ type IngestionConfig struct {
 	UniqueIndexes bool `toml:"unique_indexes"` // Maintain unique value counts (default: false)
 	L2Indexes     bool `toml:"l2_indexes"`     // Maintain L2 hierarchical indexes (default: false)
 
-	// Progress tracking
-	SnapshotInterval    int `toml:"snapshot_interval"`     // Ledgers between progress snapshots (default: 1000000)
+	// Bitmap flush interval
 	BitmapFlushInterval int `toml:"bitmap_flush_interval"` // Ledgers between bitmap index flushes (default: 10000)
 
 	// Parallelism
@@ -151,13 +151,12 @@ func DefaultConfig() *Config {
 			MaxBytesForLevelBaseMB: 1024,
 		},
 		Ingestion: IngestionConfig{
-			ProgressFile:        "",
+			ProgressFile:        "", // Empty = disabled
 			FinalCompaction:     true,
 			ComputeStats:        false,
 			BitmapIndexes:       true,
 			UniqueIndexes:       false,
 			L2Indexes:           false,
-			SnapshotInterval:    1000000,
 			BitmapFlushInterval: 10000, // Flush hot segments every 10K ledgers
 			Workers:             0,     // 0 = NumCPU
 			BatchSize:           100,

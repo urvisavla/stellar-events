@@ -67,8 +67,12 @@ max_bytes_for_level_base_mb = 1024
 # Ingestion
 # =============================================================================
 [ingestion]
-# Progress file for resume capability
-progress_file = "./progress.json"
+# Progress file path (empty = disabled)
+# When set, writes progress JSON every 10k ledgers with:
+# - ledger range being ingested
+# - events processed, avg per ledger
+# - processing rate and ETA
+progress_file = ""
 
 # --- Post-processing ---
 # Run compaction after ingestion (optimizes for reads)
@@ -87,10 +91,6 @@ unique_indexes = false
 
 # Maintain L2 hierarchical indexes (precise event lookup)
 l2_indexes = false
-
-# --- Progress Tracking ---
-# Ledgers between progress snapshots
-snapshot_interval = 1000
 
 # Ledgers between bitmap index flushes (prevents memory growth)
 # Set to 0 to only flush at end of ingestion

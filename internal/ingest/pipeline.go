@@ -292,7 +292,7 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 			}
 
 			// Progress callback
-			if p.onProgress != nil && ledgersProcessed%1000 == 0 {
+			if p.onProgress != nil && ledgersProcessed%10000 == 0 {
 				p.onProgress(nextSeq-1, ledgersProcessed, totalEvents, aggStats)
 			}
 		}

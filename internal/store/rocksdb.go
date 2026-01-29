@@ -813,99 +813,50 @@ func (es *EventStore) CountEvents() (int64, error) {
 	return count, nil
 }
 
-// GetStorageStats retrieves RocksDB storage statistics
-func (es *EventStore) GetStorageStats() *StorageStats {
-	stats := &StorageStats{}
+// GetStorageSnapshot returns per-column-family storage statistics.
+func (es *EventStore) GetStorageSnapshot() (*StorageSnapshot, error) {
+	snapshot := &StorageSnapshot{
+		Timestamp:      time.Now(),
+		ColumnFamilies: make(map[string]*ColumnFamilyStats),
+	}
 
-	stats.EstimatedNumKeys = es.db.GetProperty("rocksdb.estimate-num-keys")
-	stats.EstimateLiveDataSize = es.db.GetProperty("rocksdb.estimate-live-data-size")
-	stats.TotalSstFilesSize = es.db.GetProperty("rocksdb.total-sst-files-size")
-	stats.LiveSstFilesSize = es.db.GetProperty("rocksdb.live-sst-files-size")
-	stats.SizeAllMemTables = es.db.GetProperty("rocksdb.size-all-mem-tables")
-	stats.CurSizeAllMemTables = es.db.GetProperty("rocksdb.cur-size-all-mem-tables")
+	cfNames := []string{CFDefault, CFEvents, CFUnique, CFBitmap}
 
-	// Note: rocksdb.estimate-num-keys is often inaccurate with column families
-	// The actual event count is shown separately via GetStats()
-
-	stats.EstimatePendingCompactionBytes = es.db.GetProperty("rocksdb.estimate-pending-compaction-bytes")
-	stats.NumRunningCompactions = es.db.GetProperty("rocksdb.num-running-compactions")
-	stats.NumRunningFlushes = es.db.GetProperty("rocksdb.num-running-flushes")
-
-	stats.NumFilesAtLevel0 = es.db.GetProperty("rocksdb.num-files-at-level0")
-	stats.NumFilesAtLevel1 = es.db.GetProperty("rocksdb.num-files-at-level1")
-	stats.NumFilesAtLevel2 = es.db.GetProperty("rocksdb.num-files-at-level2")
-	stats.NumFilesAtLevel3 = es.db.GetProperty("rocksdb.num-files-at-level3")
-
-	stats.BlockCacheUsage = es.db.GetProperty("rocksdb.block-cache-usage")
-	stats.BlockCachePinnedUsage = es.db.GetProperty("rocksdb.block-cache-pinned-usage")
-
-	stats.BackgroundErrors = es.db.GetProperty("rocksdb.background-errors")
-	stats.NumLiveVersions = es.db.GetProperty("rocksdb.num-live-versions")
-	stats.NumSnapshots = es.db.GetProperty("rocksdb.num-snapshots")
-
-	return stats
-}
-
-// GetSnapshotStats returns numeric RocksDB stats for progress snapshots (fast path)
-// Only collects L0 file count - use GetDetailedSnapshotStats() for all levels
-func (es *EventStore) GetSnapshotStats() *SnapshotStats {
-	stats := &SnapshotStats{}
-
-	// Parse int64 from string property
-	parseIntProp := func(val string) int64 {
-		var n int64
+	// Helper to parse uint64 from RocksDB property string
+	parseUint64 := func(val string) uint64 {
+		var n uint64
 		fmt.Sscanf(val, "%d", &n)
 		return n
 	}
 
-	// Parse int from string property
-	parseIntPropSmall := func(val string) int {
-		var n int
-		fmt.Sscanf(val, "%d", &n)
-		return n
+	// Helper to count files across all levels for a CF
+	countFiles := func(cf *grocksdb.ColumnFamilyHandle) int {
+		total := 0
+		for level := 0; level <= 6; level++ {
+			prop := fmt.Sprintf("rocksdb.num-files-at-level%d", level)
+			total += int(parseUint64(es.db.GetPropertyCF(prop, cf)))
+		}
+		return total
 	}
 
-	// Use RocksDB property for SST size - much faster than filesystem walk
-	// Note: This returns total SST files size across all column families
-	stats.SSTFilesSizeBytes = parseIntProp(es.db.GetProperty("rocksdb.total-sst-files-size"))
-	stats.MemtableSizeBytes = parseIntProp(es.db.GetProperty("rocksdb.cur-size-all-mem-tables"))
-	stats.EstimatedNumKeys = parseIntProp(es.db.GetProperty("rocksdb.estimate-num-keys"))
-	stats.PendingCompactBytes = parseIntProp(es.db.GetProperty("rocksdb.estimate-pending-compaction-bytes"))
+	for i, name := range cfNames {
+		cf := es.cfHandles[i]
+		cfStats := &ColumnFamilyStats{
+			Name:           name,
+			EstimatedKeys:  parseUint64(es.db.GetPropertyCF("rocksdb.estimate-num-keys", cf)),
+			SSTFilesBytes:  parseUint64(es.db.GetPropertyCF("rocksdb.total-sst-files-size", cf)),
+			MemtableBytes:  parseUint64(es.db.GetPropertyCF("rocksdb.cur-size-all-mem-tables", cf)),
+			PendingCompact: parseUint64(es.db.GetPropertyCF("rocksdb.estimate-pending-compaction-bytes", cf)),
+			NumFiles:       countFiles(cf),
+		}
 
-	// Only collect L0 for fast path - this is what periodic snapshots need
-	for _, cf := range es.cfHandles {
-		stats.L0Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level0", cf))
+		snapshot.ColumnFamilies[name] = cfStats
+		snapshot.TotalSST += cfStats.SSTFilesBytes
+		snapshot.TotalMemtable += cfStats.MemtableBytes
+		snapshot.TotalFiles += cfStats.NumFiles
 	}
 
-	stats.RunningCompactions = parseIntPropSmall(es.db.GetProperty("rocksdb.num-running-compactions"))
-	stats.CompactionPending = es.db.GetProperty("rocksdb.compaction-pending") == "1"
-
-	return stats
-}
-
-// GetDetailedSnapshotStats returns full stats including all level file counts
-// Used for end-of-ingestion summary and compaction stats
-func (es *EventStore) GetDetailedSnapshotStats() *SnapshotStats {
-	stats := es.GetSnapshotStats() // Get basic stats first
-
-	// Parse int from string property
-	parseIntPropSmall := func(val string) int {
-		var n int
-		fmt.Sscanf(val, "%d", &n)
-		return n
-	}
-
-	// Collect L1-L6 file counts (expensive - 24 property calls)
-	for _, cf := range es.cfHandles {
-		stats.L1Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level1", cf))
-		stats.L2Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level2", cf))
-		stats.L3Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level3", cf))
-		stats.L4Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level4", cf))
-		stats.L5Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level5", cf))
-		stats.L6Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level6", cf))
-	}
-
-	return stats
+	return snapshot, nil
 }
 
 // Flush forces all memtables to be flushed to SST files
@@ -971,17 +922,14 @@ func (es *EventStore) GetStats() (*DBStats, error) {
 	return stats, nil
 }
 
-// CompactAll runs manual compaction on the entire database (all column families)
-func (es *EventStore) CompactAll() *CompactionResult {
-	beforeStats := es.GetDetailedSnapshotStats()
-	beforeFiles := beforeStats.L0Files + beforeStats.L1Files + beforeStats.L2Files +
-		beforeStats.L3Files + beforeStats.L4Files + beforeStats.L5Files + beforeStats.L6Files
-
-	result := &CompactionResult{
-		BeforeSSTBytes:   beforeStats.SSTFilesSizeBytes,
-		BeforeL0Files:    beforeStats.L0Files,
-		BeforeTotalFiles: beforeFiles,
+// CompactAllWithStats runs manual compaction and returns before/after stats per column family.
+func (es *EventStore) CompactAllWithStats() (*CompactionSummary, error) {
+	before, err := es.GetStorageSnapshot()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pre-compaction stats: %w", err)
 	}
+
+	start := time.Now()
 
 	// Create compaction options for full compaction
 	compactOpts := grocksdb.NewCompactRangeOptions()
@@ -991,26 +939,57 @@ func (es *EventStore) CompactAll() *CompactionResult {
 	compactOpts.SetBottommostLevelCompaction(grocksdb.KForceOptimized)
 	compactOpts.SetExclusiveManualCompaction(true)
 
-	// Compact ALL column families, not just default
+	// Compact ALL column families
 	fullRange := grocksdb.Range{Start: nil, Limit: nil}
 	for _, cf := range es.cfHandles {
 		es.db.CompactRangeCFOpt(cf, fullRange, compactOpts)
 	}
 
-	afterStats := es.GetDetailedSnapshotStats()
-	afterFiles := afterStats.L0Files + afterStats.L1Files + afterStats.L2Files +
-		afterStats.L3Files + afterStats.L4Files + afterStats.L5Files + afterStats.L6Files
+	duration := time.Since(start)
 
-	result.AfterSSTBytes = afterStats.SSTFilesSizeBytes
-	result.AfterL0Files = afterStats.L0Files
-	result.AfterTotalFiles = afterFiles
-	result.BytesReclaimed = beforeStats.SSTFilesSizeBytes - afterStats.SSTFilesSizeBytes
-
-	if beforeStats.SSTFilesSizeBytes > 0 {
-		result.SpaceSavingsPercent = float64(result.BytesReclaimed) / float64(beforeStats.SSTFilesSizeBytes) * 100
+	after, err := es.GetStorageSnapshot()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get post-compaction stats: %w", err)
 	}
 
-	return result
+	// Build per-CF compaction results
+	perCF := make(map[string]*CFCompactionResult)
+	for name, beforeCF := range before.ColumnFamilies {
+		afterCF := after.ColumnFamilies[name]
+		var reclaimed uint64
+		if beforeCF.SSTFilesBytes > afterCF.SSTFilesBytes {
+			reclaimed = beforeCF.SSTFilesBytes - afterCF.SSTFilesBytes
+		}
+		pct := 0.0
+		if beforeCF.SSTFilesBytes > 0 {
+			pct = float64(reclaimed) / float64(beforeCF.SSTFilesBytes) * 100
+		}
+		perCF[name] = &CFCompactionResult{
+			Name:           name,
+			BeforeBytes:    beforeCF.SSTFilesBytes,
+			AfterBytes:     afterCF.SSTFilesBytes,
+			Reclaimed:      reclaimed,
+			SavingsPercent: pct,
+		}
+	}
+
+	var totalReclaimed uint64
+	if before.TotalSST > after.TotalSST {
+		totalReclaimed = before.TotalSST - after.TotalSST
+	}
+	totalSavings := 0.0
+	if before.TotalSST > 0 {
+		totalSavings = float64(totalReclaimed) / float64(before.TotalSST) * 100
+	}
+
+	return &CompactionSummary{
+		Before:         before,
+		After:          after,
+		Duration:       duration,
+		PerCF:          perCF,
+		TotalReclaimed: totalReclaimed,
+		SavingsPercent: totalSavings,
+	}, nil
 }
 
 // CountUniqueIndexes counts entries in unique indexes and sums their event counts (parallel)
@@ -1861,20 +1840,6 @@ func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *
 	}
 
 	return processed, nil
-}
-
-// GetIndexStats counts entries in each index
-func (es *EventStore) GetIndexStats() *IndexStats {
-	stats := &IndexStats{}
-
-	// Count events
-	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
-	for it.SeekToFirst(); it.Valid(); it.Next() {
-		stats.EventsCount++
-	}
-	it.Close()
-
-	return stats
 }
 
 // =============================================================================

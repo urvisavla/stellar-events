@@ -2,17 +2,13 @@ package main
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
-	"os"
-	"strings"
 	"time"
 
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 
 	"github.com/urvisavla/stellar-events/internal/config"
-	"github.com/urvisavla/stellar-events/internal/progress"
 	"github.com/urvisavla/stellar-events/internal/store"
 )
 
@@ -57,34 +53,6 @@ func configToIndexOptions(cfg *config.IndexConfig) *store.IndexConfig {
 }
 
 // =============================================================================
-// Stats Provider Adapter
-// =============================================================================
-
-// statsProviderAdapter adapts store.Store to progress.StatsProvider
-type statsProviderAdapter struct {
-	store store.Store
-}
-
-func (a *statsProviderAdapter) GetSnapshotStats() *progress.SnapshotStats {
-	s := a.store.GetSnapshotStats()
-	return &progress.SnapshotStats{
-		SSTFilesSizeBytes:   s.SSTFilesSizeBytes,
-		MemtableSizeBytes:   s.MemtableSizeBytes,
-		EstimatedNumKeys:    s.EstimatedNumKeys,
-		PendingCompactBytes: s.PendingCompactBytes,
-		L0Files:             s.L0Files,
-		L1Files:             s.L1Files,
-		L2Files:             s.L2Files,
-		L3Files:             s.L3Files,
-		L4Files:             s.L4Files,
-		L5Files:             s.L5Files,
-		L6Files:             s.L6Files,
-		RunningCompactions:  s.RunningCompactions,
-		CompactionPending:   s.CompactionPending,
-	}
-}
-
-// =============================================================================
 // Encoding Helpers
 // =============================================================================
 
@@ -96,16 +64,6 @@ func decodeBase64(s string) ([]byte, error) {
 // =============================================================================
 // Formatting Helpers
 // =============================================================================
-
-// bytesToMB converts a byte count string to megabytes
-func bytesToMB(bytesStr string) string {
-	var bytes int64
-	if _, err := fmt.Sscan(bytesStr, &bytes); err != nil {
-		return bytesStr
-	}
-	mb := float64(bytes) / (1024 * 1024)
-	return fmt.Sprintf("%.2f", mb)
-}
 
 // formatElapsed formats a duration for display (human readable)
 func formatElapsed(d time.Duration) string {
@@ -142,62 +100,6 @@ func formatDuration(d time.Duration) string {
 }
 
 // =============================================================================
-// Progress Tracking Helpers
-// =============================================================================
-
-// printPerformanceTrend reads the history file and prints min/max/avg rates
-func printPerformanceTrend(historyFile string) {
-	data, err := os.ReadFile(historyFile)
-	if err != nil {
-		return
-	}
-
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) < 2 {
-		return
-	}
-
-	var minRate, maxRate, sumRate float64
-	var count int
-	minRate = -1
-
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		var snapshot progress.ProgressSnapshot
-		if err := json.Unmarshal([]byte(line), &snapshot); err != nil {
-			continue
-		}
-
-		rate := snapshot.LedgersPerSec
-		if rate <= 0 {
-			continue
-		}
-
-		if minRate < 0 || rate < minRate {
-			minRate = rate
-		}
-		if rate > maxRate {
-			maxRate = rate
-		}
-		sumRate += rate
-		count++
-	}
-
-	if count < 2 {
-		return
-	}
-
-	avgRate := sumRate / float64(count)
-
-	fmt.Fprintf(os.Stderr, "\nPerformance Trend (%d intervals):\n", count)
-	fmt.Fprintf(os.Stderr, "  Min ledgers/sec:   %.2f\n", minRate)
-	fmt.Fprintf(os.Stderr, "  Max ledgers/sec:   %.2f\n", maxRate)
-	fmt.Fprintf(os.Stderr, "  Avg ledgers/sec:   %.2f\n", avgRate)
-}
-
-// =============================================================================
 // Stats Display Helpers
 // =============================================================================
 
@@ -221,11 +123,7 @@ func printDistribution(name string, stats *store.DistributionStats) {
 	if len(stats.TopN) > 0 {
 		p.Printf("  Top %d by event count:\n", len(stats.TopN))
 		for i, entry := range stats.TopN {
-			displayVal := entry.Value
-			//if len(displayVal) > 44 {
-			//	//	displayVal = displayVal[:20] + "..." + displayVal[len(displayVal)-20:]
-			//}
-			p.Printf("    %2d. %s (%d events)\n", i+1, displayVal, entry.EventCount)
+			p.Printf("    %2d. %s (%d events)\n", i+1, entry.Value, entry.EventCount)
 		}
 	}
 }

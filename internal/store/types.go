@@ -111,60 +111,42 @@ type DBStats struct {
 	UniqueContracts int    `json:"unique_contracts"`
 }
 
-// StorageStats holds storage-level statistics.
-type StorageStats struct {
-	EstimatedNumKeys     string `json:"estimated_num_keys"`
-	EstimateLiveDataSize string `json:"estimate_live_data_size"`
-	TotalSstFilesSize    string `json:"total_sst_files_size"`
-	LiveSstFilesSize     string `json:"live_sst_files_size"`
-	SizeAllMemTables     string `json:"size_all_mem_tables"`
-	CurSizeAllMemTables  string `json:"cur_size_all_mem_tables"`
-
-	EstimatePendingCompactionBytes string `json:"estimate_pending_compaction_bytes"`
-	NumRunningCompactions          string `json:"num_running_compactions"`
-	NumRunningFlushes              string `json:"num_running_flushes"`
-
-	NumFilesAtLevel0 string `json:"num_files_at_level0"`
-	NumFilesAtLevel1 string `json:"num_files_at_level1"`
-	NumFilesAtLevel2 string `json:"num_files_at_level2"`
-	NumFilesAtLevel3 string `json:"num_files_at_level3"`
-
-	BlockCacheUsage       string `json:"block_cache_usage"`
-	BlockCachePinnedUsage string `json:"block_cache_pinned_usage"`
-	BackgroundErrors      string `json:"background_errors"`
-	NumLiveVersions       string `json:"num_live_versions"`
-	NumSnapshots          string `json:"num_snapshots"`
+// ColumnFamilyStats holds storage stats for a single column family.
+type ColumnFamilyStats struct {
+	Name           string `json:"name"`
+	EstimatedKeys  uint64 `json:"estimated_keys"`
+	SSTFilesBytes  uint64 `json:"sst_files_bytes"`
+	MemtableBytes  uint64 `json:"memtable_bytes"`
+	PendingCompact uint64 `json:"pending_compact_bytes"`
+	NumFiles       int    `json:"num_files"`
 }
 
-// SnapshotStats holds storage metrics for progress snapshots.
-type SnapshotStats struct {
-	SSTFilesSizeBytes   int64 `json:"sst_files_size_bytes"`
-	MemtableSizeBytes   int64 `json:"memtable_size_bytes"`
-	EstimatedNumKeys    int64 `json:"estimated_num_keys"`
-	PendingCompactBytes int64 `json:"pending_compact_bytes"`
-
-	L0Files int `json:"l0_files"`
-	L1Files int `json:"l1_files"`
-	L2Files int `json:"l2_files"`
-	L3Files int `json:"l3_files"`
-	L4Files int `json:"l4_files"`
-	L5Files int `json:"l5_files"`
-	L6Files int `json:"l6_files"`
-
-	RunningCompactions int  `json:"running_compactions"`
-	CompactionPending  bool `json:"compaction_pending"`
+// StorageSnapshot holds storage stats for all column families at a point in time.
+type StorageSnapshot struct {
+	Timestamp      time.Time                     `json:"timestamp"`
+	ColumnFamilies map[string]*ColumnFamilyStats `json:"column_families"`
+	TotalSST       uint64                        `json:"total_sst_bytes"`
+	TotalMemtable  uint64                        `json:"total_memtable_bytes"`
+	TotalFiles     int                           `json:"total_files"`
 }
 
-// CompactionResult holds before/after metrics from manual compaction.
-type CompactionResult struct {
-	BeforeSSTBytes      int64   `json:"before_sst_bytes"`
-	BeforeL0Files       int     `json:"before_l0_files"`
-	BeforeTotalFiles    int     `json:"before_total_files"`
-	AfterSSTBytes       int64   `json:"after_sst_bytes"`
-	AfterL0Files        int     `json:"after_l0_files"`
-	AfterTotalFiles     int     `json:"after_total_files"`
-	BytesReclaimed      int64   `json:"bytes_reclaimed"`
-	SpaceSavingsPercent float64 `json:"space_savings_percent"`
+// CFCompactionResult holds compaction results for one column family.
+type CFCompactionResult struct {
+	Name           string  `json:"name"`
+	BeforeBytes    uint64  `json:"before_bytes"`
+	AfterBytes     uint64  `json:"after_bytes"`
+	Reclaimed      uint64  `json:"reclaimed_bytes"`
+	SavingsPercent float64 `json:"savings_percent"`
+}
+
+// CompactionSummary holds complete compaction results with per-CF breakdown.
+type CompactionSummary struct {
+	Before         *StorageSnapshot               `json:"before"`
+	After          *StorageSnapshot               `json:"after"`
+	Duration       time.Duration                  `json:"duration"`
+	PerCF          map[string]*CFCompactionResult `json:"per_cf"`
+	TotalReclaimed uint64                         `json:"total_reclaimed"`
+	SavingsPercent float64                        `json:"savings_percent"`
 }
 
 // =============================================================================
@@ -228,18 +210,6 @@ type EventStats struct {
 	DiagnosticEvents int64 `json:"diagnostic_events"`
 }
 
-// IndexStats holds per-index entry counts.
-type IndexStats struct {
-	EventsCount   int64 `json:"events_count"`
-	ContractCount int64 `json:"contract_index_count"`
-	TxHashCount   int64 `json:"txhash_index_count"`
-	TypeCount     int64 `json:"type_index_count"`
-	Topic0Count   int64 `json:"topic0_index_count"`
-	Topic1Count   int64 `json:"topic1_index_count"`
-	Topic2Count   int64 `json:"topic2_index_count"`
-	Topic3Count   int64 `json:"topic3_index_count"`
-}
-
 // BitmapStats holds statistics about bitmap indexes.
 type BitmapStats struct {
 	CurrentSegmentID   uint32 `json:"current_segment_id"`
@@ -251,13 +221,6 @@ type BitmapStats struct {
 	Topic1IndexCount   int64  `json:"topic1_index_count"`
 	Topic2IndexCount   int64  `json:"topic2_index_count"`
 	Topic3IndexCount   int64  `json:"topic3_index_count"`
-}
-
-// AllStats combines all statistics.
-type AllStats struct {
-	Database *DBStats      `json:"database"`
-	Storage  *StorageStats `json:"storage"`
-	Indexes  *IndexStats   `json:"indexes"`
 }
 
 // =============================================================================
