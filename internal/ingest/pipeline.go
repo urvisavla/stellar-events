@@ -13,14 +13,15 @@ import (
 
 // PipelineConfig configures the parallel ingestion pipeline
 type PipelineConfig struct {
-	Workers           int    // Number of parallel workers
-	BatchSize         int    // Ledgers to batch before writing
-	QueueSize         int    // Channel buffer size
-	DataDir           string // Ledger data directory
-	NetworkPassphrase string // Network passphrase for XDR parsing
-	MaintainUniqueIdx bool   // Maintain unique indexes during ingestion
-	MaintainBitmapIdx bool   // Maintain roaring bitmap indexes during ingestion
-	MaintainL2Idx     bool   // Maintain L2 hierarchical indexes during ingestion
+	Workers             int    // Number of parallel workers
+	BatchSize           int    // Ledgers to batch before writing
+	QueueSize           int    // Channel buffer size
+	DataDir             string // Ledger data directory
+	NetworkPassphrase   string // Network passphrase for XDR parsing
+	MaintainUniqueIdx   bool   // Maintain unique indexes during ingestion
+	MaintainBitmapIdx   bool   // Maintain roaring bitmap indexes during ingestion
+	MaintainL2Idx       bool   // Maintain L2 hierarchical indexes during ingestion
+	BitmapFlushInterval int    // Ledgers between bitmap index flushes (0 = only at end)
 }
 
 // PipelineStats tracks pipeline performance
@@ -276,9 +277,18 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 					return fmt.Errorf("failed to update last processed ledger: %w", err)
 				}
 
-				eventBatch = eventBatch[:0]
+				// Fresh allocation to release underlying array memory
+				eventBatch = make([]*store.IngestEvent, 0, p.config.BatchSize*100)
 				batchRawBytes = 0
 				batchStartSeq = nextSeq
+
+				// Periodic bitmap flush to prevent hot segment memory growth
+				if p.config.MaintainBitmapIdx && p.config.BitmapFlushInterval > 0 &&
+					ledgersProcessed%p.config.BitmapFlushInterval == 0 {
+					if err := p.store.FlushBitmapIndexes(); err != nil {
+						return fmt.Errorf("failed to flush bitmap indexes: %w", err)
+					}
+				}
 			}
 
 			// Progress callback

@@ -121,14 +121,15 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	fmt.Fprintf(os.Stderr, "Parallel mode: %d workers, batch size %d, queue size %d\n", workers, batchSize, queueSize)
 
 	pipelineConfig := ingest.PipelineConfig{
-		Workers:           workers,
-		BatchSize:         batchSize,
-		QueueSize:         queueSize,
-		DataDir:           cfg.Source.LedgerDir,
-		NetworkPassphrase: networkPassphrase,
-		MaintainUniqueIdx: cfg.Ingestion.UniqueIndexes,
-		MaintainBitmapIdx: cfg.Ingestion.BitmapIndexes,
-		MaintainL2Idx:     cfg.Ingestion.L2Indexes,
+		Workers:             workers,
+		BatchSize:           batchSize,
+		QueueSize:           queueSize,
+		DataDir:             cfg.Source.LedgerDir,
+		NetworkPassphrase:   networkPassphrase,
+		MaintainUniqueIdx:   cfg.Ingestion.UniqueIndexes,
+		MaintainBitmapIdx:   cfg.Ingestion.BitmapIndexes,
+		MaintainL2Idx:       cfg.Ingestion.L2Indexes,
+		BitmapFlushInterval: cfg.Ingestion.BitmapFlushInterval,
 	}
 
 	pipeline := ingest.NewPipeline(pipelineConfig, eventStore)
@@ -192,7 +193,7 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 
 	var summary strings.Builder
 	rawDataMB := float64(rawBytesTotal) / (1024 * 1024)
-	preCompactStats := eventStore.GetSnapshotStats()
+	preCompactStats := eventStore.GetDetailedSnapshotStats() // Use detailed stats for full level breakdown
 	sstSizeMB := float64(preCompactStats.SSTFilesSizeBytes) / (1024 * 1024)
 	memtableMB := float64(preCompactStats.MemtableSizeBytes) / (1024 * 1024)
 	storedSizeMB := sstSizeMB + memtableMB
@@ -268,7 +269,7 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		fmt.Fprintf(os.Stderr, "Compaction completed in %s\n", formatElapsed(compactionTime))
 
 		if compactionResult != nil {
-			rocksStats := eventStore.GetSnapshotStats()
+			rocksStats := eventStore.GetDetailedSnapshotStats() // Use detailed stats for full level breakdown
 			postTotalFiles := rocksStats.L0Files + rocksStats.L1Files + rocksStats.L2Files +
 				rocksStats.L3Files + rocksStats.L4Files + rocksStats.L5Files + rocksStats.L6Files
 			postSstSizeMB := float64(rocksStats.SSTFilesSizeBytes) / (1024 * 1024)

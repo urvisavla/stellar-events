@@ -5,8 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -826,15 +824,6 @@ func (es *EventStore) GetStorageStats() *StorageStats {
 	stats.SizeAllMemTables = es.db.GetProperty("rocksdb.size-all-mem-tables")
 	stats.CurSizeAllMemTables = es.db.GetProperty("rocksdb.cur-size-all-mem-tables")
 
-	// Fallback to filesystem scan - RocksDB properties are unreliable
-	diskSize := es.getSSTFileSizeFromDisk()
-	if diskSize > 0 {
-		diskSizeStr := fmt.Sprintf("%d", diskSize)
-		stats.TotalSstFilesSize = diskSizeStr
-		stats.LiveSstFilesSize = diskSizeStr
-		stats.EstimateLiveDataSize = diskSizeStr
-	}
-
 	// Note: rocksdb.estimate-num-keys is often inaccurate with column families
 	// The actual event count is shown separately via GetStats()
 
@@ -857,7 +846,8 @@ func (es *EventStore) GetStorageStats() *StorageStats {
 	return stats
 }
 
-// GetSnapshotStats returns numeric RocksDB stats for progress snapshots
+// GetSnapshotStats returns numeric RocksDB stats for progress snapshots (fast path)
+// Only collects L0 file count - use GetDetailedSnapshotStats() for all levels
 func (es *EventStore) GetSnapshotStats() *SnapshotStats {
 	stats := &SnapshotStats{}
 
@@ -875,21 +865,16 @@ func (es *EventStore) GetSnapshotStats() *SnapshotStats {
 		return n
 	}
 
-	// RocksDB properties are unreliable - always use filesystem scan for SST size
-	stats.SSTFilesSizeBytes = es.getSSTFileSizeFromDisk()
+	// Use RocksDB property for SST size - much faster than filesystem walk
+	// Note: This returns total SST files size across all column families
+	stats.SSTFilesSizeBytes = parseIntProp(es.db.GetProperty("rocksdb.total-sst-files-size"))
 	stats.MemtableSizeBytes = parseIntProp(es.db.GetProperty("rocksdb.cur-size-all-mem-tables"))
 	stats.EstimatedNumKeys = parseIntProp(es.db.GetProperty("rocksdb.estimate-num-keys"))
 	stats.PendingCompactBytes = parseIntProp(es.db.GetProperty("rocksdb.estimate-pending-compaction-bytes"))
 
-	// Level file counts - aggregate from all CFs
+	// Only collect L0 for fast path - this is what periodic snapshots need
 	for _, cf := range es.cfHandles {
 		stats.L0Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level0", cf))
-		stats.L1Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level1", cf))
-		stats.L2Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level2", cf))
-		stats.L3Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level3", cf))
-		stats.L4Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level4", cf))
-		stats.L5Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level5", cf))
-		stats.L6Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level6", cf))
 	}
 
 	stats.RunningCompactions = parseIntPropSmall(es.db.GetProperty("rocksdb.num-running-compactions"))
@@ -898,25 +883,29 @@ func (es *EventStore) GetSnapshotStats() *SnapshotStats {
 	return stats
 }
 
-// getSSTFileSizeFromDisk scans the database directory for SST files and returns total size
-func (es *EventStore) getSSTFileSizeFromDisk() int64 {
-	// Convert to absolute path for reliability
-	absPath, err := filepath.Abs(es.dbPath)
-	if err != nil {
-		absPath = es.dbPath
+// GetDetailedSnapshotStats returns full stats including all level file counts
+// Used for end-of-ingestion summary and compaction stats
+func (es *EventStore) GetDetailedSnapshotStats() *SnapshotStats {
+	stats := es.GetSnapshotStats() // Get basic stats first
+
+	// Parse int from string property
+	parseIntPropSmall := func(val string) int {
+		var n int
+		fmt.Sscanf(val, "%d", &n)
+		return n
 	}
 
-	var totalSize int64
-	filepath.Walk(absPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip errors
-		}
-		if !info.IsDir() && strings.HasSuffix(info.Name(), ".sst") {
-			totalSize += info.Size()
-		}
-		return nil
-	})
-	return totalSize
+	// Collect L1-L6 file counts (expensive - 24 property calls)
+	for _, cf := range es.cfHandles {
+		stats.L1Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level1", cf))
+		stats.L2Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level2", cf))
+		stats.L3Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level3", cf))
+		stats.L4Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level4", cf))
+		stats.L5Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level5", cf))
+		stats.L6Files += parseIntPropSmall(es.db.GetPropertyCF("rocksdb.num-files-at-level6", cf))
+	}
+
+	return stats
 }
 
 // Flush forces all memtables to be flushed to SST files
@@ -984,7 +973,7 @@ func (es *EventStore) GetStats() (*DBStats, error) {
 
 // CompactAll runs manual compaction on the entire database (all column families)
 func (es *EventStore) CompactAll() *CompactionResult {
-	beforeStats := es.GetSnapshotStats()
+	beforeStats := es.GetDetailedSnapshotStats()
 	beforeFiles := beforeStats.L0Files + beforeStats.L1Files + beforeStats.L2Files +
 		beforeStats.L3Files + beforeStats.L4Files + beforeStats.L5Files + beforeStats.L6Files
 
@@ -1008,7 +997,7 @@ func (es *EventStore) CompactAll() *CompactionResult {
 		es.db.CompactRangeCFOpt(cf, fullRange, compactOpts)
 	}
 
-	afterStats := es.GetSnapshotStats()
+	afterStats := es.GetDetailedSnapshotStats()
 	afterFiles := afterStats.L0Files + afterStats.L1Files + afterStats.L2Files +
 		afterStats.L3Files + afterStats.L4Files + afterStats.L5Files + afterStats.L6Files
 

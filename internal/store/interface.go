@@ -91,8 +91,11 @@ type Store interface {
 	// GetStorageStats returns storage-level statistics.
 	GetStorageStats() *StorageStats
 
-	// GetSnapshotStats returns numeric stats for progress snapshots.
+	// GetSnapshotStats returns numeric stats for progress snapshots (fast path, L0 only).
 	GetSnapshotStats() *SnapshotStats
+
+	// GetDetailedSnapshotStats returns full stats including all level file counts.
+	GetDetailedSnapshotStats() *SnapshotStats
 
 	// GetIndexStats returns per-index entry counts.
 	GetIndexStats() *IndexStats

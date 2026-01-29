@@ -88,7 +88,8 @@ type IngestionConfig struct {
 	L2Indexes     bool `toml:"l2_indexes"`     // Maintain L2 hierarchical indexes (default: false)
 
 	// Progress tracking
-	SnapshotInterval int `toml:"snapshot_interval"` // Ledgers between progress snapshots (default: 1000000)
+	SnapshotInterval    int `toml:"snapshot_interval"`     // Ledgers between progress snapshots (default: 1000000)
+	BitmapFlushInterval int `toml:"bitmap_flush_interval"` // Ledgers between bitmap index flushes (default: 10000)
 
 	// Parallelism
 	Workers   int `toml:"workers"`    // Parallel workers (0 = NumCPU)
@@ -150,16 +151,17 @@ func DefaultConfig() *Config {
 			MaxBytesForLevelBaseMB: 1024,
 		},
 		Ingestion: IngestionConfig{
-			ProgressFile:     "",
-			FinalCompaction:  true,
-			ComputeStats:     false,
-			BitmapIndexes:    true,
-			UniqueIndexes:    false,
-			L2Indexes:        false,
-			SnapshotInterval: 1000000,
-			Workers:          0, // 0 = NumCPU
-			BatchSize:        100,
-			QueueSize:        0, // 0 = workers * 2
+			ProgressFile:        "",
+			FinalCompaction:     true,
+			ComputeStats:        false,
+			BitmapIndexes:       true,
+			UniqueIndexes:       false,
+			L2Indexes:           false,
+			SnapshotInterval:    1000000,
+			BitmapFlushInterval: 10000, // Flush hot segments every 10K ledgers
+			Workers:             0,     // 0 = NumCPU
+			BatchSize:           100,
+			QueueSize:           0, // 0 = workers * 2
 		},
 		Query: QueryConfig{
 			MaxLedgerRange: 100000,

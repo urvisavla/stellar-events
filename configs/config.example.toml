@@ -92,6 +92,10 @@ l2_indexes = false
 # Ledgers between progress snapshots
 snapshot_interval = 1000
 
+# Ledgers between bitmap index flushes (prevents memory growth)
+# Set to 0 to only flush at end of ingestion
+bitmap_flush_interval = 10000
+
 # --- Parallelism ---
 # Number of parallel workers (0 = all CPUs)
 workers = 0
