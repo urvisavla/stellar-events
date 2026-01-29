@@ -1727,6 +1727,10 @@ func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *
 		counts = make(map[string]uint64)
 	}
 
+	// Track ledgers for periodic bitmap flush
+	var lastFlushLedger uint32 = startLedger
+	var prevLedger uint32 = 0
+
 	for it.Seek(startKey); it.Valid(); it.Next() {
 		key := it.Key().Data()
 		if len(key) < 10 {
@@ -1738,6 +1742,17 @@ func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *
 		if ledger > endLedger {
 			break
 		}
+
+		// Periodic bitmap flush when crossing ledger boundaries
+		if opts.BitmapFlushInterval > 0 && ledger != prevLedger && prevLedger > 0 {
+			if (ledger - lastFlushLedger) >= uint32(opts.BitmapFlushInterval) {
+				if es.bitmapIndex != nil {
+					_ = es.bitmapIndex.FlushHotSegments()
+				}
+				lastFlushLedger = ledger
+			}
+		}
+		prevLedger = ledger
 
 		txIdx := binary.BigEndian.Uint16(key[4:6])
 		opIdx := binary.BigEndian.Uint16(key[6:8])

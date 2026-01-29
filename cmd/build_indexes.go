@@ -65,7 +65,7 @@ func cmdBuildIndexes(cfg *config.Config, buildL2, buildUnique bool) {
 	if buildUnique {
 		fmt.Fprintf(os.Stderr, "  - Unique indexes (counts)\n")
 	}
-	fmt.Fprintf(os.Stderr, "Using %d workers\n\n", workers)
+	fmt.Fprintf(os.Stderr, "Using %d workers, flush interval %d ledgers\n\n", workers, cfg.Ingestion.BitmapFlushInterval)
 
 	// Open event store
 	eventStore, err := openEventStore(cfg)
@@ -108,9 +108,10 @@ func cmdBuildIndexes(cfg *config.Config, buildL2, buildUnique bool) {
 
 	// Build indexes with specified options
 	opts := &store.BuildIndexOptions{
-		BitmapIndexes: true, // Always build L1 bitmap
-		L2Indexes:     buildL2,
-		UniqueIndexes: buildUnique,
+		BitmapIndexes:       true, // Always build L1 bitmap
+		L2Indexes:           buildL2,
+		UniqueIndexes:       buildUnique,
+		BitmapFlushInterval: cfg.Ingestion.BitmapFlushInterval,
 	}
 
 	if err := eventStore.BuildIndexes(workers, opts, progressFn); err != nil {

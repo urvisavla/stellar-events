@@ -260,9 +260,10 @@ type IndexConfig struct {
 
 // BuildIndexOptions controls which indexes to build during rebuild.
 type BuildIndexOptions struct {
-	UniqueIndexes bool // Build unique value counts (for stats)
-	BitmapIndexes bool // Build L1 bitmap indexes (ledger-level)
-	L2Indexes     bool // Build L2 bitmap indexes (event-level)
+	UniqueIndexes       bool // Build unique value counts (for stats)
+	BitmapIndexes       bool // Build L1 bitmap indexes (ledger-level)
+	L2Indexes           bool // Build L2 bitmap indexes (event-level)
+	BitmapFlushInterval int  // Ledgers between bitmap flushes (0 = only at end)
 }
 
 // DefaultIndexConfig returns config with all indexes enabled.
