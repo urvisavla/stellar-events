@@ -101,6 +101,56 @@ func (s *RocksDBStore) loadBitmap(key []byte) (*roaring.Bitmap, error) {
 	return bitmap, nil
 }
 
+// loadBitmapsMulti loads multiple bitmaps from RocksDB using MultiGet.
+// Returns a slice of bitmaps in the same order as keys (nil for missing keys).
+func (s *RocksDBStore) loadBitmapsMulti(keys [][]byte) ([]*roaring.Bitmap, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	// Use MultiGetCF for batch read
+	values, err := s.db.MultiGetCF(s.ro, s.cf, keys...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to multi-get bitmaps: %w", err)
+	}
+
+	bitmaps := make([]*roaring.Bitmap, len(keys))
+	for i, data := range values {
+		if data.Size() == 0 {
+			data.Free()
+			continue // nil bitmap for missing key
+		}
+
+		bitmap := roaring.New()
+		if err := bitmap.UnmarshalBinary(data.Data()); err != nil {
+			data.Free()
+			// Continue with nil for this bitmap rather than failing entirely
+			continue
+		}
+		bitmaps[i] = bitmap
+		data.Free()
+	}
+
+	return bitmaps, nil
+}
+
+// LoadL2SegmentsMulti loads multiple L2 bitmap segments from RocksDB using MultiGet.
+// prefixes and keyValues must have the same length. All lookups use the same ledgerSeq.
+// Returns bitmaps in the same order as the input slices (nil for missing keys).
+func (s *RocksDBStore) LoadL2SegmentsMulti(prefixes []byte, keyValues [][]byte, ledgerSeq uint32) ([]*roaring.Bitmap, error) {
+	if len(prefixes) == 0 || len(prefixes) != len(keyValues) {
+		return nil, nil
+	}
+
+	// Build all keys
+	keys := make([][]byte, len(prefixes))
+	for i := range prefixes {
+		keys[i] = MakeL2Key(prefixes[i], keyValues[i], ledgerSeq)
+	}
+
+	return s.loadBitmapsMulti(keys)
+}
+
 // =============================================================================
 // Store Interface Implementation - Write Operations
 // =============================================================================
@@ -162,16 +212,12 @@ func (s *RocksDBStore) QueryLedgers(contractID []byte, topics [][]byte, startLed
 		return roaring.New(), nil
 	}
 
-	// Intersect all bitmaps (AND logic)
-	result := bitmaps[0].Clone()
-	for i := 1; i < len(bitmaps); i++ {
-		result.And(bitmaps[i])
-	}
-
-	return result, nil
+	// Use FastAnd for efficient intersection (avoids Clone + multiple And calls)
+	return roaring.FastAnd(bitmaps...), nil
 }
 
 // QueryEvents returns precise event keys matching the filter criteria.
+// Uses batched MultiGet for L2 lookups and FastAnd for efficient intersection.
 func (s *RocksDBStore) QueryEvents(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int) ([]EventKey, int, error) {
 	// First, get matching ledgers using L1 index
 	ledgerBitmap, err := s.QueryLedgers(contractID, topics, startLedger, endLedger)
@@ -184,6 +230,32 @@ func (s *RocksDBStore) QueryEvents(contractID []byte, topics [][]byte, startLedg
 		return nil, matchingLedgers, nil
 	}
 
+	// Build the list of L2 prefixes and key values to query per ledger
+	// This is constant for all ledgers, so we build it once
+	var l2Prefixes []byte
+	var l2KeyValues [][]byte
+
+	if len(contractID) > 0 {
+		l2Prefixes = append(l2Prefixes, PrefixContractL2)
+		l2KeyValues = append(l2KeyValues, contractID)
+	}
+
+	for i, topic := range topics {
+		if len(topic) == 0 {
+			continue
+		}
+		prefix := TopicL2Prefix(i)
+		if prefix == 0 {
+			continue
+		}
+		l2Prefixes = append(l2Prefixes, prefix)
+		l2KeyValues = append(l2KeyValues, topic)
+	}
+
+	if len(l2Prefixes) == 0 {
+		return nil, matchingLedgers, nil
+	}
+
 	// Then query L2 indexes for each matching ledger
 	var eventKeys []EventKey
 	ledgers := ledgerBitmap.ToArray()
@@ -193,45 +265,30 @@ func (s *RocksDBStore) QueryEvents(contractID []byte, topics [][]byte, startLedg
 			break
 		}
 
-		// Get L2 bitmap for this ledger
-		// We need to intersect L2 results from all filters
-		var l2Bitmaps []*roaring.Bitmap
+		// Batch load all L2 bitmaps for this ledger using MultiGet
+		l2Bitmaps, err := s.LoadL2SegmentsMulti(l2Prefixes, l2KeyValues, ledgerSeq)
+		if err != nil {
+			return nil, matchingLedgers, err
+		}
 
-		if len(contractID) > 0 {
-			bm, err := s.bitmap.QueryL2Index(PrefixContractL2, contractID, ledgerSeq)
-			if err != nil {
-				return nil, matchingLedgers, err
-			}
+		// Filter out nil bitmaps
+		var validBitmaps []*roaring.Bitmap
+		for _, bm := range l2Bitmaps {
 			if bm != nil {
-				l2Bitmaps = append(l2Bitmaps, bm)
+				validBitmaps = append(validBitmaps, bm)
 			}
 		}
 
-		for i, topic := range topics {
-			if len(topic) == 0 {
-				continue
-			}
-			prefix := TopicL2Prefix(i)
-			if prefix == 0 {
-				continue
-			}
-			bm, err := s.bitmap.QueryL2Index(prefix, topic, ledgerSeq)
-			if err != nil {
-				return nil, matchingLedgers, err
-			}
-			if bm != nil {
-				l2Bitmaps = append(l2Bitmaps, bm)
-			}
-		}
-
-		if len(l2Bitmaps) == 0 {
+		if len(validBitmaps) == 0 {
 			continue
 		}
 
-		// Intersect L2 bitmaps
-		l2Result := l2Bitmaps[0].Clone()
-		for i := 1; i < len(l2Bitmaps); i++ {
-			l2Result.And(l2Bitmaps[i])
+		// Use FastAnd for efficient intersection
+		var l2Result *roaring.Bitmap
+		if len(validBitmaps) == 1 {
+			l2Result = validBitmaps[0]
+		} else {
+			l2Result = roaring.FastAnd(validBitmaps...)
 		}
 
 		if l2Result.IsEmpty() {
