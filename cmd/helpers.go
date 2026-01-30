@@ -17,7 +17,7 @@ import (
 // =============================================================================
 
 // openEventStore opens the event store with config options
-func openEventStore(cfg *config.Config) (store.Store, error) {
+func openEventStore(cfg *config.Config) (*store.RocksDBEventStore, error) {
 	return store.NewEventStoreWithOptions(
 		cfg.Storage.DBPath,
 		configToRocksDBOptions(&cfg.Storage),

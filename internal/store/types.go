@@ -266,6 +266,16 @@ type BuildIndexOptions struct {
 	BitmapFlushInterval int  // Ledgers between bitmap flushes (0 = only at end)
 }
 
+// indexEntry holds extracted data for index updates (used by collector pattern)
+type indexEntry struct {
+	Ledger     uint32
+	TxIdx      uint16
+	OpIdx      uint16
+	EventIdx   uint16
+	ContractID []byte   // nil if no contract
+	Topics     [][]byte // up to 4 topics
+}
+
 // DefaultIndexConfig returns config with all indexes enabled.
 func DefaultIndexConfig() *IndexConfig {
 	return &IndexConfig{

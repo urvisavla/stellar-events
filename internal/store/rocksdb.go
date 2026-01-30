@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/RoaringBitmap/roaring"
@@ -17,6 +16,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/urvisavla/stellar-events/internal/index"
+	"github.com/urvisavla/stellar-events/internal/query"
 )
 
 // Column family names
@@ -167,8 +167,8 @@ func parseRawXDRToEvent(rawXDR []byte, ledger uint32, tx, op, eventIdx uint16) (
 	return event, nil
 }
 
-// EventStore manages storing events in RocksDB
-type EventStore struct {
+// RocksDBEventStore manages storing events in RocksDB
+type RocksDBEventStore struct {
 	db      *grocksdb.DB
 	dbPath  string // Store path for filesystem-based stats
 	wo      *grocksdb.WriteOptions
@@ -182,8 +182,8 @@ type EventStore struct {
 	cfUnique  *grocksdb.ColumnFamilyHandle // Unique value indexes with counts
 	cfBitmap  *grocksdb.ColumnFamilyHandle // Roaring bitmap indexes
 
-	// Bitmap index manager
-	bitmapIndex *index.BitmapIndex
+	// Index store (manages bitmap indexes with RocksDB persistence)
+	indexStore *index.RocksDBStore
 
 	// Options that need to be destroyed on Close
 	baseOpts *grocksdb.Options
@@ -195,12 +195,12 @@ type EventStore struct {
 }
 
 // NewEventStore creates a new event store with RocksDB backend
-func NewEventStore(dbPath string) (*EventStore, error) {
+func NewEventStore(dbPath string) (*RocksDBEventStore, error) {
 	return NewEventStoreWithOptions(dbPath, nil, nil)
 }
 
 // NewEventStoreWithOptions creates a new event store with custom options
-func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpts *IndexConfig) (*EventStore, error) {
+func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpts *IndexConfig) (*RocksDBEventStore, error) {
 	// Create base options
 	baseOpts := grocksdb.NewDefaultOptions()
 	baseOpts.SetCreateIfMissing(true)
@@ -272,8 +272,8 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 		indexes = DefaultIndexConfig()
 	}
 
-	// Create bitmap index manager
-	bitmapIdx, err := index.NewBitmapIndex(db, cfHandles[3])
+	// Create index store (RocksDB-backed bitmap indexes)
+	indexStore, err := index.NewRocksDBStore(db, cfHandles[3])
 	if err != nil {
 		db.Close()
 		for _, opt := range cfOpts {
@@ -284,25 +284,25 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 		}
 		baseOpts.Destroy()
 		wo.Destroy()
-		return nil, fmt.Errorf("failed to create bitmap index: %w", err)
+		return nil, fmt.Errorf("failed to create index store: %w", err)
 	}
 
-	return &EventStore{
-		db:          db,
-		dbPath:      dbPath,
-		wo:          wo,
-		ro:          grocksdb.NewDefaultReadOptions(),
-		indexes:     indexes,
-		cfHandles:   cfHandles,
-		cfDefault:   cfHandles[0],
-		cfEvents:    cfHandles[1],
-		cfUnique:    cfHandles[2],
-		cfBitmap:    cfHandles[3],
-		bitmapIndex: bitmapIdx,
-		baseOpts:    baseOpts,
-		cfOpts:      cfOpts,
-		bbtoList:    bbtoList,
-		mergeOp:     mergeOp,
+	return &RocksDBEventStore{
+		db:         db,
+		dbPath:     dbPath,
+		wo:         wo,
+		ro:         grocksdb.NewDefaultReadOptions(),
+		indexes:    indexes,
+		cfHandles:  cfHandles,
+		cfDefault:  cfHandles[0],
+		cfEvents:   cfHandles[1],
+		cfUnique:   cfHandles[2],
+		cfBitmap:   cfHandles[3],
+		indexStore: indexStore,
+		baseOpts:   baseOpts,
+		cfOpts:     cfOpts,
+		bbtoList:   bbtoList,
+		mergeOp:    mergeOp,
 	}, nil
 }
 
@@ -366,10 +366,10 @@ func parseCompression(compression string) grocksdb.CompressionType {
 }
 
 // Close closes the event store
-func (es *EventStore) Close() {
-	// Close bitmap index (flushes any remaining hot segments)
-	if es.bitmapIndex != nil {
-		es.bitmapIndex.Close()
+func (es *RocksDBEventStore) Close() {
+	// Close index store (flushes any remaining hot segments)
+	if es.indexStore != nil {
+		es.indexStore.Close()
 	}
 
 	// Destroy read/write options first
@@ -389,7 +389,7 @@ func (es *EventStore) Close() {
 
 // StoreEvents stores events with optional index updates based on options.
 // Returns the number of bytes written.
-func (es *EventStore) StoreEvents(events []*IngestEvent, opts *StoreOptions) (int64, error) {
+func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptions) (int64, error) {
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
 
@@ -410,10 +410,11 @@ func (es *EventStore) StoreEvents(events []*IngestEvent, opts *StoreOptions) (in
 		totalBytes += int64(len(event.RawXDR))
 
 		// Update bitmap indexes (fast, in-memory operation)
-		if opts.BitmapIndexes && es.bitmapIndex != nil {
+		if opts.BitmapIndexes && es.indexStore != nil {
+			bitmapIdx := es.indexStore.GetBitmapIndex()
 			// L1: Index contract ID -> ledger
 			if len(event.ContractID) > 0 {
-				es.bitmapIndex.AddContractIndex(event.ContractID, event.LedgerSequence)
+				bitmapIdx.AddContractIndex(event.ContractID, event.LedgerSequence)
 			}
 
 			// L1: Index topics -> ledger
@@ -421,13 +422,13 @@ func (es *EventStore) StoreEvents(events []*IngestEvent, opts *StoreOptions) (in
 				if i > 3 {
 					break // Only index first 4 topics
 				}
-				es.bitmapIndex.AddTopicIndex(i, topicBytes, event.LedgerSequence)
+				bitmapIdx.AddTopicIndex(i, topicBytes, event.LedgerSequence)
 			}
 
 			// L2: Index contract ID -> (ledger, event) for hierarchical queries
 			if opts.L2Indexes {
 				if len(event.ContractID) > 0 {
-					es.bitmapIndex.AddContractL2Index(
+					bitmapIdx.AddContractL2Index(
 						event.ContractID,
 						event.LedgerSequence,
 						event.TransactionIndex,
@@ -441,7 +442,7 @@ func (es *EventStore) StoreEvents(events []*IngestEvent, opts *StoreOptions) (in
 					if i > 3 {
 						break
 					}
-					es.bitmapIndex.AddTopicL2Index(
+					bitmapIdx.AddTopicL2Index(
 						i,
 						topicBytes,
 						event.LedgerSequence,
@@ -503,19 +504,19 @@ func (es *EventStore) StoreEvents(events []*IngestEvent, opts *StoreOptions) (in
 }
 
 // FlushBitmapIndexes flushes all hot bitmap segments to disk
-func (es *EventStore) FlushBitmapIndexes() error {
-	if es.bitmapIndex == nil {
+func (es *RocksDBEventStore) FlushBitmapIndexes() error {
+	if es.indexStore == nil {
 		return nil
 	}
-	return es.bitmapIndex.FlushHotSegments()
+	return es.indexStore.Flush()
 }
 
 // GetBitmapStats returns bitmap index statistics
-func (es *EventStore) GetBitmapStats() *BitmapStats {
-	if es.bitmapIndex == nil {
+func (es *RocksDBEventStore) GetBitmapStats() *BitmapStats {
+	if es.indexStore == nil {
 		return nil
 	}
-	internalStats := es.bitmapIndex.GetStats()
+	internalStats := es.indexStore.GetStats()
 	if internalStats == nil {
 		return nil
 	}
@@ -533,7 +534,7 @@ func (es *EventStore) GetBitmapStats() *BitmapStats {
 }
 
 // SetLastProcessedLedger stores the last processed ledger sequence
-func (es *EventStore) SetLastProcessedLedger(sequence uint32) error {
+func (es *RocksDBEventStore) SetLastProcessedLedger(sequence uint32) error {
 	key := []byte("last_processed_ledger")
 	value := make([]byte, 4)
 	binary.BigEndian.PutUint32(value, sequence)
@@ -541,7 +542,7 @@ func (es *EventStore) SetLastProcessedLedger(sequence uint32) error {
 }
 
 // GetLastProcessedLedger retrieves the last processed ledger sequence
-func (es *EventStore) GetLastProcessedLedger() (uint32, error) {
+func (es *RocksDBEventStore) GetLastProcessedLedger() (uint32, error) {
 	key := []byte("last_processed_ledger")
 	value, err := es.db.GetCF(es.ro, es.cfDefault, key)
 	if err != nil {
@@ -561,7 +562,7 @@ func (es *EventStore) GetLastProcessedLedger() (uint32, error) {
 // =============================================================================
 
 // GetEventsByLedgerRange retrieves all events within a ledger range
-func (es *EventStore) GetEventsByLedgerRange(startLedger, endLedger uint32) ([]*ContractEvent, error) {
+func (es *RocksDBEventStore) GetEventsByLedgerRange(startLedger, endLedger uint32) ([]*ContractEvent, error) {
 	var events []*ContractEvent
 
 	startKey := eventKeyFromParts(startLedger, 0, 0, 0)
@@ -599,7 +600,7 @@ func (es *EventStore) GetEventsByLedgerRange(startLedger, endLedger uint32) ([]*
 }
 
 // GetEventsByLedger retrieves all events for a specific ledger
-func (es *EventStore) GetEventsByLedger(ledgerSequence uint32) ([]*ContractEvent, error) {
+func (es *RocksDBEventStore) GetEventsByLedger(ledgerSequence uint32) ([]*ContractEvent, error) {
 	return es.GetEventsByLedgerRange(ledgerSequence, ledgerSequence)
 }
 
@@ -608,7 +609,7 @@ func (es *EventStore) GetEventsByLedger(ledgerSequence uint32) ([]*ContractEvent
 // =============================================================================
 
 // GetEventsByContractID retrieves events for a specific contract (scans all events)
-func (es *EventStore) GetEventsByContractID(contractID []byte, limit int) ([]*ContractEvent, error) {
+func (es *RocksDBEventStore) GetEventsByContractID(contractID []byte, limit int) ([]*ContractEvent, error) {
 	var events []*ContractEvent
 
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
@@ -648,7 +649,7 @@ func (es *EventStore) GetEventsByContractID(contractID []byte, limit int) ([]*Co
 }
 
 // GetEventsByContractIDInRange retrieves events for a contract within a ledger range
-func (es *EventStore) GetEventsByContractIDInRange(contractID []byte, startLedger, endLedger uint32) ([]*ContractEvent, error) {
+func (es *RocksDBEventStore) GetEventsByContractIDInRange(contractID []byte, startLedger, endLedger uint32) ([]*ContractEvent, error) {
 	var events []*ContractEvent
 
 	startKey := eventKeyFromParts(startLedger, 0, 0, 0)
@@ -692,7 +693,7 @@ func (es *EventStore) GetEventsByContractIDInRange(contractID []byte, startLedge
 // =============================================================================
 
 // GetEventsByTopic retrieves events with a specific topic value at the given position
-func (es *EventStore) GetEventsByTopic(position int, topicValue []byte, limit int) ([]*ContractEvent, error) {
+func (es *RocksDBEventStore) GetEventsByTopic(position int, topicValue []byte, limit int) ([]*ContractEvent, error) {
 	if position < 0 || position > 3 {
 		return nil, fmt.Errorf("topic position must be 0-3, got %d", position)
 	}
@@ -741,7 +742,7 @@ func (es *EventStore) GetEventsByTopic(position int, topicValue []byte, limit in
 }
 
 // GetEventsByTopicInRange retrieves events with a specific topic within a ledger range
-func (es *EventStore) GetEventsByTopicInRange(position int, topicValue []byte, startLedger, endLedger uint32) ([]*ContractEvent, error) {
+func (es *RocksDBEventStore) GetEventsByTopicInRange(position int, topicValue []byte, startLedger, endLedger uint32) ([]*ContractEvent, error) {
 	if position < 0 || position > 3 {
 		return nil, fmt.Errorf("topic position must be 0-3, got %d", position)
 	}
@@ -796,7 +797,7 @@ func (es *EventStore) GetEventsByTopicInRange(position int, topicValue []byte, s
 // =============================================================================
 
 // CountEvents returns the total number of events in the store
-func (es *EventStore) CountEvents() (int64, error) {
+func (es *RocksDBEventStore) CountEvents() (int64, error) {
 	var count int64
 
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
@@ -814,7 +815,7 @@ func (es *EventStore) CountEvents() (int64, error) {
 }
 
 // GetStorageSnapshot returns per-column-family storage statistics.
-func (es *EventStore) GetStorageSnapshot() (*StorageSnapshot, error) {
+func (es *RocksDBEventStore) GetStorageSnapshot() (*StorageSnapshot, error) {
 	snapshot := &StorageSnapshot{
 		Timestamp:      time.Now(),
 		ColumnFamilies: make(map[string]*ColumnFamilyStats),
@@ -861,7 +862,7 @@ func (es *EventStore) GetStorageSnapshot() (*StorageSnapshot, error) {
 
 // Flush forces all memtables to be flushed to SST files
 // This should be called before getting accurate storage stats
-func (es *EventStore) Flush() error {
+func (es *RocksDBEventStore) Flush() error {
 	flushOpts := grocksdb.NewDefaultFlushOptions()
 	defer flushOpts.Destroy()
 	flushOpts.SetWait(true)
@@ -876,7 +877,7 @@ func (es *EventStore) Flush() error {
 }
 
 // GetStats returns statistics about the event database (O(1) - no full scan)
-func (es *EventStore) GetStats() (*DBStats, error) {
+func (es *RocksDBEventStore) GetStats() (*DBStats, error) {
 	stats := &DBStats{}
 
 	// Get min/max ledger using seek (O(1))
@@ -923,7 +924,7 @@ func (es *EventStore) GetStats() (*DBStats, error) {
 }
 
 // CompactAllWithStats runs manual compaction and returns before/after stats per column family.
-func (es *EventStore) CompactAllWithStats() (*CompactionSummary, error) {
+func (es *RocksDBEventStore) CompactAllWithStats() (*CompactionSummary, error) {
 	before, err := es.GetStorageSnapshot()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pre-compaction stats: %w", err)
@@ -993,7 +994,7 @@ func (es *EventStore) CompactAllWithStats() (*CompactionSummary, error) {
 }
 
 // CountUniqueIndexes counts entries in unique indexes and sums their event counts (parallel)
-func (es *EventStore) CountUniqueIndexes() (*UniqueIndexCounts, error) {
+func (es *RocksDBEventStore) CountUniqueIndexes() (*UniqueIndexCounts, error) {
 	// Use 16 partitions per index type (total 80 goroutines for 5 index types)
 	const partitions = 16
 
@@ -1053,7 +1054,7 @@ func (es *EventStore) CountUniqueIndexes() (*UniqueIndexCounts, error) {
 
 // countIndexTypePartition counts entries for a partition of an index type
 // Partitions are based on the first byte of the value (after the type prefix)
-func (es *EventStore) countIndexTypePartition(indexType byte, partition, totalPartitions int) (uniqueCount, totalEvents int64, err error) {
+func (es *RocksDBEventStore) countIndexTypePartition(indexType byte, partition, totalPartitions int) (uniqueCount, totalEvents int64, err error) {
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 
@@ -1155,7 +1156,7 @@ func (h *topNHeap) getSorted() []TopEntry {
 
 // GetIndexDistribution computes percentile statistics for each index type in parallel
 // topN specifies how many top entries to include (0 for none)
-func (es *EventStore) GetIndexDistribution(topN int) (*IndexDistribution, error) {
+func (es *RocksDBEventStore) GetIndexDistribution(topN int) (*IndexDistribution, error) {
 	// Scan each type prefix in parallel
 	type result struct {
 		indexType byte
@@ -1206,7 +1207,7 @@ func (es *EventStore) GetIndexDistribution(topN int) (*IndexDistribution, error)
 }
 
 // computeDistributionForType computes distribution for a single index type using parallel partitions
-func (es *EventStore) computeDistributionForType(indexType byte, topN int) (*DistributionStats, error) {
+func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN int) (*DistributionStats, error) {
 	const partitions = 16
 
 	type partitionResult struct {
@@ -1281,7 +1282,7 @@ func (es *EventStore) computeDistributionForType(indexType byte, topN int) (*Dis
 }
 
 // scanDistributionPartition scans a partition and returns counts for distribution
-func (es *EventStore) scanDistributionPartition(indexType byte, partition, totalPartitions, topN int) ([]int64, int64, []TopEntry, error) {
+func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition, totalPartitions, topN int) ([]int64, int64, []TopEntry, error) {
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 
@@ -1345,7 +1346,7 @@ func percentile(sorted []int64, p float64) int64 {
 }
 
 // getLedgerRange finds the min and max ledger sequences in the database
-func (es *EventStore) getLedgerRange() (uint32, uint32, error) {
+func (es *RocksDBEventStore) getLedgerRange() (uint32, uint32, error) {
 	var minLedger, maxLedger uint32
 
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
@@ -1372,9 +1373,142 @@ func (es *EventStore) getLedgerRange() (uint32, uint32, error) {
 	return minLedger, maxLedger, it.Err()
 }
 
+// GetLedgerRange returns the min and max ledger sequences in the store.
+// Implements the EventReader interface.
+func (es *RocksDBEventStore) GetLedgerRange() (min, max uint32, err error) {
+	return es.getLedgerRange()
+}
+
+// GetEventsInLedger retrieves all events in a specific ledger as query.Event format.
+// Implements the EventReader interface.
+func (es *RocksDBEventStore) GetEventsInLedger(ledger uint32) ([]*query.Event, error) {
+	var events []*query.Event
+
+	startKey := eventKeyFromParts(ledger, 0, 0, 0)
+	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
+	defer it.Close()
+
+	for it.Seek(startKey); it.Valid(); it.Next() {
+		key := it.Key().Data()
+		if len(key) < 10 {
+			break
+		}
+
+		keyLedger := binary.BigEndian.Uint32(key[0:4])
+		if keyLedger != ledger {
+			break
+		}
+
+		_, tx, op, eventIdx := parseEventKey(key)
+		event, err := parseRawXDRToQueryEvent(it.Value().Data(), ledger, tx, op, eventIdx)
+		if err != nil {
+			continue
+		}
+		events = append(events, event)
+	}
+
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("iterator error: %w", err)
+	}
+
+	return events, nil
+}
+
+// GetEventsByKeys retrieves events by their precise keys using batch fetch.
+// Implements the EventReader interface.
+func (es *RocksDBEventStore) GetEventsByKeys(keys []index.EventKey) ([]*query.Event, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	// Build RocksDB keys from EventKey structs
+	// EventKey.EventIndex is encoded as [tx:10bits][op:10bits][event:12bits]
+	rocksKeys := make([][]byte, len(keys))
+	for i, ek := range keys {
+		txIdx, opIdx, evtIdx := index.DecodeEventIndex(ek.EventIndex)
+		rocksKeys[i] = eventKeyFromParts(ek.LedgerSeq, txIdx, opIdx, evtIdx)
+	}
+
+	// Use MultiGet for efficient batch fetching
+	values, err := es.db.MultiGetCF(es.ro, es.cfEvents, rocksKeys...)
+	if err != nil {
+		return nil, fmt.Errorf("MultiGet failed: %w", err)
+	}
+
+	events := make([]*query.Event, 0, len(values))
+	for i, value := range values {
+		if value.Size() == 0 {
+			value.Free()
+			continue
+		}
+
+		key := rocksKeys[i]
+		ledger := binary.BigEndian.Uint32(key[0:4])
+		txIdx := binary.BigEndian.Uint16(key[4:6])
+		opIdx := binary.BigEndian.Uint16(key[6:8])
+		evtIdx := binary.BigEndian.Uint16(key[8:10])
+
+		event, err := parseRawXDRToQueryEvent(value.Data(), ledger, txIdx, opIdx, evtIdx)
+		value.Free()
+		if err != nil {
+			continue
+		}
+		events = append(events, event)
+	}
+
+	return events, nil
+}
+
+// parseRawXDRToQueryEvent converts raw XDR bytes to a query.Event
+func parseRawXDRToQueryEvent(rawXDR []byte, ledger uint32, tx, op, eventIdx uint16) (*query.Event, error) {
+	var xdrEvent xdr.ContractEvent
+	if err := xdrEvent.UnmarshalBinary(rawXDR); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal XDR event: %w", err)
+	}
+
+	event := &query.Event{
+		LedgerSequence:   ledger,
+		TransactionIndex: int(tx),
+		OperationIndex:   int(op),
+		EventIndex:       int(eventIdx),
+	}
+
+	// Extract contract ID if present
+	if xdrEvent.ContractId != nil {
+		event.ContractID = base64.StdEncoding.EncodeToString(xdrEvent.ContractId[:])
+	}
+
+	// Event type
+	switch xdrEvent.Type {
+	case xdr.ContractEventTypeContract:
+		event.Type = "contract"
+	case xdr.ContractEventTypeSystem:
+		event.Type = "system"
+	case xdr.ContractEventTypeDiagnostic:
+		event.Type = "diagnostic"
+	}
+
+	// Extract topics and data from event body
+	if xdrEvent.Body.V == 0 {
+		body := xdrEvent.Body.MustV0()
+
+		// Topics
+		for _, topic := range body.Topics {
+			topicBytes, _ := topic.MarshalBinary()
+			event.Topics = append(event.Topics, base64.StdEncoding.EncodeToString(topicBytes))
+		}
+
+		// Data
+		dataBytes, _ := body.Data.MarshalBinary()
+		event.Data = base64.StdEncoding.EncodeToString(dataBytes)
+	}
+
+	return event, nil
+}
+
 // ComputeEventStats scans all events and computes unique counts.
 // Workers controls parallelism: 0 uses NumCPU, 1 for single-threaded, >1 for parallel.
-func (es *EventStore) ComputeEventStats(workers int) (*EventStats, error) {
+func (es *RocksDBEventStore) ComputeEventStats(workers int) (*EventStats, error) {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
@@ -1478,7 +1612,7 @@ func (es *EventStore) ComputeEventStats(workers int) (*EventStats, error) {
 }
 
 // computeEventStatsSingleThread is the single-threaded implementation
-func (es *EventStore) computeEventStatsSingleThread() (*EventStats, error) {
+func (es *RocksDBEventStore) computeEventStatsSingleThread() (*EventStats, error) {
 	stats := &EventStats{}
 
 	contracts := make(map[string]struct{})
@@ -1545,7 +1679,7 @@ func (es *EventStore) computeEventStatsSingleThread() (*EventStats, error) {
 }
 
 // computeStatsForRange computes stats for a specific ledger range
-func (es *EventStore) computeStatsForRange(startLedger, endLedger uint32) struct {
+func (es *RocksDBEventStore) computeStatsForRange(startLedger, endLedger uint32) struct {
 	stats     *EventStats
 	contracts map[string]struct{}
 	topic0s   map[string]struct{}
@@ -1635,7 +1769,8 @@ func (es *EventStore) computeStatsForRange(startLedger, endLedger uint32) struct
 
 // BuildIndexes scans all events and builds indexes based on options (one-time operation)
 // L1 bitmap indexes are always built. L2 and unique indexes are optional.
-func (es *EventStore) BuildIndexes(workers int, opts *BuildIndexOptions, progressFn func(processed int64)) error {
+// Uses a collector pattern: workers read/extract in parallel, single goroutine updates bitmaps.
+func (es *RocksDBEventStore) BuildIndexes(workers int, opts *BuildIndexOptions, progressFn func(processed int64)) error {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
@@ -1647,9 +1782,9 @@ func (es *EventStore) BuildIndexes(workers int, opts *BuildIndexOptions, progres
 		}
 	}
 
-	// Ensure bitmap index is initialized if we're building bitmap indexes
-	if (opts.BitmapIndexes || opts.L2Indexes) && es.bitmapIndex == nil {
-		return fmt.Errorf("bitmap index not initialized - cannot build bitmap indexes")
+	// Ensure index store is initialized if we're building bitmap indexes
+	if (opts.BitmapIndexes || opts.L2Indexes) && es.indexStore == nil {
+		return fmt.Errorf("index store not initialized - cannot build bitmap indexes")
 	}
 
 	minLedger, maxLedger, err := es.getLedgerRange()
@@ -1668,9 +1803,22 @@ func (es *EventStore) BuildIndexes(workers int, opts *BuildIndexOptions, progres
 		workers = int(totalLedgers)
 	}
 
+	// Create channel for index entries (collector pattern for bitmap indexes)
+	var entryCh chan *indexEntry
+	var collectorDone chan error
+
+	if opts.BitmapIndexes || opts.L2Indexes {
+		entryCh = make(chan *indexEntry, 100000) // buffered channel
+		collectorDone = make(chan error, 1)
+
+		// Start collector goroutine - single goroutine updates bitmaps (no lock contention)
+		go func() {
+			collectorDone <- es.indexCollector(entryCh, opts, progressFn)
+		}()
+	}
+
 	errCh := make(chan error, workers)
 	var wg sync.WaitGroup
-	var totalProcessed int64
 
 	for i := 0; i < workers; i++ {
 		startLedger := minLedger + uint32(i)*ledgersPerWorker
@@ -1682,54 +1830,44 @@ func (es *EventStore) BuildIndexes(workers int, opts *BuildIndexOptions, progres
 		wg.Add(1)
 		go func(start, end uint32) {
 			defer wg.Done()
-			processed, err := es.buildIndexesForRange(start, end, opts)
-			if err != nil {
+			if err := es.buildIndexesForRange(start, end, opts, entryCh); err != nil {
 				errCh <- err
-				return
-			}
-			newTotal := atomic.AddInt64(&totalProcessed, processed)
-			if progressFn != nil {
-				progressFn(newTotal)
 			}
 		}(startLedger, endLedger)
 	}
 
 	wg.Wait()
-	close(errCh)
 
+	// Close entry channel and wait for collector to finish
+	if entryCh != nil {
+		close(entryCh)
+		if err := <-collectorDone; err != nil {
+			return fmt.Errorf("index collector failed: %w", err)
+		}
+	}
+
+	close(errCh)
 	for err := range errCh {
 		if err != nil {
 			return err
 		}
 	}
 
-	// Flush bitmap indexes at the end
-	if (opts.BitmapIndexes || opts.L2Indexes) && es.bitmapIndex != nil {
-		if err := es.bitmapIndex.FlushHotSegments(); err != nil {
-			return fmt.Errorf("failed to flush bitmap indexes: %w", err)
-		}
-	}
-
 	return nil
 }
 
-// buildIndexesForRange builds indexes for a ledger range based on options
-func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *BuildIndexOptions) (int64, error) {
+// buildIndexesForRange reads events for a ledger range and sends index data to collector.
+// Unique indexes are still handled locally (no lock contention issue with RocksDB merge).
+func (es *RocksDBEventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *BuildIndexOptions, entryCh chan<- *indexEntry) error {
 	startKey := eventKeyFromParts(startLedger, 0, 0, 0)
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
 	defer it.Close()
-
-	var processed int64
 
 	// Accumulate unique counts in memory (only if building unique indexes)
 	var counts map[string]uint64
 	if opts.UniqueIndexes {
 		counts = make(map[string]uint64)
 	}
-
-	// Track ledgers for periodic bitmap flush
-	var lastFlushLedger uint32 = startLedger
-	var prevLedger uint32 = 0
 
 	for it.Seek(startKey); it.Valid(); it.Next() {
 		key := it.Key().Data()
@@ -1742,17 +1880,6 @@ func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *
 		if ledger > endLedger {
 			break
 		}
-
-		// Periodic bitmap flush when crossing ledger boundaries
-		if opts.BitmapFlushInterval > 0 && ledger != prevLedger && prevLedger > 0 {
-			if (ledger - lastFlushLedger) >= uint32(opts.BitmapFlushInterval) {
-				if es.bitmapIndex != nil {
-					_ = es.bitmapIndex.FlushHotSegments()
-				}
-				lastFlushLedger = ledger
-			}
-		}
-		prevLedger = ledger
 
 		txIdx := binary.BigEndian.Uint16(key[4:6])
 		opIdx := binary.BigEndian.Uint16(key[6:8])
@@ -1785,7 +1912,7 @@ func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *
 			}
 		}
 
-		// Build UNIQUE indexes (counts)
+		// Build UNIQUE indexes (counts) - handled locally, no contention
 		if opts.UniqueIndexes {
 			if len(contractID) > 0 {
 				uk := string(uniqueKey(UniqueTypeContract, contractID))
@@ -1810,27 +1937,17 @@ func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *
 			}
 		}
 
-		// Build L1 BITMAP indexes (contract/topic -> ledger)
-		if opts.BitmapIndexes && es.bitmapIndex != nil {
-			if len(contractID) > 0 {
-				es.bitmapIndex.AddContractIndex(contractID, ledger)
-			}
-			for i, topicBytes := range topics {
-				es.bitmapIndex.AddTopicIndex(i, topicBytes, ledger)
-			}
-		}
-
-		// Build L2 BITMAP indexes (contract/topic -> ledger:event)
-		if opts.L2Indexes && es.bitmapIndex != nil {
-			if len(contractID) > 0 {
-				es.bitmapIndex.AddContractL2Index(contractID, ledger, txIdx, opIdx, eventIdx)
-			}
-			for i, topicBytes := range topics {
-				es.bitmapIndex.AddTopicL2Index(i, topicBytes, ledger, txIdx, opIdx, eventIdx)
+		// Send to collector for bitmap indexes (no direct bitmap updates here)
+		if entryCh != nil && (len(contractID) > 0 || len(topics) > 0) {
+			entryCh <- &indexEntry{
+				Ledger:     ledger,
+				TxIdx:      txIdx,
+				OpIdx:      opIdx,
+				EventIdx:   eventIdx,
+				ContractID: contractID,
+				Topics:     topics,
 			}
 		}
-
-		processed++
 	}
 
 	// Write unique index counts
@@ -1846,15 +1963,79 @@ func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *
 		}
 
 		if err := es.db.Write(es.wo, batch); err != nil {
-			return processed, fmt.Errorf("failed to write unique index batch: %w", err)
+			return fmt.Errorf("failed to write unique index batch: %w", err)
 		}
 	}
 
 	if err := it.Err(); err != nil {
-		return processed, fmt.Errorf("iterator error: %w", err)
+		return fmt.Errorf("iterator error: %w", err)
 	}
 
-	return processed, nil
+	return nil
+}
+
+// indexCollector receives index entries from workers and updates bitmaps sequentially.
+// This eliminates lock contention - only one goroutine touches the bitmap index.
+func (es *RocksDBEventStore) indexCollector(entryCh <-chan *indexEntry, opts *BuildIndexOptions, progressFn func(processed int64)) error {
+	var processed int64
+	var lastFlushLedger uint32
+	var prevLedger uint32
+
+	bitmapIdx := es.indexStore.GetBitmapIndex()
+
+	for entry := range entryCh {
+		// Periodic flush on ledger boundary
+		if opts.BitmapFlushInterval > 0 && entry.Ledger != prevLedger && prevLedger > 0 {
+			if (entry.Ledger - lastFlushLedger) >= uint32(opts.BitmapFlushInterval) {
+				if err := es.indexStore.Flush(); err != nil {
+					return fmt.Errorf("failed to flush bitmap indexes: %w", err)
+				}
+				lastFlushLedger = entry.Ledger
+			}
+		}
+		prevLedger = entry.Ledger
+
+		// L1 bitmap indexes (contract/topic -> ledger)
+		if opts.BitmapIndexes && bitmapIdx != nil {
+			if len(entry.ContractID) > 0 {
+				bitmapIdx.AddContractIndex(entry.ContractID, entry.Ledger)
+			}
+			for i, topic := range entry.Topics {
+				bitmapIdx.AddTopicIndex(i, topic, entry.Ledger)
+			}
+		}
+
+		// L2 bitmap indexes (contract/topic -> ledger:event)
+		if opts.L2Indexes && bitmapIdx != nil {
+			if len(entry.ContractID) > 0 {
+				bitmapIdx.AddContractL2Index(entry.ContractID, entry.Ledger, entry.TxIdx, entry.OpIdx, entry.EventIdx)
+			}
+			for i, topic := range entry.Topics {
+				bitmapIdx.AddTopicL2Index(i, topic, entry.Ledger, entry.TxIdx, entry.OpIdx, entry.EventIdx)
+			}
+		}
+
+		processed++
+
+		// Progress callback every 100k events
+		if progressFn != nil && processed%100000 == 0 {
+			progressFn(processed)
+		}
+	}
+
+	// Final flush
+	if es.indexStore != nil {
+		if err := es.indexStore.Flush(); err != nil {
+			return fmt.Errorf("failed to flush bitmap indexes: %w", err)
+		}
+	}
+
+	// Final progress
+	if progressFn != nil {
+		progressFn(processed)
+	}
+
+	return nil
 }
 
 // =============================================================================
@@ -1863,13 +2044,15 @@ func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *
 
 // GetEventsByContractIDBitmap retrieves events for a contract using bitmap index
 // This is much faster than GetEventsByContractIDInRange for sparse data
-func (es *EventStore) GetEventsByContractIDBitmap(contractID []byte, startLedger, endLedger uint32, limit int) (*QueryResult, error) {
-	if es.bitmapIndex == nil {
-		return nil, fmt.Errorf("bitmap index not available")
+func (es *RocksDBEventStore) GetEventsByContractIDBitmap(contractID []byte, startLedger, endLedger uint32, limit int) (*QueryResult, error) {
+	if es.indexStore == nil {
+		return nil, fmt.Errorf("index store not available")
 	}
 
+	bitmapIdx := es.indexStore.GetBitmapIndex()
+
 	// Query bitmap to find matching ledgers
-	bitmap, err := es.bitmapIndex.QueryContractIndex(contractID, startLedger, endLedger)
+	bitmap, err := bitmapIdx.QueryContractIndex(contractID, startLedger, endLedger)
 	if err != nil {
 		return nil, fmt.Errorf("bitmap query failed: %w", err)
 	}
@@ -1909,13 +2092,15 @@ func (es *EventStore) GetEventsByContractIDBitmap(contractID []byte, startLedger
 }
 
 // GetEventsByTopicBitmap retrieves events with a specific topic using bitmap index
-func (es *EventStore) GetEventsByTopicBitmap(position int, topicValue []byte, startLedger, endLedger uint32, limit int) (*QueryResult, error) {
-	if es.bitmapIndex == nil {
-		return nil, fmt.Errorf("bitmap index not available")
+func (es *RocksDBEventStore) GetEventsByTopicBitmap(position int, topicValue []byte, startLedger, endLedger uint32, limit int) (*QueryResult, error) {
+	if es.indexStore == nil {
+		return nil, fmt.Errorf("index store not available")
 	}
 
+	bitmapIdx := es.indexStore.GetBitmapIndex()
+
 	// Query bitmap to find matching ledgers
-	bitmap, err := es.bitmapIndex.QueryTopicIndex(position, topicValue, startLedger, endLedger)
+	bitmap, err := bitmapIdx.QueryTopicIndex(position, topicValue, startLedger, endLedger)
 	if err != nil {
 		return nil, fmt.Errorf("bitmap query failed: %w", err)
 	}
@@ -1962,12 +2147,14 @@ func (es *EventStore) GetEventsByTopicBitmap(position int, topicValue []byte, st
 
 // GetEventsWithFilter retrieves events matching multiple filters using bitmap intersection
 // All specified filters must match (AND logic)
-func (es *EventStore) GetEventsWithFilter(filter *QueryFilter, startLedger, endLedger uint32, limit int) (*QueryResult, error) {
+func (es *RocksDBEventStore) GetEventsWithFilter(filter *QueryFilter, startLedger, endLedger uint32, limit int) (*QueryResult, error) {
 	totalStart := time.Now()
 
-	if es.bitmapIndex == nil {
-		return nil, fmt.Errorf("bitmap index not available")
+	if es.indexStore == nil {
+		return nil, fmt.Errorf("index store not available")
 	}
+
+	bitmapIdx := es.indexStore.GetBitmapIndex()
 
 	result := &QueryResult{
 		LedgerRange: endLedger - startLedger + 1,
@@ -1984,7 +2171,7 @@ func (es *EventStore) GetEventsWithFilter(filter *QueryFilter, startLedger, endL
 	var bitmaps []*roaring.Bitmap
 
 	if len(filter.ContractID) > 0 {
-		bm, err := es.bitmapIndex.QueryContractIndex(filter.ContractID, startLedger, endLedger)
+		bm, err := bitmapIdx.QueryContractIndex(filter.ContractID, startLedger, endLedger)
 		if err != nil {
 			return nil, fmt.Errorf("contract bitmap query failed: %w", err)
 		}
@@ -1992,7 +2179,7 @@ func (es *EventStore) GetEventsWithFilter(filter *QueryFilter, startLedger, endL
 	}
 
 	if len(filter.Topic0) > 0 {
-		bm, err := es.bitmapIndex.QueryTopicIndex(0, filter.Topic0, startLedger, endLedger)
+		bm, err := bitmapIdx.QueryTopicIndex(0, filter.Topic0, startLedger, endLedger)
 		if err != nil {
 			return nil, fmt.Errorf("topic0 bitmap query failed: %w", err)
 		}
@@ -2000,7 +2187,7 @@ func (es *EventStore) GetEventsWithFilter(filter *QueryFilter, startLedger, endL
 	}
 
 	if len(filter.Topic1) > 0 {
-		bm, err := es.bitmapIndex.QueryTopicIndex(1, filter.Topic1, startLedger, endLedger)
+		bm, err := bitmapIdx.QueryTopicIndex(1, filter.Topic1, startLedger, endLedger)
 		if err != nil {
 			return nil, fmt.Errorf("topic1 bitmap query failed: %w", err)
 		}
@@ -2008,7 +2195,7 @@ func (es *EventStore) GetEventsWithFilter(filter *QueryFilter, startLedger, endL
 	}
 
 	if len(filter.Topic2) > 0 {
-		bm, err := es.bitmapIndex.QueryTopicIndex(2, filter.Topic2, startLedger, endLedger)
+		bm, err := bitmapIdx.QueryTopicIndex(2, filter.Topic2, startLedger, endLedger)
 		if err != nil {
 			return nil, fmt.Errorf("topic2 bitmap query failed: %w", err)
 		}
@@ -2016,7 +2203,7 @@ func (es *EventStore) GetEventsWithFilter(filter *QueryFilter, startLedger, endL
 	}
 
 	if len(filter.Topic3) > 0 {
-		bm, err := es.bitmapIndex.QueryTopicIndex(3, filter.Topic3, startLedger, endLedger)
+		bm, err := bitmapIdx.QueryTopicIndex(3, filter.Topic3, startLedger, endLedger)
 		if err != nil {
 			return nil, fmt.Errorf("topic3 bitmap query failed: %w", err)
 		}
@@ -2080,7 +2267,7 @@ func (es *EventStore) GetEventsWithFilter(filter *QueryFilter, startLedger, endL
 }
 
 // getEventsFromLedgerWithFilter retrieves events from a specific ledger matching a contract ID
-func (es *EventStore) getEventsFromLedgerWithFilter(ledger uint32, contractID []byte, _ [][]byte) ([]*ContractEvent, int64, error) {
+func (es *RocksDBEventStore) getEventsFromLedgerWithFilter(ledger uint32, contractID []byte, _ [][]byte) ([]*ContractEvent, int64, error) {
 	var events []*ContractEvent
 	var scanned int64
 
@@ -2125,7 +2312,7 @@ func (es *EventStore) getEventsFromLedgerWithFilter(ledger uint32, contractID []
 }
 
 // getEventsFromLedgerWithTopicFilter retrieves events from a ledger matching topic filters
-func (es *EventStore) getEventsFromLedgerWithTopicFilter(ledger uint32, topicFilters [][]byte) ([]*ContractEvent, int64, error) {
+func (es *RocksDBEventStore) getEventsFromLedgerWithTopicFilter(ledger uint32, topicFilters [][]byte) ([]*ContractEvent, int64, error) {
 	var events []*ContractEvent
 	var scanned int64
 
@@ -2168,7 +2355,7 @@ func (es *EventStore) getEventsFromLedgerWithTopicFilter(ledger uint32, topicFil
 }
 
 // getEventsFromLedgerWithFullFilter retrieves events matching both contract and topic filters
-func (es *EventStore) getEventsFromLedgerWithFullFilter(ledger uint32, contractID []byte, topicFilters [][]byte) ([]*ContractEvent, int64, error) {
+func (es *RocksDBEventStore) getEventsFromLedgerWithFullFilter(ledger uint32, contractID []byte, topicFilters [][]byte) ([]*ContractEvent, int64, error) {
 	var events []*ContractEvent
 	var scanned int64
 
@@ -2248,12 +2435,13 @@ func matchesTopicFilters(xdrEvent *xdr.ContractEvent, topicFilters [][]byte) boo
 }
 
 // CountEventsByContractBitmap counts events for a contract using bitmap index (fast)
-func (es *EventStore) CountEventsByContractBitmap(contractID []byte, startLedger, endLedger uint32) (uint64, error) {
-	if es.bitmapIndex == nil {
-		return 0, fmt.Errorf("bitmap index not available")
+func (es *RocksDBEventStore) CountEventsByContractBitmap(contractID []byte, startLedger, endLedger uint32) (uint64, error) {
+	if es.indexStore == nil {
+		return 0, fmt.Errorf("index store not available")
 	}
 
-	bitmap, err := es.bitmapIndex.QueryContractIndex(contractID, startLedger, endLedger)
+	bitmapIdx := es.indexStore.GetBitmapIndex()
+	bitmap, err := bitmapIdx.QueryContractIndex(contractID, startLedger, endLedger)
 	if err != nil {
 		return 0, err
 	}
@@ -2264,12 +2452,13 @@ func (es *EventStore) CountEventsByContractBitmap(contractID []byte, startLedger
 }
 
 // CountEventsByTopicBitmap counts ledgers with events for a topic using bitmap index
-func (es *EventStore) CountEventsByTopicBitmap(position int, topicValue []byte, startLedger, endLedger uint32) (uint64, error) {
-	if es.bitmapIndex == nil {
-		return 0, fmt.Errorf("bitmap index not available")
+func (es *RocksDBEventStore) CountEventsByTopicBitmap(position int, topicValue []byte, startLedger, endLedger uint32) (uint64, error) {
+	if es.indexStore == nil {
+		return 0, fmt.Errorf("index store not available")
 	}
 
-	bitmap, err := es.bitmapIndex.QueryTopicIndex(position, topicValue, startLedger, endLedger)
+	bitmapIdx := es.indexStore.GetBitmapIndex()
+	bitmap, err := bitmapIdx.QueryTopicIndex(position, topicValue, startLedger, endLedger)
 	if err != nil {
 		return 0, err
 	}
@@ -2282,43 +2471,48 @@ func (es *EventStore) CountEventsByTopicBitmap(position int, topicValue []byte, 
 // =============================================================================
 
 // GetEventsWithFilterHierarchical uses two-level bitmap for precise event lookup
-func (es *EventStore) GetEventsWithFilterHierarchical(filter *QueryFilter, startLedger, endLedger uint32, limit int) (*HierarchicalQueryResult, error) {
+func (es *RocksDBEventStore) GetEventsWithFilterHierarchical(filter *QueryFilter, startLedger, endLedger uint32, limit int) (*HierarchicalQueryResult, error) {
 	totalStart := time.Now()
 
-	if es.bitmapIndex == nil {
-		return nil, fmt.Errorf("bitmap index not available")
+	if es.indexStore == nil {
+		return nil, fmt.Errorf("index store not available")
 	}
+
+	bitmapIdx := es.indexStore.GetBitmapIndex()
 
 	result := &HierarchicalQueryResult{}
 
 	// Determine which index to query (contract or topic)
-	var hierarchicalResult *index.IndexQueryResult
+	var eventKeys []index.EventKey
+	var matchingLedgers int
 	var err error
 
+	l1Start := time.Now()
+
 	if len(filter.ContractID) > 0 {
-		hierarchicalResult, err = es.bitmapIndex.QueryContractIndexHierarchical(filter.ContractID, startLedger, endLedger, limit)
+		eventKeys, matchingLedgers, err = bitmapIdx.QueryContractIndexHierarchical(filter.ContractID, startLedger, endLedger, limit)
 	} else if len(filter.Topic0) > 0 {
-		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(0, filter.Topic0, startLedger, endLedger, limit)
+		eventKeys, matchingLedgers, err = bitmapIdx.QueryTopicIndexHierarchical(0, filter.Topic0, startLedger, endLedger, limit)
 	} else if len(filter.Topic1) > 0 {
-		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(1, filter.Topic1, startLedger, endLedger, limit)
+		eventKeys, matchingLedgers, err = bitmapIdx.QueryTopicIndexHierarchical(1, filter.Topic1, startLedger, endLedger, limit)
 	} else if len(filter.Topic2) > 0 {
-		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(2, filter.Topic2, startLedger, endLedger, limit)
+		eventKeys, matchingLedgers, err = bitmapIdx.QueryTopicIndexHierarchical(2, filter.Topic2, startLedger, endLedger, limit)
 	} else if len(filter.Topic3) > 0 {
-		hierarchicalResult, err = es.bitmapIndex.QueryTopicIndexHierarchical(3, filter.Topic3, startLedger, endLedger, limit)
+		eventKeys, matchingLedgers, err = bitmapIdx.QueryTopicIndexHierarchical(3, filter.Topic3, startLedger, endLedger, limit)
 	} else {
 		return nil, fmt.Errorf("at least one filter must be specified for hierarchical query")
 	}
+
+	result.L1LookupTime = time.Since(l1Start) // Approximate: includes L2 lookup too
 
 	if err != nil {
 		return nil, err
 	}
 
-	result.L1LookupTime = hierarchicalResult.L1LookupTime
-	result.L2LookupTime = hierarchicalResult.L2LookupTime
-	result.MatchingLedgers = hierarchicalResult.MatchingLedgers
-	result.MatchingEvents = hierarchicalResult.TotalEvents
+	result.MatchingLedgers = matchingLedgers
+	result.MatchingEvents = len(eventKeys)
 
-	if hierarchicalResult.TotalEvents == 0 {
+	if len(eventKeys) == 0 {
 		result.TotalTime = time.Since(totalStart)
 		return result, nil
 	}
@@ -2327,13 +2521,13 @@ func (es *EventStore) GetEventsWithFilterHierarchical(filter *QueryFilter, start
 	fetchStart := time.Now()
 
 	// Build exact event keys
-	keysToFetch := make([][]byte, 0, len(hierarchicalResult.EventKeys))
-	for i, ek := range hierarchicalResult.EventKeys {
+	keysToFetch := make([][]byte, 0, len(eventKeys))
+	for i, ek := range eventKeys {
 		if limit > 0 && i >= limit {
 			break
 		}
 		// Decode the event index to get tx, op, event
-		txIdx, opIdx, evtIdx := index.DecodeEventIndex(uint32(ek.EventIndex))
+		txIdx, opIdx, evtIdx := index.DecodeEventIndex(ek.EventIndex)
 		key := eventKeyFromParts(ek.LedgerSeq, txIdx, opIdx, evtIdx)
 		keysToFetch = append(keysToFetch, key)
 	}
@@ -2373,14 +2567,16 @@ func (es *EventStore) GetEventsWithFilterHierarchical(filter *QueryFilter, start
 }
 
 // AddEventToL2Index adds an event to the L2 hierarchical index
-func (es *EventStore) AddEventToL2Index(contractID []byte, topics [][]byte, ledgerSeq uint32, txIdx, opIdx, eventIdx uint16) {
-	if es.bitmapIndex == nil {
+func (es *RocksDBEventStore) AddEventToL2Index(contractID []byte, topics [][]byte, ledgerSeq uint32, txIdx, opIdx, eventIdx uint16) {
+	if es.indexStore == nil {
 		return
 	}
 
+	bitmapIdx := es.indexStore.GetBitmapIndex()
+
 	// Add to contract L2 index
 	if len(contractID) > 0 {
-		es.bitmapIndex.AddContractL2Index(contractID, ledgerSeq, txIdx, opIdx, eventIdx)
+		bitmapIdx.AddContractL2Index(contractID, ledgerSeq, txIdx, opIdx, eventIdx)
 	}
 
 	// Add to topic L2 indexes
@@ -2388,6 +2584,16 @@ func (es *EventStore) AddEventToL2Index(contractID []byte, topics [][]byte, ledg
 		if i > 3 || len(topic) == 0 {
 			break
 		}
-		es.bitmapIndex.AddTopicL2Index(i, topic, ledgerSeq, txIdx, opIdx, eventIdx)
+		bitmapIdx.AddTopicL2Index(i, topic, ledgerSeq, txIdx, opIdx, eventIdx)
 	}
 }
+
+// =============================================================================
+// Compile-time Interface Checks
+// =============================================================================
+
+// Verify RocksDBEventStore implements EventStore interface
+var _ EventStore = (*RocksDBEventStore)(nil)
+
+// Verify RocksDBEventStore implements EventReader interface
+var _ EventReader = (*RocksDBEventStore)(nil)
