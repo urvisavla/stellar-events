@@ -646,6 +646,7 @@ func (es *RocksDBEventStore) GetEventsInRangeWithTiming(startLedger, endLedger u
 		diskStart = time.Now()
 		valueData := it.Value().Data()
 		result.Timing.DiskReadTime += time.Since(diskStart)
+		result.Timing.BytesRead += int64(len(valueData))
 
 		// Time unmarshalling/decoding
 		unmarshalStart := time.Now()
@@ -1537,6 +1538,7 @@ func (es *RocksDBEventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.
 		diskStart = time.Now()
 		valueData := it.Value().Data()
 		result.Timing.DiskReadTime += time.Since(diskStart)
+		result.Timing.BytesRead += int64(len(valueData))
 
 		// Time unmarshalling/decoding
 		unmarshalStart := time.Now()

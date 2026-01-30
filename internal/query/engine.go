@@ -103,6 +103,7 @@ func (e *Engine) Query(filter *Filter, startLedger, endLedger uint32, opts *Opti
 		// Aggregate timing from this ledger
 		result.DiskReadTime += fetchResult.Timing.DiskReadTime
 		result.UnmarshalTime += fetchResult.Timing.UnmarshalTime
+		result.BytesRead += fetchResult.Timing.BytesRead
 
 		result.EventsScanned += int64(len(fetchResult.Events))
 

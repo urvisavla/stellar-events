@@ -109,6 +109,25 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.3fs", d.Seconds())
 }
 
+// formatBytes formats byte count with appropriate unit
+func formatBytes(bytes int64) string {
+	const (
+		KB = 1024
+		MB = 1024 * KB
+		GB = 1024 * MB
+	)
+	if bytes < KB {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	if bytes < MB {
+		return fmt.Sprintf("%.2f KB", float64(bytes)/KB)
+	}
+	if bytes < GB {
+		return fmt.Sprintf("%.2f MB", float64(bytes)/MB)
+	}
+	return fmt.Sprintf("%.2f GB", float64(bytes)/GB)
+}
+
 // =============================================================================
 // Stats Display Helpers
 // =============================================================================
