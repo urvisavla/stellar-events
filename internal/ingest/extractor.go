@@ -10,9 +10,23 @@ import (
 	"github.com/urvisavla/stellar-events/internal/store"
 )
 
-// ExtractEvents extracts events as raw XDR with minimal overhead
-// This is the fastest extraction mode - no field parsing, just raw bytes
+// ExtractEvents extracts events as raw XDR with minimal overhead.
+// This is the fastest extraction mode - no field parsing, just raw bytes.
+// Uses defensive copies to prevent memory leaks (safe for long-lived events).
 func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats) ([]*store.IngestEvent, error) {
+	return ExtractEventsWithOptions(xdrBytes, networkPassphrase, stats, false)
+}
+
+// ExtractEventsFast extracts events without defensive memory copies.
+// Use this for bulk ingestion where events are written immediately and not held in memory.
+// The returned events are only valid until the next call or until xdrBytes is modified.
+func ExtractEventsFast(xdrBytes []byte, networkPassphrase string, stats *LedgerStats) ([]*store.IngestEvent, error) {
+	return ExtractEventsWithOptions(xdrBytes, networkPassphrase, stats, true)
+}
+
+// ExtractEventsWithOptions extracts events with configurable memory behavior.
+// When fastMode is true, skips defensive copies for better performance during bulk ingestion.
+func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *LedgerStats, fastMode bool) ([]*store.IngestEvent, error) {
 	var lcm xdr.LedgerCloseMeta
 	if err := lcm.UnmarshalBinary(xdrBytes); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal LedgerCloseMeta: %w", err)
@@ -55,9 +69,13 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 		}
 
 		// Capture transaction hash once for all events in this transaction
-		// IMPORTANT: Copy the hash to avoid keeping the entire tx structure alive in memory
-		txHash := make([]byte, 32)
-		copy(txHash, tx.Hash[:])
+		var txHash []byte
+		if fastMode {
+			txHash = tx.Hash[:]
+		} else {
+			txHash = make([]byte, 32)
+			copy(txHash, tx.Hash[:])
+		}
 
 		// Process transaction-level events
 		for eventIndex, event := range txEvents.TransactionEvents {
@@ -72,12 +90,15 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 			}
 
 			// Extract contract ID and topics for indexing (avoids re-parsing later)
-			// IMPORTANT: Copy contractID to avoid keeping the entire XDR structure alive
 			var contractID []byte
 			var topics [][]byte
 			if event.Event.ContractId != nil {
-				contractID = make([]byte, 32)
-				copy(contractID, event.Event.ContractId[:])
+				if fastMode {
+					contractID = event.Event.ContractId[:]
+				} else {
+					contractID = make([]byte, 32)
+					copy(contractID, event.Event.ContractId[:])
+				}
 			}
 			if event.Event.Body.V == 0 {
 				body := event.Event.Body.MustV0()
@@ -113,12 +134,15 @@ func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats
 				}
 
 				// Extract contract ID and topics for indexing (avoids re-parsing later)
-				// IMPORTANT: Copy contractID to avoid keeping the entire XDR structure alive
 				var contractID []byte
 				var topics [][]byte
 				if event.ContractId != nil {
-					contractID = make([]byte, 32)
-					copy(contractID, event.ContractId[:])
+					if fastMode {
+						contractID = event.ContractId[:]
+					} else {
+						contractID = make([]byte, 32)
+						copy(contractID, event.ContractId[:])
+					}
 				}
 				if event.Body.V == 0 {
 					body := event.Body.MustV0()

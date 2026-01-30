@@ -6,6 +6,9 @@ import (
 	"github.com/RoaringBitmap/roaring"
 )
 
+// Key size: 1 (prefix) + 32 (keyValue) + 4 (segmentID/ledgerSeq) = 37 bytes
+const keySize = 37
+
 // =============================================================================
 // Segment Loader Interface
 // =============================================================================
@@ -33,11 +36,17 @@ type SegmentLoader interface {
 // This implementation is NOT thread-safe. Callers must ensure single-threaded
 // access during ingestion, which is the normal case for the pipeline collector.
 type BitmapIndex struct {
-	// Level 1: Hot segment cache - maps "prefix:keyHash:segmentID" to bitmap of ledgers
-	hotSegments map[string]*roaring.Bitmap
+	// Level 1: Hot segment cache - maps key to bitmap of ledgers
+	// Key format: <prefix:1><keyValue:32><segmentID:4>
+	hotSegments map[[keySize]byte]*roaring.Bitmap
 
-	// Level 2: Hot cache - maps "L2prefix:keyHash:ledger" to bitmap of event indices
-	hotL2Segments map[string]*roaring.Bitmap
+	// Level 2: Ledger-centric hot cache for efficient ingestion
+	// Only keeps data for the current ledger, flushes when ledger changes
+	// Key format: <prefix:1><keyValue:32> (no ledger in key - it's tracked separately)
+	currentL2Ledger uint32
+	currentL2Map    map[[l2KeySize]byte]*roaring.Bitmap
+	// Accumulated L2 segments ready for flush
+	pendingL2Segments []Segment
 
 	// Current hot segment ID (the one being actively written)
 	currentSegmentID uint32
@@ -46,13 +55,16 @@ type BitmapIndex struct {
 	loader SegmentLoader
 }
 
+// l2KeySize is prefix (1) + keyValue (32) = 33 bytes (no ledger in map key)
+const l2KeySize = 33
+
 // NewBitmapIndex creates a new in-memory bitmap index.
 // The loader parameter is optional and used for queries to load persisted segments.
 func NewBitmapIndex(loader SegmentLoader) *BitmapIndex {
 	return &BitmapIndex{
-		hotSegments:   make(map[string]*roaring.Bitmap),
-		hotL2Segments: make(map[string]*roaring.Bitmap),
-		loader:        loader,
+		hotSegments:  make(map[[keySize]byte]*roaring.Bitmap),
+		currentL2Map: make(map[[l2KeySize]byte]*roaring.Bitmap),
+		loader:       loader,
 	}
 }
 
@@ -62,53 +74,51 @@ func (bi *BitmapIndex) SetLoader(loader SegmentLoader) {
 }
 
 // =============================================================================
-// Key Generation (exported for use by storage implementations)
+// Key Generation
 // =============================================================================
 
 // MakeL1Key creates a database key for an L1 bitmap segment.
 // Format: <prefix:1><keyValue:32><segmentID:4>
+// This allocates and is used for storage layer operations.
 func MakeL1Key(prefix byte, keyValue []byte, segmentID uint32) []byte {
-	key := make([]byte, 1+32+4)
+	key := make([]byte, keySize)
 	key[0] = prefix
-
-	// Pad or truncate keyValue to 32 bytes
 	if len(keyValue) >= 32 {
 		copy(key[1:33], keyValue[:32])
 	} else {
 		copy(key[1:1+len(keyValue)], keyValue)
 	}
-
-	// Big-endian segment ID for proper sorting
 	binary.BigEndian.PutUint32(key[33:37], segmentID)
 	return key
 }
 
 // MakeL2Key creates a database key for an L2 bitmap.
 // Format: <L2prefix:1><keyValue:32><ledger:4>
+// This allocates and is used for storage layer operations.
 func MakeL2Key(prefix byte, keyValue []byte, ledgerSeq uint32) []byte {
-	key := make([]byte, 1+32+4)
+	key := make([]byte, keySize)
 	key[0] = prefix
-
-	// Pad or truncate keyValue to 32 bytes
 	if len(keyValue) >= 32 {
 		copy(key[1:33], keyValue[:32])
 	} else {
 		copy(key[1:1+len(keyValue)], keyValue)
 	}
-
-	// Big-endian ledger sequence for proper sorting
 	binary.BigEndian.PutUint32(key[33:37], ledgerSeq)
 	return key
 }
 
-// makeL1CacheKey creates a cache key for the hot segments map.
-func makeL1CacheKey(prefix byte, keyValue []byte, segmentID uint32) string {
-	return string(MakeL1Key(prefix, keyValue, segmentID))
-}
-
-// makeL2CacheKey creates a cache key for the hot L2 segments map.
-func makeL2CacheKey(prefix byte, keyValue []byte, ledgerSeq uint32) string {
-	return string(MakeL2Key(prefix, keyValue, ledgerSeq))
+// makeKey builds a key in place without allocation.
+// Used internally for map lookups.
+func makeKey(prefix byte, keyValue []byte, id uint32) [keySize]byte {
+	var key [keySize]byte
+	key[0] = prefix
+	if len(keyValue) >= 32 {
+		copy(key[1:33], keyValue[:32])
+	} else {
+		copy(key[1:1+len(keyValue)], keyValue)
+	}
+	binary.BigEndian.PutUint32(key[33:37], id)
+	return key
 }
 
 // =============================================================================
@@ -120,12 +130,12 @@ func (bi *BitmapIndex) AddToIndex(prefix byte, keyValue []byte, ledgerSeq uint32
 	segmentID := SegmentID(ledgerSeq)
 	localLedger := ledgerSeq % SegmentSize
 
-	cacheKey := makeL1CacheKey(prefix, keyValue, segmentID)
+	key := makeKey(prefix, keyValue, segmentID)
 
-	bitmap, exists := bi.hotSegments[cacheKey]
+	bitmap, exists := bi.hotSegments[key]
 	if !exists {
 		bitmap = roaring.New()
-		bi.hotSegments[cacheKey] = bitmap
+		bi.hotSegments[key] = bitmap
 	}
 
 	bitmap.Add(localLedger)
@@ -142,8 +152,17 @@ func (bi *BitmapIndex) AddContractIndex(contractID []byte, ledgerSeq uint32) {
 
 // AddTopicIndex adds a ledger to a topic L1 index.
 func (bi *BitmapIndex) AddTopicIndex(topicPosition int, topicValue []byte, ledgerSeq uint32) {
-	prefix := TopicL1Prefix(topicPosition)
-	if prefix == 0 {
+	var prefix byte
+	switch topicPosition {
+	case 0:
+		prefix = PrefixTopic0Index
+	case 1:
+		prefix = PrefixTopic1Index
+	case 2:
+		prefix = PrefixTopic2Index
+	case 3:
+		prefix = PrefixTopic3Index
+	default:
 		return // Invalid topic position
 	}
 	bi.AddToIndex(prefix, topicValue, ledgerSeq)
@@ -155,16 +174,67 @@ func (bi *BitmapIndex) AddTopicIndex(topicPosition int, topicValue []byte, ledge
 
 // AddToL2Index adds an event index to the L2 bitmap for a given key and ledger.
 // eventIndex encodes tx:op:event as a single uint32.
+// Uses ledger-centric batching: when ledger changes, flushes previous ledger's data.
 func (bi *BitmapIndex) AddToL2Index(prefix byte, keyValue []byte, ledgerSeq uint32, eventIndex uint32) {
-	cacheKey := makeL2CacheKey(prefix, keyValue, ledgerSeq)
+	// Check if we've moved to a new ledger
+	if ledgerSeq != bi.currentL2Ledger && bi.currentL2Ledger != 0 {
+		bi.flushCurrentL2Ledger()
+	}
+	bi.currentL2Ledger = ledgerSeq
 
-	bitmap, exists := bi.hotL2Segments[cacheKey]
+	// Use smaller key (no ledger) for current ledger's map
+	key := makeL2Key(prefix, keyValue)
+
+	bitmap, exists := bi.currentL2Map[key]
 	if !exists {
 		bitmap = roaring.New()
-		bi.hotL2Segments[cacheKey] = bitmap
+		bi.currentL2Map[key] = bitmap
 	}
 
 	bitmap.Add(eventIndex)
+}
+
+// makeL2Key creates a key for the current ledger's L2 map (no ledger in key).
+func makeL2Key(prefix byte, keyValue []byte) [l2KeySize]byte {
+	var key [l2KeySize]byte
+	key[0] = prefix
+	if len(keyValue) >= 32 {
+		copy(key[1:33], keyValue[:32])
+	} else {
+		copy(key[1:1+len(keyValue)], keyValue)
+	}
+	return key
+}
+
+// flushCurrentL2Ledger serializes the current ledger's L2 data to pending segments.
+func (bi *BitmapIndex) flushCurrentL2Ledger() {
+	if len(bi.currentL2Map) == 0 {
+		return
+	}
+
+	ledger := bi.currentL2Ledger
+	for key, bitmap := range bi.currentL2Map {
+		bitmap.RunOptimize()
+		data, err := bitmap.ToBytes()
+		if err != nil {
+			continue // Skip on error
+		}
+
+		// Build full key: prefix + keyValue + ledger
+		fullKey := make([]byte, keySize)
+		copy(fullKey[0:l2KeySize], key[:])
+		binary.BigEndian.PutUint32(fullKey[33:37], ledger)
+
+		bi.pendingL2Segments = append(bi.pendingL2Segments, Segment{
+			Key:  fullKey,
+			Data: data,
+		})
+	}
+
+	// Clear for next ledger - reuse map to avoid allocation
+	for k := range bi.currentL2Map {
+		delete(bi.currentL2Map, k)
+	}
 }
 
 // AddContractL2Index adds an event to the contract ID L2 index.
@@ -175,8 +245,17 @@ func (bi *BitmapIndex) AddContractL2Index(contractID []byte, ledgerSeq uint32, t
 
 // AddTopicL2Index adds an event to a topic L2 index.
 func (bi *BitmapIndex) AddTopicL2Index(topicPosition int, topicValue []byte, ledgerSeq uint32, txIndex, opIndex, eventIndex uint16) {
-	prefix := TopicL2Prefix(topicPosition)
-	if prefix == 0 {
+	var prefix byte
+	switch topicPosition {
+	case 0:
+		prefix = PrefixTopic0L2
+	case 1:
+		prefix = PrefixTopic1L2
+	case 2:
+		prefix = PrefixTopic2L2
+	case 3:
+		prefix = PrefixTopic3L2
+	default:
 		return // Invalid topic position
 	}
 	encoded := EncodeEventIndex(txIndex, opIndex, eventIndex)
@@ -254,10 +333,10 @@ func (bi *BitmapIndex) QueryIndex(prefix byte, keyValue []byte, startLedger, end
 
 // getL1Segment retrieves an L1 segment from hot cache or storage.
 func (bi *BitmapIndex) getL1Segment(prefix byte, keyValue []byte, segmentID uint32) (*roaring.Bitmap, error) {
-	cacheKey := makeL1CacheKey(prefix, keyValue, segmentID)
+	key := makeKey(prefix, keyValue, segmentID)
 
 	// Check hot cache first
-	if bitmap, exists := bi.hotSegments[cacheKey]; exists {
+	if bitmap, exists := bi.hotSegments[key]; exists {
 		return bitmap, nil
 	}
 
@@ -271,11 +350,23 @@ func (bi *BitmapIndex) getL1Segment(prefix byte, keyValue []byte, segmentID uint
 
 // QueryL2Index returns event indices for a specific ledger.
 func (bi *BitmapIndex) QueryL2Index(prefix byte, keyValue []byte, ledgerSeq uint32) (*roaring.Bitmap, error) {
-	cacheKey := makeL2CacheKey(prefix, keyValue, ledgerSeq)
+	// Check if this is the current ledger being indexed
+	if ledgerSeq == bi.currentL2Ledger {
+		l2Key := makeL2Key(prefix, keyValue)
+		if bitmap, exists := bi.currentL2Map[l2Key]; exists {
+			return bitmap, nil
+		}
+	}
 
-	// Check hot cache first
-	if bitmap, exists := bi.hotL2Segments[cacheKey]; exists {
-		return bitmap, nil
+	// Check pending segments (already serialized but not yet flushed to storage)
+	fullKey := MakeL2Key(prefix, keyValue, ledgerSeq)
+	for _, seg := range bi.pendingL2Segments {
+		if string(seg.Key) == string(fullKey) {
+			bitmap := roaring.New()
+			if err := bitmap.UnmarshalBinary(seg.Data); err == nil {
+				return bitmap, nil
+			}
+		}
 	}
 
 	// Load from storage if loader is available
@@ -382,48 +473,44 @@ type FlushResult struct {
 
 // GetAndClearAllSegments gets and clears both L1 and L2 segments.
 func (bi *BitmapIndex) GetAndClearAllSegments() (*FlushResult, error) {
+	// Flush current L2 ledger first
+	bi.flushCurrentL2Ledger()
+
 	result := &FlushResult{
 		L1Segments: make([]Segment, 0, len(bi.hotSegments)),
-		L2Segments: make([]Segment, 0, len(bi.hotL2Segments)),
+		L2Segments: bi.pendingL2Segments, // Take accumulated L2 segments
 	}
 
 	// Serialize L1 segments
-	for cacheKey, bitmap := range bi.hotSegments {
+	for key, bitmap := range bi.hotSegments {
 		bitmap.RunOptimize()
 		data, err := bitmap.ToBytes()
 		if err != nil {
 			return nil, err
 		}
+		// Copy key to slice for storage
+		keyCopy := make([]byte, keySize)
+		copy(keyCopy, key[:])
 		result.L1Segments = append(result.L1Segments, Segment{
-			Key:  []byte(cacheKey),
+			Key:  keyCopy,
 			Data: data,
 		})
 	}
 
-	// Serialize L2 segments
-	for cacheKey, bitmap := range bi.hotL2Segments {
-		bitmap.RunOptimize()
-		data, err := bitmap.ToBytes()
-		if err != nil {
-			return nil, err
-		}
-		result.L2Segments = append(result.L2Segments, Segment{
-			Key:  []byte(cacheKey),
-			Data: data,
-		})
-	}
-
-	// Clear both
-	bi.hotSegments = make(map[string]*roaring.Bitmap)
-	bi.hotL2Segments = make(map[string]*roaring.Bitmap)
+	// Clear L1 and reset L2
+	bi.hotSegments = make(map[[keySize]byte]*roaring.Bitmap)
+	bi.pendingL2Segments = nil
+	bi.currentL2Ledger = 0
 
 	return result, nil
 }
 
 // ClearAll clears all hot segments.
 func (bi *BitmapIndex) ClearAll() {
-	bi.hotSegments = make(map[string]*roaring.Bitmap)
-	bi.hotL2Segments = make(map[string]*roaring.Bitmap)
+	bi.hotSegments = make(map[[keySize]byte]*roaring.Bitmap)
+	bi.currentL2Map = make(map[[l2KeySize]byte]*roaring.Bitmap)
+	bi.pendingL2Segments = nil
+	bi.currentL2Ledger = 0
 }
 
 // =============================================================================
@@ -442,10 +529,13 @@ func (bi *BitmapIndex) GetHotSegmentStats() (count int, totalCards uint64, memBy
 
 // GetL2Stats returns statistics about L2 hot segments.
 func (bi *BitmapIndex) GetL2Stats() (count int, totalCards uint64) {
-	count = len(bi.hotL2Segments)
-	for _, bm := range bi.hotL2Segments {
+	// Count current ledger's map entries
+	count = len(bi.currentL2Map)
+	for _, bm := range bi.currentL2Map {
 		totalCards += bm.GetCardinality()
 	}
+	// Add pending segments count
+	count += len(bi.pendingL2Segments)
 	return
 }
 

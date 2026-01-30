@@ -403,14 +403,19 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 	// Map from unique key -> count to add
 	countUpdates := make(map[string]uint64)
 
+	// Get bitmap index once outside the loop (avoid per-event method call overhead)
+	var bitmapIdx *index.BitmapIndex
+	if opts.BitmapIndexes && es.indexStore != nil {
+		bitmapIdx = es.indexStore.GetBitmapIndex()
+	}
+
 	for _, event := range events {
 		key := eventKey(event)
 		batch.PutCF(es.cfEvents, key, event.RawXDR)
 		totalBytes += int64(len(event.RawXDR))
 
 		// Update bitmap indexes (fast, in-memory operation)
-		if opts.BitmapIndexes && es.indexStore != nil {
-			bitmapIdx := es.indexStore.GetBitmapIndex()
+		if bitmapIdx != nil {
 			// L1: Index contract ID -> ledger
 			if len(event.ContractID) > 0 {
 				bitmapIdx.AddContractIndex(event.ContractID, event.LedgerSequence)

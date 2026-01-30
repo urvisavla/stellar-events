@@ -177,9 +177,9 @@ func (p *Pipeline) processLedger(ledgerReader *reader.LedgerReader, seq uint32) 
 		return result
 	}
 
-	// Parse XDR and extract events
+	// Parse XDR and extract events (use fast mode - events are written immediately)
 	unmarshalStart := time.Now()
-	events, err := ExtractEvents(xdrBytes, p.config.NetworkPassphrase, result.Stats)
+	events, err := ExtractEventsFast(xdrBytes, p.config.NetworkPassphrase, result.Stats)
 	result.UnmarshalTime = time.Since(unmarshalStart)
 
 	if err != nil {
@@ -206,9 +206,6 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 	// Aggregated stats
 	var ledgersProcessed, totalEvents int
 	aggStats := NewLedgerStats()
-
-	// Time-based progress tracking
-	lastProgressTime := time.Now()
 
 	// Event batch for writing
 	var eventBatch []*store.IngestEvent
@@ -280,8 +277,8 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 					return fmt.Errorf("failed to update last processed ledger: %w", err)
 				}
 
-				// Fresh allocation to release underlying array memory
-				eventBatch = make([]*store.IngestEvent, 0, p.config.BatchSize*100)
+				// Reuse slice capacity to avoid allocation overhead
+				eventBatch = eventBatch[:0]
 				batchRawBytes = 0
 				batchStartSeq = nextSeq
 
@@ -294,12 +291,9 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 				}
 			}
 
-			// Progress callback - time-based or every 1000 ledgers
-			shouldReportProgress := ledgersProcessed%1000 == 0 ||
-				time.Since(lastProgressTime) > 5*time.Second
-			if p.onProgress != nil && shouldReportProgress {
+			// Progress callback every 1000 ledgers
+			if p.onProgress != nil && ledgersProcessed%1000 == 0 {
 				p.onProgress(nextSeq-1, ledgersProcessed, totalEvents, aggStats)
-				lastProgressTime = time.Now()
 			}
 		}
 	}
