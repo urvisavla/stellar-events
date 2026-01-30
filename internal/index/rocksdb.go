@@ -299,83 +299,55 @@ func (s *RocksDBStore) countIndexEntries(prefix byte) int64 {
 // =============================================================================
 
 // Flush persists all hot segments to RocksDB.
+// Uses a single drain/resume cycle for both L1 and L2 segments for efficiency.
 func (s *RocksDBStore) Flush() error {
-	// Flush L1 segments
-	if err := s.flushL1Segments(); err != nil {
-		return err
-	}
-
-	// Flush L2 segments
-	return s.flushL2Segments()
-}
-
-// flushL1Segments writes L1 hot segments to RocksDB.
-// RocksDB handles compression transparently via LZ4.
-func (s *RocksDBStore) flushL1Segments() error {
-	segments, err := s.bitmap.GetAndClearL1Segments()
+	result, err := s.bitmap.GetAndClearAllSegments()
 	if err != nil {
-		return fmt.Errorf("failed to get dirty L1 segments: %w", err)
+		return fmt.Errorf("failed to get segments: %w", err)
 	}
 
-	if len(segments) == 0 {
-		return nil
+	// Write L1 segments
+	if len(result.L1Segments) > 0 {
+		batch := grocksdb.NewWriteBatch()
+		for _, seg := range result.L1Segments {
+			batch.PutCF(s.cf, seg.Key, seg.Data)
+		}
+		if err := s.db.Write(s.wo, batch); err != nil {
+			batch.Destroy()
+			return fmt.Errorf("failed to write L1 segments: %w", err)
+		}
+		batch.Destroy()
 	}
 
-	batch := grocksdb.NewWriteBatch()
-	defer batch.Destroy()
+	// Write L2 segments in batches
+	if len(result.L2Segments) > 0 {
+		const maxBatchSize = 10000
+		batch := grocksdb.NewWriteBatch()
+		batchCount := 0
 
-	for _, seg := range segments {
-		batch.PutCF(s.cf, seg.Key, seg.Data)
-	}
+		for _, seg := range result.L2Segments {
+			batch.PutCF(s.cf, seg.Key, seg.Data)
+			batchCount++
 
-	if err := s.db.Write(s.wo, batch); err != nil {
-		return fmt.Errorf("failed to write L1 segments: %w", err)
-	}
+			if batchCount >= maxBatchSize {
+				if err := s.db.Write(s.wo, batch); err != nil {
+					batch.Destroy()
+					return fmt.Errorf("failed to write L2 segment batch: %w", err)
+				}
+				batch.Destroy()
+				batch = grocksdb.NewWriteBatch()
+				batchCount = 0
+			}
+		}
 
-	return nil
-}
-
-// flushL2Segments writes L2 hot segments to RocksDB.
-// RocksDB handles compression transparently via LZ4.
-func (s *RocksDBStore) flushL2Segments() error {
-	segments, err := s.bitmap.GetAndClearL2Segments()
-	if err != nil {
-		return fmt.Errorf("failed to get dirty L2 segments: %w", err)
-	}
-
-	if len(segments) == 0 {
-		return nil
-	}
-
-	// Flush in batches to avoid huge WriteBatch memory usage
-	const maxBatchSize = 10000
-	batch := grocksdb.NewWriteBatch()
-	batchCount := 0
-
-	for _, seg := range segments {
-		batch.PutCF(s.cf, seg.Key, seg.Data)
-		batchCount++
-
-		// Write batch when it reaches max size
-		if batchCount >= maxBatchSize {
+		if batchCount > 0 {
 			if err := s.db.Write(s.wo, batch); err != nil {
 				batch.Destroy()
 				return fmt.Errorf("failed to write L2 segment batch: %w", err)
 			}
-			batch.Destroy()
-			batch = grocksdb.NewWriteBatch()
-			batchCount = 0
 		}
+		batch.Destroy()
 	}
-
-	// Write remaining entries
-	if batchCount > 0 {
-		if err := s.db.Write(s.wo, batch); err != nil {
-			batch.Destroy()
-			return fmt.Errorf("failed to write L2 segment batch: %w", err)
-		}
-	}
-	batch.Destroy()
 
 	return nil
 }

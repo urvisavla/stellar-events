@@ -366,9 +366,6 @@ func parseCompression(compression string) grocksdb.CompressionType {
 
 // Close closes the event store
 func (es *RocksDBEventStore) Close() {
-	// Stop bitmap writer goroutine if running
-	es.StopBitmapWriter()
-
 	// Close index store (flushes any remaining hot segments)
 	if es.indexStore != nil {
 		es.indexStore.Close()
@@ -387,23 +384,6 @@ func (es *RocksDBEventStore) Close() {
 	// after the DB is closed (the C pointer becomes invalid).
 	// These are small memory leaks but avoid the crash.
 	// A proper fix would require grocksdb to handle this case.
-}
-
-// StartBitmapWriter starts the single-writer goroutine for lock-free bitmap updates.
-// This should be called before bulk ingestion for optimal performance.
-// The writer goroutine eliminates lock contention during high-throughput indexing.
-func (es *RocksDBEventStore) StartBitmapWriter() {
-	if es.indexStore != nil {
-		es.indexStore.GetBitmapIndex().Start()
-	}
-}
-
-// StopBitmapWriter stops the single-writer goroutine and waits for pending updates.
-// This is called automatically by Close(), but can be called manually if needed.
-func (es *RocksDBEventStore) StopBitmapWriter() {
-	if es.indexStore != nil {
-		es.indexStore.GetBitmapIndex().Stop()
-	}
 }
 
 // StoreEvents stores events with optional index updates based on options.
