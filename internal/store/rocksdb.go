@@ -580,6 +580,79 @@ func (es *RocksDBEventStore) GetEventsByLedger(ledgerSequence uint32) ([]*Contra
 	return es.GetEventsByLedgerRange(ledgerSequence, ledgerSequence)
 }
 
+// GetEventsInRangeWithTiming retrieves events in a ledger range with detailed timing.
+// Returns query.Event format with disk read and unmarshal timing.
+func (es *RocksDBEventStore) GetEventsInRangeWithTiming(startLedger, endLedger uint32, limit int) (*query.RangeResult, error) {
+	result := &query.RangeResult{
+		Timing: query.FetchTiming{},
+	}
+
+	startKey := eventKeyFromParts(startLedger, 0, 0, 0)
+
+	// Time iterator creation and seek
+	diskStart := time.Now()
+	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
+	defer it.Close()
+	it.Seek(startKey)
+	result.Timing.DiskReadTime += time.Since(diskStart)
+
+	for it.Valid() {
+		// Check limit
+		if limit > 0 && len(result.Events) >= limit {
+			break
+		}
+
+		// Time key access (disk read)
+		diskStart = time.Now()
+		key := it.Key().Data()
+		result.Timing.DiskReadTime += time.Since(diskStart)
+
+		if len(key) < 10 {
+			break
+		}
+
+		// Compare ledger (bytes 0-3)
+		keyLedger := binary.BigEndian.Uint32(key[0:4])
+		if keyLedger > endLedger {
+			break
+		}
+
+		_, tx, op, eventIdx := parseEventKey(key)
+
+		// Time value access (disk read)
+		diskStart = time.Now()
+		rawXDR := it.Value().Data()
+		result.Timing.DiskReadTime += time.Since(diskStart)
+
+		// Time unmarshalling
+		unmarshalStart := time.Now()
+		event, err := parseRawXDRToQueryEvent(rawXDR, keyLedger, tx, op, eventIdx)
+		result.Timing.UnmarshalTime += time.Since(unmarshalStart)
+
+		result.EventsScanned++
+
+		if err != nil {
+			// Time next iteration
+			diskStart = time.Now()
+			it.Next()
+			result.Timing.DiskReadTime += time.Since(diskStart)
+			continue
+		}
+		result.Events = append(result.Events, event)
+
+		// Time next iteration
+		diskStart = time.Now()
+		it.Next()
+		result.Timing.DiskReadTime += time.Since(diskStart)
+	}
+
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("iterator error: %w", err)
+	}
+
+	return result, nil
+}
+
 // =============================================================================
 // Query by Contract ID
 // =============================================================================
@@ -1388,6 +1461,71 @@ func (es *RocksDBEventStore) GetEventsInLedger(ledger uint32) ([]*query.Event, e
 	}
 
 	return events, nil
+}
+
+// GetEventsInLedgerWithTiming retrieves all events in a specific ledger with detailed timing.
+// Implements the EventReader interface.
+func (es *RocksDBEventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.FetchResult, error) {
+	result := &query.FetchResult{
+		Timing: query.FetchTiming{},
+	}
+
+	startKey := eventKeyFromParts(ledger, 0, 0, 0)
+
+	// Time iterator creation and seek
+	diskStart := time.Now()
+	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
+	defer it.Close()
+	it.Seek(startKey)
+	result.Timing.DiskReadTime += time.Since(diskStart)
+
+	for it.Valid() {
+		// Time key access (disk read)
+		diskStart = time.Now()
+		key := it.Key().Data()
+		result.Timing.DiskReadTime += time.Since(diskStart)
+
+		if len(key) < 10 {
+			break
+		}
+
+		keyLedger := binary.BigEndian.Uint32(key[0:4])
+		if keyLedger != ledger {
+			break
+		}
+
+		_, tx, op, eventIdx := parseEventKey(key)
+
+		// Time value access (disk read)
+		diskStart = time.Now()
+		rawXDR := it.Value().Data()
+		result.Timing.DiskReadTime += time.Since(diskStart)
+
+		// Time unmarshalling
+		unmarshalStart := time.Now()
+		event, err := parseRawXDRToQueryEvent(rawXDR, ledger, tx, op, eventIdx)
+		result.Timing.UnmarshalTime += time.Since(unmarshalStart)
+
+		if err != nil {
+			// Time next iteration
+			diskStart = time.Now()
+			it.Next()
+			result.Timing.DiskReadTime += time.Since(diskStart)
+			continue
+		}
+		result.Events = append(result.Events, event)
+
+		// Time next iteration
+		diskStart = time.Now()
+		it.Next()
+		result.Timing.DiskReadTime += time.Since(diskStart)
+	}
+
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("iterator error: %w", err)
+	}
+
+	return result, nil
 }
 
 // parseRawXDRToQueryEvent converts raw XDR bytes to a query.Event

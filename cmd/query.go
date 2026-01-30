@@ -129,23 +129,30 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 
 	// No filter - scan all events in range (use direct store method)
 	if !hasAnyFilter {
-		startTime := time.Now()
 		fmt.Fprintf(os.Stderr, "Querying all events in ledgers %d-%d...\n", startLedger, endLedger)
-		events, err := eventStore.GetEventsByLedgerRange(startLedger, endLedger)
+		startTime := time.Now()
+		rangeResult, err := eventStore.GetEventsInRangeWithTiming(startLedger, endLedger, limit)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 			os.Exit(1)
 		}
-		elapsed := time.Since(startTime)
+		totalTime := time.Since(startTime)
 
-		// Defensive limit
-		if limit > 0 && len(events) > limit {
-			events = events[:limit]
+		// Build a result struct for consistent display
+		result := &query.Result{
+			Events:         rangeResult.Events,
+			EventsScanned:  rangeResult.EventsScanned,
+			EventsReturned: len(rangeResult.Events),
+			LedgerRange:    endLedger - startLedger + 1,
+			DiskReadTime:   rangeResult.Timing.DiskReadTime,
+			UnmarshalTime:  rangeResult.Timing.UnmarshalTime,
+			EventFetchTime: totalTime, // Total fetch time (no index lookup for unfiltered)
+			TotalTime:      totalTime,
 		}
 
-		fmt.Fprintf(os.Stderr, "Found %d events in %s\n\n", len(events), formatElapsed(elapsed))
+		printRangeQueryResult(result)
 
-		output, err := json.MarshalIndent(events, "", "  ")
+		output, err := json.MarshalIndent(result.Events, "", "  ")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to marshal events: %v\n", err)
 			os.Exit(1)
@@ -237,6 +244,37 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 	fmt.Println(string(output))
 }
 
+// printRangeQueryResult displays query statistics for unfiltered range queries
+func printRangeQueryResult(result *query.Result) {
+	fmt.Fprintf(os.Stderr, "\n=== Range Query Results ===\n")
+	fmt.Fprintf(os.Stderr, "  Ledger range:      %d ledgers\n", result.LedgerRange)
+	fmt.Fprintf(os.Stderr, "  Events scanned:    %d\n", result.EventsScanned)
+	fmt.Fprintf(os.Stderr, "  Events returned:   %d\n", result.EventsReturned)
+
+	fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
+	fmt.Fprintf(os.Stderr, "  Event fetch:       %s (total)\n", formatDuration(result.EventFetchTime))
+	fmt.Fprintf(os.Stderr, "    - Disk read:     %s\n", formatDuration(result.DiskReadTime))
+	fmt.Fprintf(os.Stderr, "    - Unmarshal:     %s\n", formatDuration(result.UnmarshalTime))
+	fmt.Fprintf(os.Stderr, "  Total time:        %s\n", formatDuration(result.TotalTime))
+
+	// Detailed fetch breakdown as percentages
+	if result.EventFetchTime > 0 {
+		diskPct := float64(result.DiskReadTime) / float64(result.EventFetchTime) * 100
+		unmarshalPct := float64(result.UnmarshalTime) / float64(result.EventFetchTime) * 100
+		otherPct := 100 - diskPct - unmarshalPct
+		fmt.Fprintf(os.Stderr, "  Fetch breakdown:   disk=%.1f%%, unmarshal=%.1f%%, other=%.1f%%\n",
+			diskPct, unmarshalPct, otherPct)
+	}
+
+	// Throughput stats
+	if result.TotalTime > 0 && result.EventsScanned > 0 {
+		eventsPerSec := float64(result.EventsScanned) / result.TotalTime.Seconds()
+		fmt.Fprintf(os.Stderr, "  Throughput:        %.0f events/sec\n", eventsPerSec)
+	}
+
+	fmt.Fprintf(os.Stderr, "\n")
+}
+
 // printQueryResult displays query statistics to stderr
 func printQueryResult(result *query.Result) {
 	fmt.Fprintf(os.Stderr, "\n=== Bitmap Query Results ===\n")
@@ -254,13 +292,32 @@ func printQueryResult(result *query.Result) {
 
 	fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
 	fmt.Fprintf(os.Stderr, "  Index lookup:      %s\n", formatDuration(result.IndexLookupTime))
-	fmt.Fprintf(os.Stderr, "  Event fetch:       %s (iterate + filter)\n", formatDuration(result.EventFetchTime))
+	fmt.Fprintf(os.Stderr, "  Event fetch:       %s (total)\n", formatDuration(result.EventFetchTime))
+	fmt.Fprintf(os.Stderr, "    - Disk read:     %s\n", formatDuration(result.DiskReadTime))
+	fmt.Fprintf(os.Stderr, "    - Unmarshal:     %s\n", formatDuration(result.UnmarshalTime))
+	fmt.Fprintf(os.Stderr, "    - Filter:        %s\n", formatDuration(result.FilterTime))
 	fmt.Fprintf(os.Stderr, "  Total time:        %s\n", formatDuration(result.TotalTime))
 
 	if result.TotalTime > 0 {
 		indexPct := float64(result.IndexLookupTime) / float64(result.TotalTime) * 100
 		fetchPct := float64(result.EventFetchTime) / float64(result.TotalTime) * 100
 		fmt.Fprintf(os.Stderr, "  Time distribution: index=%.1f%%, fetch=%.1f%%\n", indexPct, fetchPct)
+	}
+
+	// Detailed fetch breakdown as percentages
+	if result.EventFetchTime > 0 {
+		diskPct := float64(result.DiskReadTime) / float64(result.EventFetchTime) * 100
+		unmarshalPct := float64(result.UnmarshalTime) / float64(result.EventFetchTime) * 100
+		filterPct := float64(result.FilterTime) / float64(result.EventFetchTime) * 100
+		otherPct := 100 - diskPct - unmarshalPct - filterPct
+		fmt.Fprintf(os.Stderr, "  Fetch breakdown:   disk=%.1f%%, unmarshal=%.1f%%, filter=%.1f%%, other=%.1f%%\n",
+			diskPct, unmarshalPct, filterPct, otherPct)
+	}
+
+	// Throughput stats
+	if result.TotalTime > 0 && result.EventsScanned > 0 {
+		eventsPerSec := float64(result.EventsScanned) / result.TotalTime.Seconds()
+		fmt.Fprintf(os.Stderr, "  Throughput:        %.0f events/sec\n", eventsPerSec)
 	}
 
 	fmt.Fprintf(os.Stderr, "\n")

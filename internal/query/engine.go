@@ -18,6 +18,9 @@ type EventReader interface {
 	// GetEventsInLedger retrieves all events in a specific ledger.
 	GetEventsInLedger(ledger uint32) ([]*Event, error)
 
+	// GetEventsInLedgerWithTiming retrieves all events in a ledger with detailed timing.
+	GetEventsInLedgerWithTiming(ledger uint32) (*FetchResult, error)
+
 	// GetLedgerRange returns the min and max ledger sequences in the store.
 	GetLedgerRange() (min, max uint32, err error)
 }
@@ -92,15 +95,20 @@ func (e *Engine) Query(filter *Filter, startLedger, endLedger uint32, opts *Opti
 		}
 
 		ledger := iter.Next()
-		events, err := e.eventReader.GetEventsInLedger(ledger)
+		fetchResult, err := e.eventReader.GetEventsInLedgerWithTiming(ledger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch events from ledger %d: %w", ledger, err)
 		}
 
-		result.EventsScanned += int64(len(events))
+		// Aggregate timing from this ledger
+		result.DiskReadTime += fetchResult.Timing.DiskReadTime
+		result.UnmarshalTime += fetchResult.Timing.UnmarshalTime
+
+		result.EventsScanned += int64(len(fetchResult.Events))
 
 		// Post-filter events
-		for _, event := range events {
+		filterStart := time.Now()
+		for _, event := range fetchResult.Events {
 			if limit > 0 && len(result.Events) >= limit {
 				break
 			}
@@ -109,6 +117,7 @@ func (e *Engine) Query(filter *Filter, startLedger, endLedger uint32, opts *Opti
 				result.Events = append(result.Events, event)
 			}
 		}
+		result.FilterTime += time.Since(filterStart)
 	}
 
 	result.EventFetchTime = time.Since(fetchStart)

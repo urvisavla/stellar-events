@@ -48,12 +48,18 @@ type EventStore interface {
 	// GetEventsByLedgerRange retrieves all events within a ledger range.
 	GetEventsByLedgerRange(startLedger, endLedger uint32) ([]*ContractEvent, error)
 
+	// GetEventsInRangeWithTiming retrieves events in a range with detailed timing.
+	GetEventsInRangeWithTiming(startLedger, endLedger uint32, limit int) (*query.RangeResult, error)
+
 	// =========================================================================
 	// Read Operations - For Query Engine
 	// =========================================================================
 
 	// GetEventsInLedger retrieves all events in a ledger (for query.EventReader).
 	GetEventsInLedger(ledger uint32) ([]*query.Event, error)
+
+	// GetEventsInLedgerWithTiming retrieves all events in a ledger with detailed timing.
+	GetEventsInLedgerWithTiming(ledger uint32) (*query.FetchResult, error)
 
 	// GetLedgerRange returns the min and max ledger sequences in the store.
 	GetLedgerRange() (min, max uint32, err error)
@@ -98,6 +104,9 @@ type EventStore interface {
 type EventReader interface {
 	// GetEventsInLedger retrieves all events in a specific ledger.
 	GetEventsInLedger(ledger uint32) ([]*query.Event, error)
+
+	// GetEventsInLedgerWithTiming retrieves all events in a ledger with detailed timing.
+	GetEventsInLedgerWithTiming(ledger uint32) (*query.FetchResult, error)
 
 	// GetLedgerRange returns the min and max ledger sequences in the store.
 	GetLedgerRange() (min, max uint32, err error)
