@@ -18,6 +18,12 @@ network = "mainnet"
 # Path to RocksDB database directory
 db_path = "./rocksdb/events"
 
+# Event storage format: "xdr" (default) or "binary" (faster queries)
+# - xdr: Store raw XDR bytes (smaller, but requires XDR parsing on query)
+# - binary: Store pre-decoded fields (larger ~10%, but ~10-15x faster queries)
+# Note: Must reingest data when changing this option
+event_format = "xdr"
+
 # --- Write Performance ---
 # Memtable size in MB (larger = better write throughput, more memory)
 write_buffer_size_mb = 256

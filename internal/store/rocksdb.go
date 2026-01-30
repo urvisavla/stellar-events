@@ -168,11 +168,12 @@ func parseRawXDRToEvent(rawXDR []byte, ledger uint32, tx, op, eventIdx uint16) (
 
 // RocksDBEventStore manages storing events in RocksDB
 type RocksDBEventStore struct {
-	db      *grocksdb.DB
-	dbPath  string // Store path for filesystem-based stats
-	wo      *grocksdb.WriteOptions
-	ro      *grocksdb.ReadOptions
-	indexes *IndexConfig
+	db          *grocksdb.DB
+	dbPath      string // Store path for filesystem-based stats
+	wo          *grocksdb.WriteOptions
+	ro          *grocksdb.ReadOptions
+	indexes     *IndexConfig
+	eventFormat string // "xdr" or "binary"
 
 	// Column family handles (managed by DB, don't destroy manually)
 	cfHandles []*grocksdb.ColumnFamilyHandle
@@ -287,22 +288,36 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 	}
 
 	return &RocksDBEventStore{
-		db:         db,
-		dbPath:     dbPath,
-		wo:         wo,
-		ro:         grocksdb.NewDefaultReadOptions(),
-		indexes:    indexes,
-		cfHandles:  cfHandles,
-		cfDefault:  cfHandles[0],
-		cfEvents:   cfHandles[1],
-		cfUnique:   cfHandles[2],
-		cfBitmap:   cfHandles[3],
-		indexStore: indexStore,
-		baseOpts:   baseOpts,
-		cfOpts:     cfOpts,
-		bbtoList:   bbtoList,
-		mergeOp:    mergeOp,
+		db:          db,
+		dbPath:      dbPath,
+		wo:          wo,
+		ro:          grocksdb.NewDefaultReadOptions(),
+		indexes:     indexes,
+		eventFormat: "xdr", // Default to XDR format
+		cfHandles:   cfHandles,
+		cfDefault:   cfHandles[0],
+		cfEvents:    cfHandles[1],
+		cfUnique:    cfHandles[2],
+		cfBitmap:    cfHandles[3],
+		indexStore:  indexStore,
+		baseOpts:    baseOpts,
+		cfOpts:      cfOpts,
+		bbtoList:    bbtoList,
+		mergeOp:     mergeOp,
 	}, nil
+}
+
+// SetEventFormat sets the event storage format ("xdr" or "binary").
+// Must be called before storing events.
+func (es *RocksDBEventStore) SetEventFormat(format string) {
+	if format == "binary" || format == "xdr" {
+		es.eventFormat = format
+	}
+}
+
+// GetEventFormat returns the current event storage format.
+func (es *RocksDBEventStore) GetEventFormat() string {
+	return es.eventFormat
 }
 
 // applyRocksDBOptions applies common RocksDB options
@@ -411,8 +426,16 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 
 	for _, event := range events {
 		key := eventKey(event)
-		batch.PutCF(es.cfEvents, key, event.RawXDR)
-		totalBytes += int64(len(event.RawXDR))
+
+		// Encode event based on configured format
+		var value []byte
+		if es.eventFormat == "binary" {
+			value = EncodeBinaryEvent(event, event.EventType, event.DataBytes)
+		} else {
+			value = event.RawXDR
+		}
+		batch.PutCF(es.cfEvents, key, value)
+		totalBytes += int64(len(value))
 
 		// Update bitmap indexes (fast, in-memory operation)
 		if bitmapIdx != nil {
@@ -621,12 +644,18 @@ func (es *RocksDBEventStore) GetEventsInRangeWithTiming(startLedger, endLedger u
 
 		// Time value access (disk read)
 		diskStart = time.Now()
-		rawXDR := it.Value().Data()
+		valueData := it.Value().Data()
 		result.Timing.DiskReadTime += time.Since(diskStart)
 
-		// Time unmarshalling
+		// Time unmarshalling/decoding
 		unmarshalStart := time.Now()
-		event, err := parseRawXDRToQueryEvent(rawXDR, keyLedger, tx, op, eventIdx)
+		var event *query.Event
+		var err error
+		if es.eventFormat == "binary" {
+			event, err = DecodeBinaryToQueryEvent(valueData, keyLedger, tx, op, eventIdx)
+		} else {
+			event, err = parseRawXDRToQueryEvent(valueData, keyLedger, tx, op, eventIdx)
+		}
 		result.Timing.UnmarshalTime += time.Since(unmarshalStart)
 
 		result.EventsScanned++
@@ -1449,7 +1478,15 @@ func (es *RocksDBEventStore) GetEventsInLedger(ledger uint32) ([]*query.Event, e
 		}
 
 		_, tx, op, eventIdx := parseEventKey(key)
-		event, err := parseRawXDRToQueryEvent(it.Value().Data(), ledger, tx, op, eventIdx)
+		valueData := it.Value().Data()
+
+		var event *query.Event
+		var err error
+		if es.eventFormat == "binary" {
+			event, err = DecodeBinaryToQueryEvent(valueData, ledger, tx, op, eventIdx)
+		} else {
+			event, err = parseRawXDRToQueryEvent(valueData, ledger, tx, op, eventIdx)
+		}
 		if err != nil {
 			continue
 		}
@@ -1498,12 +1535,18 @@ func (es *RocksDBEventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.
 
 		// Time value access (disk read)
 		diskStart = time.Now()
-		rawXDR := it.Value().Data()
+		valueData := it.Value().Data()
 		result.Timing.DiskReadTime += time.Since(diskStart)
 
-		// Time unmarshalling
+		// Time unmarshalling/decoding
 		unmarshalStart := time.Now()
-		event, err := parseRawXDRToQueryEvent(rawXDR, ledger, tx, op, eventIdx)
+		var event *query.Event
+		var err error
+		if es.eventFormat == "binary" {
+			event, err = DecodeBinaryToQueryEvent(valueData, ledger, tx, op, eventIdx)
+		} else {
+			event, err = parseRawXDRToQueryEvent(valueData, ledger, tx, op, eventIdx)
+		}
 		result.Timing.UnmarshalTime += time.Since(unmarshalStart)
 
 		if err != nil {

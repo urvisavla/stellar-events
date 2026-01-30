@@ -89,9 +89,10 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 				return nil, fmt.Errorf("failed to marshal event XDR: %w", err)
 			}
 
-			// Extract contract ID and topics for indexing (avoids re-parsing later)
+			// Extract contract ID, topics, type, and data for indexing and binary storage
 			var contractID []byte
 			var topics [][]byte
+			var dataBytes []byte
 			if event.Event.ContractId != nil {
 				if fastMode {
 					contractID = event.Event.ContractId[:]
@@ -106,6 +107,7 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 					topicBytes, _ := topic.MarshalBinary()
 					topics = append(topics, topicBytes)
 				}
+				dataBytes, _ = body.Data.MarshalBinary()
 			}
 
 			events = append(events, &store.IngestEvent{
@@ -117,6 +119,8 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 				ContractID:       contractID,
 				Topics:           topics,
 				TxHash:           txHash,
+				EventType:        int(event.Event.Type),
+				DataBytes:        dataBytes,
 			})
 		}
 
@@ -133,9 +137,10 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 					return nil, fmt.Errorf("failed to marshal event XDR: %w", err)
 				}
 
-				// Extract contract ID and topics for indexing (avoids re-parsing later)
+				// Extract contract ID, topics, type, and data for indexing and binary storage
 				var contractID []byte
 				var topics [][]byte
+				var dataBytes []byte
 				if event.ContractId != nil {
 					if fastMode {
 						contractID = event.ContractId[:]
@@ -150,6 +155,7 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 						topicBytes, _ := topic.MarshalBinary()
 						topics = append(topics, topicBytes)
 					}
+					dataBytes, _ = body.Data.MarshalBinary()
 				}
 
 				events = append(events, &store.IngestEvent{
@@ -161,6 +167,8 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 					ContractID:       contractID,
 					Topics:           topics,
 					TxHash:           txHash,
+					EventType:        int(event.Type),
+					DataBytes:        dataBytes,
 				})
 			}
 		}

@@ -18,11 +18,21 @@ import (
 
 // openEventStore opens the event store with config options
 func openEventStore(cfg *config.Config) (*store.RocksDBEventStore, error) {
-	return store.NewEventStoreWithOptions(
+	es, err := store.NewEventStoreWithOptions(
 		cfg.Storage.DBPath,
 		configToRocksDBOptions(&cfg.Storage),
 		configToIndexOptions(&cfg.Indexes),
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set event format if configured
+	if cfg.Storage.EventFormat != "" {
+		es.SetEventFormat(cfg.Storage.EventFormat)
+	}
+
+	return es, nil
 }
 
 // configToRocksDBOptions converts config.StorageConfig to store.RocksDBOptions

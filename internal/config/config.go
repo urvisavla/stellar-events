@@ -44,6 +44,9 @@ type SourceConfig struct {
 type StorageConfig struct {
 	DBPath string `toml:"db_path"` // Path to RocksDB database directory
 
+	// Event storage format: "xdr" (default) or "binary" (faster queries)
+	EventFormat string `toml:"event_format"`
+
 	// Write performance
 	WriteBufferSizeMB           int `toml:"write_buffer_size_mb"`             // Memtable size (default: 64)
 	MaxWriteBufferNumber        int `toml:"max_write_buffer_number"`          // Number of memtables (default: 2)
@@ -128,7 +131,8 @@ func DefaultConfig() *Config {
 			Network:   "mainnet",
 		},
 		Storage: StorageConfig{
-			DBPath: "./events.db",
+			DBPath:      "./events.db",
+			EventFormat: "xdr", // "xdr" or "binary"
 			// Write performance
 			WriteBufferSizeMB:           64,
 			MaxWriteBufferNumber:        2,
@@ -207,6 +211,11 @@ func (c *Config) Validate() error {
 
 	if c.Source.Network == "" {
 		return fmt.Errorf("source.network is required")
+	}
+
+	// Validate event format
+	if c.Storage.EventFormat != "" && c.Storage.EventFormat != "xdr" && c.Storage.EventFormat != "binary" {
+		return fmt.Errorf("storage.event_format must be 'xdr' or 'binary', got '%s'", c.Storage.EventFormat)
 	}
 
 	return nil

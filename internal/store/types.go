@@ -9,7 +9,7 @@ import "time"
 
 // IngestEvent represents an event captured during ingestion.
 // Used for fast ingestion - no JSON serialization overhead.
-// Pre-extracted fields avoid re-parsing XDR during indexing.
+// Pre-extracted fields avoid re-parsing XDR during indexing and querying.
 type IngestEvent struct {
 	LedgerSequence   uint32
 	TransactionIndex uint16
@@ -21,6 +21,10 @@ type IngestEvent struct {
 	ContractID []byte   // 32 bytes if present, nil otherwise
 	Topics     [][]byte // Pre-marshaled topic XDR bytes
 	TxHash     []byte   // 32 bytes - transaction hash
+
+	// Pre-extracted fields for binary format storage (avoids XDR parsing at query time)
+	EventType int    // 0=contract, 1=system, 2=diagnostic
+	DataBytes []byte // Pre-marshaled SCVal data bytes
 }
 
 // StoreOptions configures what indexes to update when storing events.
