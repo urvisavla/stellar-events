@@ -51,54 +51,6 @@ type ContractEvent struct {
 }
 
 // =============================================================================
-// Query Types
-// =============================================================================
-
-// QueryFilter defines a filter for bitmap-accelerated queries.
-type QueryFilter struct {
-	ContractID []byte // Filter by contract ID (32 bytes)
-	Topic0     []byte // Filter by topic at position 0
-	Topic1     []byte // Filter by topic at position 1
-	Topic2     []byte // Filter by topic at position 2
-	Topic3     []byte // Filter by topic at position 3
-}
-
-// QueryResult holds the result of a bitmap-accelerated query.
-type QueryResult struct {
-	Events          []*ContractEvent
-	MatchingLedgers uint64 // Number of ledgers that matched the filter
-	EventsScanned   int64  // Number of events scanned
-	EventsReturned  int64  // Number of events returned
-
-	// Timing breakdown
-	BitmapLookupTime time.Duration // Time to query bitmap index
-	EventFetchTime   time.Duration // Time to fetch events from matching ledgers
-	FilterTime       time.Duration // Time spent filtering events
-	TotalTime        time.Duration // Total query time
-
-	// Additional stats
-	LedgerRange        uint32   // Number of ledgers in query range
-	SegmentsQueried    int      // Number of bitmap segments queried
-	MatchingLedgerSeqs []uint32 // Actual ledger sequences that matched
-}
-
-// HierarchicalQueryResult holds the result of a hierarchical bitmap query.
-type HierarchicalQueryResult struct {
-	Events []*ContractEvent
-
-	// Timing breakdown
-	L1LookupTime   time.Duration // Level 1: find matching ledgers
-	L2LookupTime   time.Duration // Level 2: find matching events per ledger
-	EventFetchTime time.Duration // Fetch events by exact keys
-	TotalTime      time.Duration
-
-	// Stats
-	MatchingLedgers int
-	MatchingEvents  int
-	EventsFetched   int
-}
-
-// =============================================================================
 // Statistics Types
 // =============================================================================
 

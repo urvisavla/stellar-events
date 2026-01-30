@@ -4,24 +4,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/RoaringBitmap/roaring"
-
 	"github.com/urvisavla/stellar-events/internal/index"
 )
 
 // =============================================================================
 // Interfaces (dependencies injected into Engine)
 // =============================================================================
-
-// IndexReader provides indexed lookups for events.
-// This is a subset of index.Store for read operations.
-type IndexReader interface {
-	// QueryLedgers returns a bitmap of ledgers matching the filter criteria.
-	QueryLedgers(contractID []byte, topics [][]byte, startLedger, endLedger uint32) (*roaring.Bitmap, error)
-
-	// QueryEvents returns precise event keys matching the filter criteria.
-	QueryEvents(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int) ([]index.EventKey, int, error)
-}
 
 // EventReader provides raw event retrieval.
 // Implementations can be backed by RocksDB, S3, PostgreSQL, etc.
@@ -43,12 +31,12 @@ type EventReader interface {
 // Engine orchestrates index lookups and event fetches.
 // It is completely storage-agnostic.
 type Engine struct {
-	indexReader IndexReader
+	indexReader index.IndexReader
 	eventReader EventReader
 }
 
 // NewEngine creates a new query engine with the given readers.
-func NewEngine(indexReader IndexReader, eventReader EventReader) *Engine {
+func NewEngine(indexReader index.IndexReader, eventReader EventReader) *Engine {
 	return &Engine{
 		indexReader: indexReader,
 		eventReader: eventReader,

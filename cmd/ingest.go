@@ -80,6 +80,11 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	}
 	defer eventStore.Close()
 
+	// Start bitmap writer goroutine for lock-free indexing (if bitmap indexes enabled)
+	if cfg.Ingestion.BitmapIndexes || cfg.Ingestion.L2Indexes {
+		eventStore.StartBitmapWriter()
+	}
+
 	networkPassphrase := cfg.GetNetworkPassphrase()
 
 	// Config-only parallelism settings (with safe defaults)

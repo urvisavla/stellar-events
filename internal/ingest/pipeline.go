@@ -207,6 +207,9 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 	var ledgersProcessed, totalEvents int
 	aggStats := NewLedgerStats()
 
+	// Time-based progress tracking
+	lastProgressTime := time.Now()
+
 	// Event batch for writing
 	var eventBatch []*store.IngestEvent
 	var batchRawBytes int64
@@ -291,9 +294,12 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 				}
 			}
 
-			// Progress callback
-			if p.onProgress != nil && ledgersProcessed%10000 == 0 {
+			// Progress callback - time-based or every 1000 ledgers
+			shouldReportProgress := ledgersProcessed%1000 == 0 ||
+				time.Since(lastProgressTime) > 5*time.Second
+			if p.onProgress != nil && shouldReportProgress {
 				p.onProgress(nextSeq-1, ledgersProcessed, totalEvents, aggStats)
+				lastProgressTime = time.Now()
 			}
 		}
 	}

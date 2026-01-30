@@ -24,26 +24,71 @@ type SegmentLoader interface {
 }
 
 // =============================================================================
+// Single-Writer Update Types
+// =============================================================================
+
+// UpdateType identifies the type of bitmap update
+type UpdateType byte
+
+const (
+	UpdateL1Contract UpdateType = iota
+	UpdateL1Topic0
+	UpdateL1Topic1
+	UpdateL1Topic2
+	UpdateL1Topic3
+	UpdateL2Contract
+	UpdateL2Topic0
+	UpdateL2Topic1
+	UpdateL2Topic2
+	UpdateL2Topic3
+)
+
+// BitmapUpdate represents a single bitmap update request
+type BitmapUpdate struct {
+	Type       UpdateType
+	KeyValue   []byte
+	LedgerSeq  uint32
+	EventIndex uint32 // Only for L2 updates (encoded tx:op:event)
+}
+
+// =============================================================================
 // Bitmap Index (Pure In-Memory)
 // =============================================================================
 
 // BitmapIndex manages segmented roaring bitmap indexes in memory.
 // It provides Add operations for building indexes and Query operations
 // that combine in-memory hot segments with persisted segments via SegmentLoader.
+//
+// Uses a single-writer goroutine pattern for lock-free updates during ingestion.
+// All Add* methods send updates through a channel to the writer goroutine,
+// which owns all bitmap data structures and requires no locks for writes.
 type BitmapIndex struct {
 	// Level 1: Hot segment cache - maps "prefix:keyHash:segmentID" to bitmap of ledgers
+	// Owned by writer goroutine during ingestion (no lock needed for writes)
 	hotSegments   map[string]*roaring.Bitmap
-	hotSegmentsMu sync.RWMutex
+	hotSegmentsMu sync.RWMutex // Only needed for reads/flush
 
 	// Level 2: Hot cache - maps "L2prefix:keyHash:ledger" to bitmap of event indices
+	// Owned by writer goroutine during ingestion (no lock needed for writes)
 	hotL2Segments   map[string]*roaring.Bitmap
-	hotL2SegmentsMu sync.RWMutex
+	hotL2SegmentsMu sync.RWMutex // Only needed for reads/flush
 
 	// Current hot segment ID (the one being actively written)
 	currentSegmentID uint32
 
 	// Segment loader for queries (optional, can be nil for write-only mode)
 	loader SegmentLoader
+
+	// Single-writer channel pattern for lock-free updates
+	updateCh chan *BitmapUpdate
+	doneCh   chan struct{}
+	wg       sync.WaitGroup
+	started  bool
+
+	// Flush coordination: allows pausing writer for safe bitmap serialization
+	drainMu   sync.Mutex    // Prevents concurrent drains
+	drainReq  chan struct{} // Signal to request drain/resume
+	drainResp chan struct{} // Signal that writer has paused
 }
 
 // NewBitmapIndex creates a new in-memory bitmap index.
@@ -59,6 +104,163 @@ func NewBitmapIndex(loader SegmentLoader) *BitmapIndex {
 // SetLoader sets the segment loader for query operations.
 func (bi *BitmapIndex) SetLoader(loader SegmentLoader) {
 	bi.loader = loader
+}
+
+// =============================================================================
+// Single-Writer Lifecycle
+// =============================================================================
+
+// Start begins the single-writer goroutine for lock-free updates.
+// Must be called before using Add* methods during bulk ingestion.
+func (bi *BitmapIndex) Start() {
+	if bi.started {
+		return
+	}
+	bi.updateCh = make(chan *BitmapUpdate, 10000) // Buffered for throughput
+	bi.doneCh = make(chan struct{})
+	bi.drainReq = make(chan struct{})
+	bi.drainResp = make(chan struct{})
+	bi.started = true
+	bi.wg.Add(1)
+	go bi.writer()
+}
+
+// Stop gracefully shuts down the writer goroutine.
+// Waits for all pending updates to be processed.
+func (bi *BitmapIndex) Stop() {
+	if !bi.started {
+		return
+	}
+	close(bi.updateCh)
+	bi.wg.Wait()
+	close(bi.doneCh)
+	bi.started = false
+}
+
+// IsStarted returns whether the writer goroutine is running.
+func (bi *BitmapIndex) IsStarted() bool {
+	return bi.started
+}
+
+// writer is the single goroutine that owns all bitmap data during ingestion.
+// It processes updates without any locks since it's the sole writer.
+// Supports pausing via drain requests for safe bitmap serialization.
+func (bi *BitmapIndex) writer() {
+	defer bi.wg.Done()
+	for {
+		select {
+		case update, ok := <-bi.updateCh:
+			if !ok {
+				return // Channel closed, exit
+			}
+			bi.applyUpdate(update)
+		case <-bi.drainReq:
+			// Drain all pending updates from the channel
+			draining := true
+			for draining {
+				select {
+				case update, ok := <-bi.updateCh:
+					if !ok {
+						// Channel closed during drain
+						bi.drainResp <- struct{}{}
+						return
+					}
+					bi.applyUpdate(update)
+				default:
+					// No more pending updates
+					draining = false
+				}
+			}
+			// Signal that we're drained and paused
+			bi.drainResp <- struct{}{}
+			// Wait for resume signal
+			<-bi.drainReq
+		}
+	}
+}
+
+// Drain pauses the writer goroutine after processing all pending updates.
+// This gives the caller exclusive access to bitmap data for safe serialization.
+// Must be paired with Resume() to continue processing.
+// Safe to call when writer is not started (no-op).
+func (bi *BitmapIndex) Drain() {
+	if !bi.started {
+		return
+	}
+	bi.drainMu.Lock() // Prevent concurrent drains
+	bi.drainReq <- struct{}{}
+	<-bi.drainResp // Wait for writer to pause
+	// Writer is now paused, caller has exclusive access to bitmaps
+}
+
+// Resume resumes the writer goroutine after a Drain().
+// Must be called after Drain() to allow the writer to continue processing updates.
+// Safe to call when writer is not started (no-op).
+func (bi *BitmapIndex) Resume() {
+	if !bi.started {
+		return
+	}
+	bi.drainReq <- struct{}{} // Signal resume
+	bi.drainMu.Unlock()
+}
+
+// applyUpdate applies a single update without locks (called only from writer goroutine).
+func (bi *BitmapIndex) applyUpdate(u *BitmapUpdate) {
+	switch u.Type {
+	case UpdateL1Contract:
+		bi.addToIndexInternal(PrefixContractIndex, u.KeyValue, u.LedgerSeq)
+	case UpdateL1Topic0:
+		bi.addToIndexInternal(PrefixTopic0Index, u.KeyValue, u.LedgerSeq)
+	case UpdateL1Topic1:
+		bi.addToIndexInternal(PrefixTopic1Index, u.KeyValue, u.LedgerSeq)
+	case UpdateL1Topic2:
+		bi.addToIndexInternal(PrefixTopic2Index, u.KeyValue, u.LedgerSeq)
+	case UpdateL1Topic3:
+		bi.addToIndexInternal(PrefixTopic3Index, u.KeyValue, u.LedgerSeq)
+	case UpdateL2Contract:
+		bi.addToL2IndexInternal(PrefixContractL2, u.KeyValue, u.LedgerSeq, u.EventIndex)
+	case UpdateL2Topic0:
+		bi.addToL2IndexInternal(PrefixTopic0L2, u.KeyValue, u.LedgerSeq, u.EventIndex)
+	case UpdateL2Topic1:
+		bi.addToL2IndexInternal(PrefixTopic1L2, u.KeyValue, u.LedgerSeq, u.EventIndex)
+	case UpdateL2Topic2:
+		bi.addToL2IndexInternal(PrefixTopic2L2, u.KeyValue, u.LedgerSeq, u.EventIndex)
+	case UpdateL2Topic3:
+		bi.addToL2IndexInternal(PrefixTopic3L2, u.KeyValue, u.LedgerSeq, u.EventIndex)
+	}
+}
+
+// addToIndexInternal adds to L1 index without locks (for writer goroutine).
+func (bi *BitmapIndex) addToIndexInternal(prefix byte, keyValue []byte, ledgerSeq uint32) {
+	segmentID := SegmentID(ledgerSeq)
+	localLedger := ledgerSeq % SegmentSize
+
+	cacheKey := makeL1CacheKey(prefix, keyValue, segmentID)
+
+	bitmap, exists := bi.hotSegments[cacheKey]
+	if !exists {
+		bitmap = roaring.New()
+		bi.hotSegments[cacheKey] = bitmap
+	}
+
+	bitmap.Add(localLedger)
+
+	if segmentID > bi.currentSegmentID {
+		bi.currentSegmentID = segmentID
+	}
+}
+
+// addToL2IndexInternal adds to L2 index without locks (for writer goroutine).
+func (bi *BitmapIndex) addToL2IndexInternal(prefix byte, keyValue []byte, ledgerSeq uint32, eventIndex uint32) {
+	cacheKey := makeL2CacheKey(prefix, keyValue, ledgerSeq)
+
+	bitmap, exists := bi.hotL2Segments[cacheKey]
+	if !exists {
+		bitmap = roaring.New()
+		bi.hotL2Segments[cacheKey] = bitmap
+	}
+
+	bitmap.Add(eventIndex)
 }
 
 // =============================================================================
@@ -116,7 +318,35 @@ func makeL2CacheKey(prefix byte, keyValue []byte, ledgerSeq uint32) string {
 // =============================================================================
 
 // AddToIndex adds a ledger to the L1 bitmap index for a given key.
+// If the writer goroutine is started, sends through channel (lock-free).
+// Otherwise falls back to direct locking (for backwards compatibility).
 func (bi *BitmapIndex) AddToIndex(prefix byte, keyValue []byte, ledgerSeq uint32) {
+	if bi.started {
+		// Use channel-based update (lock-free)
+		var updateType UpdateType
+		switch prefix {
+		case PrefixContractIndex:
+			updateType = UpdateL1Contract
+		case PrefixTopic0Index:
+			updateType = UpdateL1Topic0
+		case PrefixTopic1Index:
+			updateType = UpdateL1Topic1
+		case PrefixTopic2Index:
+			updateType = UpdateL1Topic2
+		case PrefixTopic3Index:
+			updateType = UpdateL1Topic3
+		default:
+			return // Unknown prefix
+		}
+		bi.updateCh <- &BitmapUpdate{
+			Type:      updateType,
+			KeyValue:  keyValue,
+			LedgerSeq: ledgerSeq,
+		}
+		return
+	}
+
+	// Fallback: direct locking (when writer not started)
 	segmentID := SegmentID(ledgerSeq)
 	localLedger := ledgerSeq % SegmentSize // Offset within segment
 
@@ -159,7 +389,36 @@ func (bi *BitmapIndex) AddTopicIndex(topicPosition int, topicValue []byte, ledge
 
 // AddToL2Index adds an event index to the L2 bitmap for a given key and ledger.
 // eventIndex encodes tx:op:event as a single uint32.
+// If the writer goroutine is started, sends through channel (lock-free).
+// Otherwise falls back to direct locking (for backwards compatibility).
 func (bi *BitmapIndex) AddToL2Index(prefix byte, keyValue []byte, ledgerSeq uint32, eventIndex uint32) {
+	if bi.started {
+		// Use channel-based update (lock-free)
+		var updateType UpdateType
+		switch prefix {
+		case PrefixContractL2:
+			updateType = UpdateL2Contract
+		case PrefixTopic0L2:
+			updateType = UpdateL2Topic0
+		case PrefixTopic1L2:
+			updateType = UpdateL2Topic1
+		case PrefixTopic2L2:
+			updateType = UpdateL2Topic2
+		case PrefixTopic3L2:
+			updateType = UpdateL2Topic3
+		default:
+			return // Unknown prefix
+		}
+		bi.updateCh <- &BitmapUpdate{
+			Type:       updateType,
+			KeyValue:   keyValue,
+			LedgerSeq:  ledgerSeq,
+			EventIndex: eventIndex,
+		}
+		return
+	}
+
+	// Fallback: direct locking (when writer not started)
 	cacheKey := makeL2CacheKey(prefix, keyValue, ledgerSeq)
 
 	bi.hotL2SegmentsMu.Lock()
@@ -398,9 +657,19 @@ type Segment struct {
 // GetDirtyL1Segments returns all hot L1 segments for persistence.
 // Each segment is optimized and serialized to bytes.
 // The caller is responsible for compression.
+// When writer is started, this drains pending updates and pauses the writer
+// to ensure safe access to bitmap data during serialization.
+// NOTE: Use GetAndClearL1Segments() for flush operations to avoid race conditions.
 func (bi *BitmapIndex) GetDirtyL1Segments() ([]Segment, error) {
-	bi.hotSegmentsMu.RLock()
-	defer bi.hotSegmentsMu.RUnlock()
+	// When writer is started, use drain/resume for exclusive access
+	if bi.started {
+		bi.Drain()
+		defer bi.Resume()
+	} else {
+		// Fallback: use locks when writer is not started
+		bi.hotSegmentsMu.RLock()
+		defer bi.hotSegmentsMu.RUnlock()
+	}
 
 	segments := make([]Segment, 0, len(bi.hotSegments))
 	for cacheKey, bitmap := range bi.hotSegments {
@@ -421,10 +690,54 @@ func (bi *BitmapIndex) GetDirtyL1Segments() ([]Segment, error) {
 	return segments, nil
 }
 
+// GetAndClearL1Segments atomically gets and clears all hot L1 segments.
+// This is the preferred method for flush operations as it keeps the writer
+// paused during both get and clear, preventing race conditions.
+func (bi *BitmapIndex) GetAndClearL1Segments() ([]Segment, error) {
+	// When writer is started, use drain/resume for exclusive access
+	if bi.started {
+		bi.Drain()
+		defer bi.Resume()
+	} else {
+		bi.hotSegmentsMu.Lock()
+		defer bi.hotSegmentsMu.Unlock()
+	}
+
+	segments := make([]Segment, 0, len(bi.hotSegments))
+	for cacheKey, bitmap := range bi.hotSegments {
+		bitmap.RunOptimize()
+
+		data, err := bitmap.ToBytes()
+		if err != nil {
+			return nil, err
+		}
+
+		segments = append(segments, Segment{
+			Key:  []byte(cacheKey),
+			Data: data,
+		})
+	}
+
+	// Clear while still holding exclusive access
+	bi.hotSegments = make(map[string]*roaring.Bitmap)
+
+	return segments, nil
+}
+
 // GetDirtyL2Segments returns all hot L2 segments for persistence.
+// When writer is started, this drains pending updates and pauses the writer
+// to ensure safe access to bitmap data during serialization.
+// NOTE: Use GetAndClearL2Segments() for flush operations to avoid race conditions.
 func (bi *BitmapIndex) GetDirtyL2Segments() ([]Segment, error) {
-	bi.hotL2SegmentsMu.RLock()
-	defer bi.hotL2SegmentsMu.RUnlock()
+	// When writer is started, use drain/resume for exclusive access
+	if bi.started {
+		bi.Drain()
+		defer bi.Resume()
+	} else {
+		// Fallback: use locks when writer is not started
+		bi.hotL2SegmentsMu.RLock()
+		defer bi.hotL2SegmentsMu.RUnlock()
+	}
 
 	segments := make([]Segment, 0, len(bi.hotL2Segments))
 	for cacheKey, bitmap := range bi.hotL2Segments {
@@ -440,6 +753,40 @@ func (bi *BitmapIndex) GetDirtyL2Segments() ([]Segment, error) {
 			Data: data,
 		})
 	}
+
+	return segments, nil
+}
+
+// GetAndClearL2Segments atomically gets and clears all hot L2 segments.
+// This is the preferred method for flush operations as it keeps the writer
+// paused during both get and clear, preventing race conditions.
+func (bi *BitmapIndex) GetAndClearL2Segments() ([]Segment, error) {
+	// When writer is started, use drain/resume for exclusive access
+	if bi.started {
+		bi.Drain()
+		defer bi.Resume()
+	} else {
+		bi.hotL2SegmentsMu.Lock()
+		defer bi.hotL2SegmentsMu.Unlock()
+	}
+
+	segments := make([]Segment, 0, len(bi.hotL2Segments))
+	for cacheKey, bitmap := range bi.hotL2Segments {
+		bitmap.RunOptimize()
+
+		data, err := bitmap.ToBytes()
+		if err != nil {
+			return nil, err
+		}
+
+		segments = append(segments, Segment{
+			Key:  []byte(cacheKey),
+			Data: data,
+		})
+	}
+
+	// Clear while still holding exclusive access
+	bi.hotL2Segments = make(map[string]*roaring.Bitmap)
 
 	return segments, nil
 }

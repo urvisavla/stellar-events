@@ -7,6 +7,19 @@ import (
 	"github.com/linxGnu/grocksdb"
 )
 
+// IndexReader provides indexed lookups for events.
+// This interface is implemented by RocksDBStore and used by query.Engine.
+type IndexReader interface {
+	// QueryLedgers returns a bitmap of ledgers matching the filter criteria.
+	QueryLedgers(contractID []byte, topics [][]byte, startLedger, endLedger uint32) (*roaring.Bitmap, error)
+
+	// QueryEvents returns precise event keys matching the filter criteria.
+	QueryEvents(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int) ([]EventKey, int, error)
+}
+
+// Verify RocksDBStore implements IndexReader at compile time
+var _ IndexReader = (*RocksDBStore)(nil)
+
 // =============================================================================
 // RocksDB Index Store
 // =============================================================================
@@ -299,7 +312,7 @@ func (s *RocksDBStore) Flush() error {
 // flushL1Segments writes L1 hot segments to RocksDB.
 // RocksDB handles compression transparently via LZ4.
 func (s *RocksDBStore) flushL1Segments() error {
-	segments, err := s.bitmap.GetDirtyL1Segments()
+	segments, err := s.bitmap.GetAndClearL1Segments()
 	if err != nil {
 		return fmt.Errorf("failed to get dirty L1 segments: %w", err)
 	}
@@ -319,14 +332,13 @@ func (s *RocksDBStore) flushL1Segments() error {
 		return fmt.Errorf("failed to write L1 segments: %w", err)
 	}
 
-	s.bitmap.ClearL1Segments()
 	return nil
 }
 
 // flushL2Segments writes L2 hot segments to RocksDB.
 // RocksDB handles compression transparently via LZ4.
 func (s *RocksDBStore) flushL2Segments() error {
-	segments, err := s.bitmap.GetDirtyL2Segments()
+	segments, err := s.bitmap.GetAndClearL2Segments()
 	if err != nil {
 		return fmt.Errorf("failed to get dirty L2 segments: %w", err)
 	}
@@ -365,7 +377,6 @@ func (s *RocksDBStore) flushL2Segments() error {
 	}
 	batch.Destroy()
 
-	s.bitmap.ClearL2Segments()
 	return nil
 }
 

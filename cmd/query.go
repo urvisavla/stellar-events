@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/urvisavla/stellar-events/internal/config"
-	"github.com/urvisavla/stellar-events/internal/store"
+	"github.com/urvisavla/stellar-events/internal/query"
 )
 
 // =============================================================================
@@ -123,11 +123,6 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 	}
 	defer eventStore.Close()
 
-	var events []*store.ContractEvent
-	var hierarchicalResult *store.HierarchicalQueryResult
-	var queryResult *store.QueryResult
-	startTime := time.Now()
-
 	// Check if any filter is specified
 	hasContract := contractID != ""
 	hasTopic0 := topic0 != ""
@@ -136,164 +131,164 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 	hasTopic3 := topic3 != ""
 	hasAnyFilter := hasContract || hasTopic0 || hasTopic1 || hasTopic2 || hasTopic3
 
-	// Build filter if any filter is specified
-	var filter *store.QueryFilter
-	if hasAnyFilter {
-		filter = &store.QueryFilter{}
-
-		if hasContract {
-			contractBytes, decErr := decodeBase64(contractID)
-			if decErr != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid contract ID: %v\n", decErr)
-				os.Exit(2)
-			}
-			filter.ContractID = contractBytes
-		}
-
-		if hasTopic0 {
-			topicBytes, decErr := decodeBase64(topic0)
-			if decErr != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid topic0: %v\n", decErr)
-				os.Exit(2)
-			}
-			filter.Topic0 = topicBytes
-		}
-
-		if hasTopic1 {
-			topicBytes, decErr := decodeBase64(topic1)
-			if decErr != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid topic1: %v\n", decErr)
-				os.Exit(2)
-			}
-			filter.Topic1 = topicBytes
-		}
-
-		if hasTopic2 {
-			topicBytes, decErr := decodeBase64(topic2)
-			if decErr != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid topic2: %v\n", decErr)
-				os.Exit(2)
-			}
-			filter.Topic2 = topicBytes
-		}
-
-		if hasTopic3 {
-			topicBytes, decErr := decodeBase64(topic3)
-			if decErr != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid topic3: %v\n", decErr)
-				os.Exit(2)
-			}
-			filter.Topic3 = topicBytes
-		}
-	}
-
-	// Query with filter - use hierarchical L1+L2 or L1-only based on skipL2 flag
-	if hasAnyFilter {
-		if skipL2 {
-			// L1-only bitmap query (skip hierarchical)
-			fmt.Fprintf(os.Stderr, "Querying with L1 bitmap index in ledgers %d-%d...\n", startLedger, endLedger)
-			queryResult, err = eventStore.GetEventsWithFilter(filter, startLedger, endLedger, limit)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
-				os.Exit(1)
-			}
-			events = queryResult.Events
-		} else {
-			// Try hierarchical L1+L2 first, with auto-fallback to L1
-			fmt.Fprintf(os.Stderr, "Querying with HIERARCHICAL L1+L2 bitmap in ledgers %d-%d...\n", startLedger, endLedger)
-			hierarchicalResult, err = eventStore.GetEventsWithFilterHierarchical(filter, startLedger, endLedger, limit)
-			if err != nil {
-				// Fallback to L1-only bitmap query
-				fmt.Fprintf(os.Stderr, "Hierarchical query unavailable (%v), falling back to L1 bitmap...\n", err)
-				hierarchicalResult = nil
-
-				fmt.Fprintf(os.Stderr, "Querying with L1 bitmap index in ledgers %d-%d...\n", startLedger, endLedger)
-				queryResult, err = eventStore.GetEventsWithFilter(filter, startLedger, endLedger, limit)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
-					os.Exit(1)
-				}
-				events = queryResult.Events
-			} else {
-				events = hierarchicalResult.Events
-			}
-		}
-	} else {
-		// No filter - scan all events in range
+	// No filter - scan all events in range (use direct store method)
+	if !hasAnyFilter {
+		startTime := time.Now()
 		fmt.Fprintf(os.Stderr, "Querying all events in ledgers %d-%d...\n", startLedger, endLedger)
-		events, err = eventStore.GetEventsByLedgerRange(startLedger, endLedger)
+		events, err := eventStore.GetEventsByLedgerRange(startLedger, endLedger)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 			os.Exit(1)
 		}
+		elapsed := time.Since(startTime)
+
+		// Defensive limit
+		if limit > 0 && len(events) > limit {
+			events = events[:limit]
+		}
+
+		fmt.Fprintf(os.Stderr, "Found %d events in %s\n\n", len(events), formatElapsed(elapsed))
+
+		output, err := json.MarshalIndent(events, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to marshal events: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(output))
+		return
 	}
 
-	elapsed := time.Since(startTime)
+	// Build query filter
+	filter := &query.Filter{}
 
-	// Defensive limit
-	if limit > 0 && len(events) > limit {
-		events = events[:limit]
+	if hasContract {
+		contractBytes, decErr := decodeBase64(contractID)
+		if decErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid contract ID: %v\n", decErr)
+			os.Exit(2)
+		}
+		filter.ContractID = contractBytes
 	}
 
-	// Always show detailed stats
-	if hierarchicalResult != nil {
-		fmt.Fprintf(os.Stderr, "\n=== Hierarchical L1+L2 Query Results ===\n")
-		fmt.Fprintf(os.Stderr, "  Matching ledgers (L1): %d\n", hierarchicalResult.MatchingLedgers)
-		fmt.Fprintf(os.Stderr, "  Matching events (L2):  %d\n", hierarchicalResult.MatchingEvents)
-		fmt.Fprintf(os.Stderr, "  Events fetched:        %d\n", hierarchicalResult.EventsFetched)
-
-		fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
-		fmt.Fprintf(os.Stderr, "  L1 bitmap lookup:  %s\n", formatDuration(hierarchicalResult.L1LookupTime))
-		fmt.Fprintf(os.Stderr, "  L2 bitmap lookup:  %s\n", formatDuration(hierarchicalResult.L2LookupTime))
-		fmt.Fprintf(os.Stderr, "  Event fetch:       %s (MultiGet)\n", formatDuration(hierarchicalResult.EventFetchTime))
-		fmt.Fprintf(os.Stderr, "  Total time:        %s\n", formatDuration(hierarchicalResult.TotalTime))
-
-		if hierarchicalResult.TotalTime > 0 {
-			l1Pct := float64(hierarchicalResult.L1LookupTime) / float64(hierarchicalResult.TotalTime) * 100
-			l2Pct := float64(hierarchicalResult.L2LookupTime) / float64(hierarchicalResult.TotalTime) * 100
-			fetchPct := float64(hierarchicalResult.EventFetchTime) / float64(hierarchicalResult.TotalTime) * 100
-			fmt.Fprintf(os.Stderr, "  Time distribution: L1=%.1f%%, L2=%.1f%%, fetch=%.1f%%\n", l1Pct, l2Pct, fetchPct)
+	if hasTopic0 {
+		topicBytes, decErr := decodeBase64(topic0)
+		if decErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid topic0: %v\n", decErr)
+			os.Exit(2)
 		}
-	} else if queryResult != nil {
-		fmt.Fprintf(os.Stderr, "\n=== L1 Bitmap Query Results ===\n")
-		fmt.Fprintf(os.Stderr, "  Ledger range:      %d ledgers\n", queryResult.LedgerRange)
-		fmt.Fprintf(os.Stderr, "  Segments queried:  %d\n", queryResult.SegmentsQueried)
-		fmt.Fprintf(os.Stderr, "  Matching ledgers:  %d\n", queryResult.MatchingLedgers)
-		fmt.Fprintf(os.Stderr, "  Events scanned:    %d\n", queryResult.EventsScanned)
-		fmt.Fprintf(os.Stderr, "  Events returned:   %d\n", queryResult.EventsReturned)
+		filter.Topic0 = topicBytes
+	}
 
-		if queryResult.LedgerRange > 0 {
-			ledgerSelectivity := float64(queryResult.MatchingLedgers) / float64(queryResult.LedgerRange) * 100
-			fmt.Fprintf(os.Stderr, "  Ledger selectivity: %.4f%% (%.0fx reduction)\n",
-				ledgerSelectivity,
-				float64(queryResult.LedgerRange)/float64(max(queryResult.MatchingLedgers, 1)))
+	if hasTopic1 {
+		topicBytes, decErr := decodeBase64(topic1)
+		if decErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid topic1: %v\n", decErr)
+			os.Exit(2)
 		}
+		filter.Topic1 = topicBytes
+	}
 
-		fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
-		fmt.Fprintf(os.Stderr, "  Bitmap lookup:     %s\n", formatDuration(queryResult.BitmapLookupTime))
-		fmt.Fprintf(os.Stderr, "  Event fetch:       %s (iterate + filter)\n", formatDuration(queryResult.EventFetchTime))
-		fmt.Fprintf(os.Stderr, "  Total time:        %s\n", formatDuration(queryResult.TotalTime))
-
-		if queryResult.TotalTime > 0 {
-			bitmapPct := float64(queryResult.BitmapLookupTime) / float64(queryResult.TotalTime) * 100
-			fetchPct := float64(queryResult.EventFetchTime) / float64(queryResult.TotalTime) * 100
-			fmt.Fprintf(os.Stderr, "  Time distribution: bitmap=%.1f%%, fetch=%.1f%%\n", bitmapPct, fetchPct)
+	if hasTopic2 {
+		topicBytes, decErr := decodeBase64(topic2)
+		if decErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid topic2: %v\n", decErr)
+			os.Exit(2)
 		}
+		filter.Topic2 = topicBytes
+	}
 
-		if queryResult.MatchingLedgers > 0 {
-			avgPerLedger := queryResult.EventFetchTime / time.Duration(queryResult.MatchingLedgers)
-			fmt.Fprintf(os.Stderr, "  Avg fetch/ledger:  %s\n", formatDuration(avgPerLedger))
+	if hasTopic3 {
+		topicBytes, decErr := decodeBase64(topic3)
+		if decErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid topic3: %v\n", decErr)
+			os.Exit(2)
 		}
+		filter.Topic3 = topicBytes
+	}
+
+	// Get the index reader
+	indexReader := eventStore.GetIndexReader()
+	if indexReader == nil {
+		fmt.Fprintf(os.Stderr, "Error: index store not available\n")
+		os.Exit(1)
+	}
+
+	// Create query engine
+	engine := query.NewEngine(indexReader, eventStore)
+
+	// Configure query options
+	opts := &query.Options{
+		Limit:      limit,
+		UseL2Index: !skipL2,
+	}
+
+	// Execute query
+	if skipL2 {
+		fmt.Fprintf(os.Stderr, "Querying with L1 bitmap index in ledgers %d-%d...\n", startLedger, endLedger)
 	} else {
-		fmt.Fprintf(os.Stderr, "Found %d events in %s\n", len(events), formatElapsed(elapsed))
+		fmt.Fprintf(os.Stderr, "Querying with HIERARCHICAL L1+L2 bitmap in ledgers %d-%d...\n", startLedger, endLedger)
 	}
 
-	fmt.Fprintf(os.Stderr, "\n")
+	result, err := engine.Query(filter, startLedger, endLedger, opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
+		os.Exit(1)
+	}
 
-	output, err := json.MarshalIndent(events, "", "  ")
+	// Display results
+	printQueryResult(result, skipL2)
+
+	output, err := json.MarshalIndent(result.Events, "", "  ")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to marshal events: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Println(string(output))
+}
+
+// printQueryResult displays query statistics to stderr
+func printQueryResult(result *query.Result, isL1Only bool) {
+	if isL1Only {
+		fmt.Fprintf(os.Stderr, "\n=== L1 Bitmap Query Results ===\n")
+		fmt.Fprintf(os.Stderr, "  Ledger range:      %d ledgers\n", result.LedgerRange)
+		fmt.Fprintf(os.Stderr, "  Matching ledgers:  %d\n", result.MatchingLedgers)
+		fmt.Fprintf(os.Stderr, "  Events scanned:    %d\n", result.EventsScanned)
+		fmt.Fprintf(os.Stderr, "  Events returned:   %d\n", result.EventsReturned)
+
+		if result.LedgerRange > 0 {
+			ledgerSelectivity := float64(result.MatchingLedgers) / float64(result.LedgerRange) * 100
+			fmt.Fprintf(os.Stderr, "  Ledger selectivity: %.4f%% (%.0fx reduction)\n",
+				ledgerSelectivity,
+				float64(result.LedgerRange)/float64(max(result.MatchingLedgers, 1)))
+		}
+
+		fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
+		fmt.Fprintf(os.Stderr, "  Bitmap lookup:     %s\n", formatDuration(result.L1LookupTime))
+		fmt.Fprintf(os.Stderr, "  Event fetch:       %s (iterate + filter)\n", formatDuration(result.EventFetchTime))
+		fmt.Fprintf(os.Stderr, "  Total time:        %s\n", formatDuration(result.TotalTime))
+
+		if result.TotalTime > 0 {
+			bitmapPct := float64(result.L1LookupTime) / float64(result.TotalTime) * 100
+			fetchPct := float64(result.EventFetchTime) / float64(result.TotalTime) * 100
+			fmt.Fprintf(os.Stderr, "  Time distribution: bitmap=%.1f%%, fetch=%.1f%%\n", bitmapPct, fetchPct)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "\n=== Hierarchical L1+L2 Query Results ===\n")
+		fmt.Fprintf(os.Stderr, "  Matching ledgers (L1): %d\n", result.MatchingLedgers)
+		fmt.Fprintf(os.Stderr, "  Matching events (L2):  %d\n", result.MatchingEvents)
+		fmt.Fprintf(os.Stderr, "  Events returned:       %d\n", result.EventsReturned)
+
+		fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
+		fmt.Fprintf(os.Stderr, "  Index lookup:      %s\n", formatDuration(result.IndexLookupTime))
+		fmt.Fprintf(os.Stderr, "  Event fetch:       %s (MultiGet)\n", formatDuration(result.EventFetchTime))
+		fmt.Fprintf(os.Stderr, "  Total time:        %s\n", formatDuration(result.TotalTime))
+
+		if result.TotalTime > 0 {
+			indexPct := float64(result.IndexLookupTime) / float64(result.TotalTime) * 100
+			fetchPct := float64(result.EventFetchTime) / float64(result.TotalTime) * 100
+			fmt.Fprintf(os.Stderr, "  Time distribution: index=%.1f%%, fetch=%.1f%%\n", indexPct, fetchPct)
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "\n")
 }
