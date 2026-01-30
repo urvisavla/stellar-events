@@ -416,45 +416,17 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 
 		// Update bitmap indexes (fast, in-memory operation)
 		if bitmapIdx != nil {
-			// L1: Index contract ID -> ledger
+			// Index contract ID -> ledger
 			if len(event.ContractID) > 0 {
 				bitmapIdx.AddContractIndex(event.ContractID, event.LedgerSequence)
 			}
 
-			// L1: Index topics -> ledger
+			// Index topics -> ledger
 			for i, topicBytes := range event.Topics {
 				if i > 3 {
 					break // Only index first 4 topics
 				}
 				bitmapIdx.AddTopicIndex(i, topicBytes, event.LedgerSequence)
-			}
-
-			// L2: Index contract ID -> (ledger, event) for hierarchical queries
-			if opts.L2Indexes {
-				if len(event.ContractID) > 0 {
-					bitmapIdx.AddContractL2Index(
-						event.ContractID,
-						event.LedgerSequence,
-						event.TransactionIndex,
-						event.OperationIndex,
-						event.EventIndex,
-					)
-				}
-
-				// L2: Index topics -> (ledger, event)
-				for i, topicBytes := range event.Topics {
-					if i > 3 {
-						break
-					}
-					bitmapIdx.AddTopicL2Index(
-						i,
-						topicBytes,
-						event.LedgerSequence,
-						event.TransactionIndex,
-						event.OperationIndex,
-						event.EventIndex,
-					)
-				}
 			}
 		}
 
@@ -1418,51 +1390,6 @@ func (es *RocksDBEventStore) GetEventsInLedger(ledger uint32) ([]*query.Event, e
 	return events, nil
 }
 
-// GetEventsByKeys retrieves events by their precise keys using batch fetch.
-// Implements the EventReader interface.
-func (es *RocksDBEventStore) GetEventsByKeys(keys []index.EventKey) ([]*query.Event, error) {
-	if len(keys) == 0 {
-		return nil, nil
-	}
-
-	// Build RocksDB keys from EventKey structs
-	// EventKey.EventIndex is encoded as [tx:10bits][op:10bits][event:12bits]
-	rocksKeys := make([][]byte, len(keys))
-	for i, ek := range keys {
-		txIdx, opIdx, evtIdx := index.DecodeEventIndex(ek.EventIndex)
-		rocksKeys[i] = eventKeyFromParts(ek.LedgerSeq, txIdx, opIdx, evtIdx)
-	}
-
-	// Use MultiGet for efficient batch fetching
-	values, err := es.db.MultiGetCF(es.ro, es.cfEvents, rocksKeys...)
-	if err != nil {
-		return nil, fmt.Errorf("MultiGet failed: %w", err)
-	}
-
-	events := make([]*query.Event, 0, len(values))
-	for i, value := range values {
-		if value.Size() == 0 {
-			value.Free()
-			continue
-		}
-
-		key := rocksKeys[i]
-		ledger := binary.BigEndian.Uint32(key[0:4])
-		txIdx := binary.BigEndian.Uint16(key[4:6])
-		opIdx := binary.BigEndian.Uint16(key[6:8])
-		evtIdx := binary.BigEndian.Uint16(key[8:10])
-
-		event, err := parseRawXDRToQueryEvent(value.Data(), ledger, txIdx, opIdx, evtIdx)
-		value.Free()
-		if err != nil {
-			continue
-		}
-		events = append(events, event)
-	}
-
-	return events, nil
-}
-
 // parseRawXDRToQueryEvent converts raw XDR bytes to a query.Event
 func parseRawXDRToQueryEvent(rawXDR []byte, ledger uint32, tx, op, eventIdx uint16) (*query.Event, error) {
 	var xdrEvent xdr.ContractEvent
@@ -1772,7 +1699,7 @@ func (es *RocksDBEventStore) computeStatsForRange(startLedger, endLedger uint32)
 }
 
 // BuildIndexes scans all events and builds indexes based on options (one-time operation)
-// L1 bitmap indexes are always built. L2 and unique indexes are optional.
+// Bitmap indexes are always built. Unique indexes are optional.
 // Uses a collector pattern: workers read/extract in parallel, single goroutine updates bitmaps.
 func (es *RocksDBEventStore) BuildIndexes(workers int, opts *BuildIndexOptions, progressFn func(processed int64)) error {
 	if workers <= 0 {
@@ -1787,7 +1714,7 @@ func (es *RocksDBEventStore) BuildIndexes(workers int, opts *BuildIndexOptions, 
 	}
 
 	// Ensure index store is initialized if we're building bitmap indexes
-	if (opts.BitmapIndexes || opts.L2Indexes) && es.indexStore == nil {
+	if opts.BitmapIndexes && es.indexStore == nil {
 		return fmt.Errorf("index store not initialized - cannot build bitmap indexes")
 	}
 
@@ -1811,7 +1738,7 @@ func (es *RocksDBEventStore) BuildIndexes(workers int, opts *BuildIndexOptions, 
 	var entryCh chan *indexEntry
 	var collectorDone chan error
 
-	if opts.BitmapIndexes || opts.L2Indexes {
+	if opts.BitmapIndexes {
 		entryCh = make(chan *indexEntry, 100000) // buffered channel
 		collectorDone = make(chan error, 1)
 
@@ -1999,23 +1926,13 @@ func (es *RocksDBEventStore) indexCollector(entryCh <-chan *indexEntry, opts *Bu
 		}
 		prevLedger = entry.Ledger
 
-		// L1 bitmap indexes (contract/topic -> ledger)
-		if opts.BitmapIndexes && bitmapIdx != nil {
+		// Bitmap indexes (contract/topic -> ledger)
+		if bitmapIdx != nil {
 			if len(entry.ContractID) > 0 {
 				bitmapIdx.AddContractIndex(entry.ContractID, entry.Ledger)
 			}
 			for i, topic := range entry.Topics {
 				bitmapIdx.AddTopicIndex(i, topic, entry.Ledger)
-			}
-		}
-
-		// L2 bitmap indexes (contract/topic -> ledger:event)
-		if opts.L2Indexes && bitmapIdx != nil {
-			if len(entry.ContractID) > 0 {
-				bitmapIdx.AddContractL2Index(entry.ContractID, entry.Ledger, entry.TxIdx, entry.OpIdx, entry.EventIdx)
-			}
-			for i, topic := range entry.Topics {
-				bitmapIdx.AddTopicL2Index(i, topic, entry.Ledger, entry.TxIdx, entry.OpIdx, entry.EventIdx)
 			}
 		}
 

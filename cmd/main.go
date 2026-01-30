@@ -18,7 +18,6 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  ingest         Ingest events from ledger files to RocksDB\n")
 	fmt.Fprintf(os.Stderr, "  query          Query events from RocksDB\n")
 	fmt.Fprintf(os.Stderr, "  stats          Show database statistics\n")
-	fmt.Fprintf(os.Stderr, "  build-indexes  Rebuild unique indexes from existing events\n")
 	fmt.Fprintf(os.Stderr, "\nConfiguration:\n")
 	fmt.Fprintf(os.Stderr, "  Requires stellar-events.toml or config.toml in current directory\n")
 	fmt.Fprintf(os.Stderr, "  See configs/stellar-events.example.toml for reference\n")
@@ -26,7 +25,6 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  %s ingest --start 1000 --end 2000\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  %s query 55000000 56000000 --contract <base64_id>\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  %s stats\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "  %s build-indexes\n", os.Args[0])
 }
 
 func main() {
@@ -66,8 +64,6 @@ func main() {
 		runQuery(cfg, args)
 	case "stats":
 		runStats(cfg, args)
-	case "build-indexes":
-		runBuildIndexes(cfg, args)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
 		printUsage()

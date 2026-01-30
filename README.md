@@ -190,9 +190,9 @@ Events use a 10-byte binary key: `[ledger:4][tx:2][op:2][event:2]`
 
 ### Bitmap Indexes
 
-Roaring bitmap indexes provide fast range queries:
-- **L1 (Ledger-level)**: Which ledgers contain events for a given contract/topic
-- **L2 (Event-level)**: Which events within a ledger match (optional, for precise lookups)
+Roaring bitmap indexes provide fast range queries by mapping contract IDs and topics to ledger sequences. Query flow:
+1. Bitmap lookup returns matching ledgers (fast intersection)
+2. Events in matching ledgers are scanned and filtered
 
 Segments of 1M ledgers are used to limit write amplification while amortizing overhead.
 

@@ -1,7 +1,6 @@
 package store
 
 import (
-	"github.com/urvisavla/stellar-events/internal/index"
 	"github.com/urvisavla/stellar-events/internal/query"
 )
 
@@ -56,9 +55,6 @@ type EventStore interface {
 	// GetEventsInLedger retrieves all events in a ledger (for query.EventReader).
 	GetEventsInLedger(ledger uint32) ([]*query.Event, error)
 
-	// GetEventsByKeys retrieves events by their precise keys (batch fetch).
-	GetEventsByKeys(keys []index.EventKey) ([]*query.Event, error)
-
 	// GetLedgerRange returns the min and max ledger sequences in the store.
 	GetLedgerRange() (min, max uint32, err error)
 
@@ -102,9 +98,6 @@ type EventStore interface {
 type EventReader interface {
 	// GetEventsInLedger retrieves all events in a specific ledger.
 	GetEventsInLedger(ledger uint32) ([]*query.Event, error)
-
-	// GetEventsByKeys retrieves events by their precise keys (batch fetch).
-	GetEventsByKeys(keys []index.EventKey) ([]*query.Event, error)
 
 	// GetLedgerRange returns the min and max ledger sequences in the store.
 	GetLedgerRange() (min, max uint32, err error)

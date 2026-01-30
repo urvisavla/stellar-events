@@ -1,6 +1,7 @@
 package query
 
 import (
+	"encoding/base64"
 	"fmt"
 	"time"
 
@@ -16,9 +17,6 @@ import (
 type EventReader interface {
 	// GetEventsInLedger retrieves all events in a specific ledger.
 	GetEventsInLedger(ledger uint32) ([]*Event, error)
-
-	// GetEventsByKeys retrieves events by their precise keys (batch fetch).
-	GetEventsByKeys(keys []index.EventKey) ([]*Event, error)
 
 	// GetLedgerRange returns the min and max ledger sequences in the store.
 	GetLedgerRange() (min, max uint32, err error)
@@ -44,7 +42,7 @@ func NewEngine(indexReader index.IndexReader, eventReader EventReader) *Engine {
 }
 
 // Query executes a filtered query.
-// It uses the index to find matching ledgers, then fetches events from those ledgers.
+// It uses the index to find matching ledgers, then fetches and filters events from those ledgers.
 func (e *Engine) Query(filter *Filter, startLedger, endLedger uint32, opts *Options) (*Result, error) {
 	if opts == nil {
 		opts = DefaultOptions()
@@ -54,16 +52,6 @@ func (e *Engine) Query(filter *Filter, startLedger, endLedger uint32, opts *Opti
 		return nil, fmt.Errorf("at least one filter must be specified")
 	}
 
-	// Use hierarchical query if L2 index is available and requested
-	if opts.UseL2Index {
-		return e.queryHierarchical(filter, startLedger, endLedger, opts)
-	}
-
-	return e.queryL1(filter, startLedger, endLedger, opts)
-}
-
-// queryL1 performs a Level 1 query (ledger-level bitmap + post-filter).
-func (e *Engine) queryL1(filter *Filter, startLedger, endLedger uint32, opts *Options) (*Result, error) {
 	totalStart := time.Now()
 	result := &Result{
 		LedgerRange: endLedger - startLedger + 1,
@@ -78,8 +66,7 @@ func (e *Engine) queryL1(filter *Filter, startLedger, endLedger uint32, opts *Op
 	if err != nil {
 		return nil, fmt.Errorf("index query failed: %w", err)
 	}
-	result.L1LookupTime = time.Since(indexStart)
-	result.IndexLookupTime = result.L1LookupTime
+	result.IndexLookupTime = time.Since(indexStart)
 	result.MatchingLedgers = int(matchingLedgers.GetCardinality())
 	result.MatchingLedgerSeqs = matchingLedgers.ToArray()
 
@@ -94,7 +81,7 @@ func (e *Engine) queryL1(filter *Filter, startLedger, endLedger uint32, opts *Op
 		return result, nil
 	}
 
-	// Phase 2: Fetch events from matching ledgers
+	// Phase 2: Fetch events from matching ledgers and post-filter
 	fetchStart := time.Now()
 	limit := opts.Limit
 
@@ -131,72 +118,24 @@ func (e *Engine) queryL1(filter *Filter, startLedger, endLedger uint32, opts *Op
 	return result, nil
 }
 
-// queryHierarchical performs a Level 2 query (precise event keys from index).
-func (e *Engine) queryHierarchical(filter *Filter, startLedger, endLedger uint32, opts *Options) (*Result, error) {
-	totalStart := time.Now()
-	result := &Result{
-		LedgerRange: endLedger - startLedger + 1,
-	}
-
-	// Convert filter to raw parameters
-	topics := filter.TopicFilters()
-
-	// Phase 1: Index lookup - get precise event keys
-	indexStart := time.Now()
-	limit := opts.Limit
-	if opts.CountOnly {
-		limit = 0 // No limit when counting
-	}
-
-	eventKeys, matchingLedgers, err := e.indexReader.QueryEvents(filter.ContractID, topics, startLedger, endLedger, limit)
-	if err != nil {
-		return nil, fmt.Errorf("index query failed: %w", err)
-	}
-	result.IndexLookupTime = time.Since(indexStart)
-	result.MatchingLedgers = matchingLedgers
-	result.MatchingEvents = len(eventKeys)
-
-	if len(eventKeys) == 0 {
-		result.TotalTime = time.Since(totalStart)
-		return result, nil
-	}
-
-	// Count only mode - skip event fetch
-	if opts.CountOnly {
-		result.TotalTime = time.Since(totalStart)
-		return result, nil
-	}
-
-	// Phase 2: Batch fetch events by keys
-	fetchStart := time.Now()
-	events, err := e.eventReader.GetEventsByKeys(eventKeys)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch events: %w", err)
-	}
-
-	result.Events = events
-	result.EventFetchTime = time.Since(fetchStart)
-	result.EventsReturned = len(result.Events)
-	result.TotalTime = time.Since(totalStart)
-
-	return result, nil
-}
-
 // =============================================================================
 // Helper Functions
 // =============================================================================
 
 // matchesFilter checks if an event matches the given filters.
-// Used for post-filtering when L1 index gives ledger-level granularity.
+// Used for post-filtering when index gives ledger-level granularity.
 func matchesFilter(event *Event, contractID []byte, topics [][]byte) bool {
 	// Check contract ID
 	if len(contractID) > 0 {
 		if event.ContractID == "" {
 			return false
 		}
-		// ContractID in event is base64 encoded, need to compare appropriately
-		// For now, assume the caller has already encoded contractID to match
-		// This will need adjustment based on actual encoding
+		// Event.ContractID is base64 encoded, contractID filter is raw bytes
+		// Encode filter to base64 for comparison
+		filterBase64 := base64.StdEncoding.EncodeToString(contractID)
+		if event.ContractID != filterBase64 {
+			return false
+		}
 	}
 
 	// Check topics
@@ -207,8 +146,11 @@ func matchesFilter(event *Event, contractID []byte, topics [][]byte) bool {
 		if i >= len(event.Topics) {
 			return false
 		}
-		// Topics in event are base64 encoded
-		// Similar encoding consideration as contractID
+		// Event.Topics are base64 encoded, topicFilter is raw bytes
+		filterBase64 := base64.StdEncoding.EncodeToString(topicFilter)
+		if event.Topics[i] != filterBase64 {
+			return false
+		}
 	}
 
 	return true

@@ -20,7 +20,6 @@ type PipelineConfig struct {
 	NetworkPassphrase   string // Network passphrase for XDR parsing
 	MaintainUniqueIdx   bool   // Maintain unique indexes during ingestion
 	MaintainBitmapIdx   bool   // Maintain roaring bitmap indexes during ingestion
-	MaintainL2Idx       bool   // Maintain L2 hierarchical indexes during ingestion
 	BitmapFlushInterval int    // Ledgers between bitmap index flushes (0 = only at end)
 }
 
@@ -264,7 +263,6 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 				_, err := p.store.StoreEvents(eventBatch, &store.StoreOptions{
 					UniqueIndexes: p.config.MaintainUniqueIdx,
 					BitmapIndexes: p.config.MaintainBitmapIdx,
-					L2Indexes:     p.config.MaintainL2Idx,
 				})
 				atomic.AddInt64(&p.stats.WriteTimeNs, time.Since(writeStart).Nanoseconds())
 

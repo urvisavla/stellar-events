@@ -50,7 +50,6 @@ func (f *Filter) TopicFilters() [][]byte {
 // Options configures query execution behavior.
 type Options struct {
 	Limit      int  // Maximum events to return (0 = no limit)
-	UseL2Index bool // Use hierarchical L2 index for precise lookups
 	IncludeXDR bool // Include raw XDR in results
 	CountOnly  bool // Only count matches, don't fetch events
 }
@@ -58,8 +57,7 @@ type Options struct {
 // DefaultOptions returns default query options.
 func DefaultOptions() *Options {
 	return &Options{
-		Limit:      100,
-		UseL2Index: true,
+		Limit: 100,
 	}
 }
 
@@ -74,19 +72,15 @@ type Result struct {
 
 	// Counts
 	MatchingLedgers int   // Number of ledgers that matched the filter
-	MatchingEvents  int   // Total matching events (may be > len(Events) if limited)
 	EventsScanned   int64 // Events scanned during fetch phase
 	EventsReturned  int   // Events returned (len(Events))
 
 	// Ledger range info
 	LedgerRange        uint32   // Number of ledgers in query range
-	SegmentsQueried    int      // Number of bitmap segments queried
 	MatchingLedgerSeqs []uint32 // Actual ledger sequences that matched
 
 	// Timing breakdown
-	IndexLookupTime time.Duration // Time for index lookup (L1 or L1+L2)
-	L1LookupTime    time.Duration // L1 bitmap lookup time
-	L2LookupTime    time.Duration // L2 bitmap lookup time (if hierarchical)
+	IndexLookupTime time.Duration // Time for index lookup
 	EventFetchTime  time.Duration // Time to fetch events from store
 	FilterTime      time.Duration // Time spent post-filtering events
 	TotalTime       time.Duration // Total query time
@@ -113,12 +107,4 @@ type Event struct {
 
 	// Optional raw XDR (only if Options.IncludeXDR is true)
 	RawXDR []byte `json:"raw_xdr,omitempty"`
-}
-
-// EventKey uniquely identifies an event in storage.
-type EventKey struct {
-	LedgerSeq uint32
-	TxIdx     uint16
-	OpIdx     uint16
-	EventIdx  uint16
 }

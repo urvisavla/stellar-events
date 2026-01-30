@@ -72,7 +72,7 @@ max_bytes_for_level_base_mb = 1024
 # - ledger range being ingested
 # - events processed, avg per ledger
 # - processing rate and ETA
-progress_file = ""
+progress_file = "progress.json"
 
 # --- Post-processing ---
 # Run compaction after ingestion (optimizes for reads)
@@ -88,9 +88,6 @@ bitmap_indexes = true
 # Maintain unique value counts during ingestion
 # If false, run 'build-indexes' command after ingestion
 unique_indexes = false
-
-# Maintain L2 hierarchical indexes (precise event lookup)
-l2_indexes = false
 
 # Ledgers between bitmap index flushes (prevents memory growth)
 # Set to 0 to only flush at end of ingestion
@@ -115,13 +112,3 @@ max_ledger_range = 100000
 
 # Default max events to return
 default_limit = 100
-
-# =============================================================================
-# Indexes
-# =============================================================================
-[indexes]
-# Index by contract ID
-contract_id = true
-
-# Index by topic0-3
-topics = true

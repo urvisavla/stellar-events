@@ -114,7 +114,6 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		NetworkPassphrase:   networkPassphrase,
 		MaintainUniqueIdx:   cfg.Ingestion.UniqueIndexes,
 		MaintainBitmapIdx:   cfg.Ingestion.BitmapIndexes,
-		MaintainL2Idx:       cfg.Ingestion.L2Indexes,
 		BitmapFlushInterval: cfg.Ingestion.BitmapFlushInterval,
 	}
 

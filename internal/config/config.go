@@ -84,9 +84,8 @@ type IngestionConfig struct {
 	ComputeStats    bool `toml:"compute_stats"`    // Compute event stats after ingestion (default: false)
 
 	// Index maintenance during ingestion
-	BitmapIndexes bool `toml:"bitmap_indexes"` // Maintain L1 bitmap indexes (default: true)
+	BitmapIndexes bool `toml:"bitmap_indexes"` // Maintain bitmap indexes (default: true)
 	UniqueIndexes bool `toml:"unique_indexes"` // Maintain unique value counts (default: false)
-	L2Indexes     bool `toml:"l2_indexes"`     // Maintain L2 hierarchical indexes (default: false)
 
 	// Bitmap flush interval
 	BitmapFlushInterval int `toml:"bitmap_flush_interval"` // Ledgers between bitmap index flushes (default: 10000)
@@ -156,7 +155,6 @@ func DefaultConfig() *Config {
 			ComputeStats:        false,
 			BitmapIndexes:       true,
 			UniqueIndexes:       false,
-			L2Indexes:           false,
 			BitmapFlushInterval: 10000, // Flush hot segments every 10K ledgers
 			Workers:             0,     // 0 = NumCPU
 			BatchSize:           100,

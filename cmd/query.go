@@ -26,7 +26,6 @@ func runQuery(cfg *config.Config, args []string) {
 	topic2 := fs.String("topic2", "", "Topic2 (base64)")
 	topic3 := fs.String("topic3", "", "Topic3 (base64)")
 	limit := fs.Int("limit", 0, "Max results (0 = use config default)")
-	noL2 := fs.Bool("no-l2", false, "Skip L2 index, use L1 bitmap only")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: query <start> [end] [options]\n\n")
@@ -41,15 +40,12 @@ func runQuery(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "  --topic2 <val>    Filter by topic2 (base64)\n")
 		fmt.Fprintf(os.Stderr, "  --topic3 <val>    Filter by topic3 (base64)\n")
 		fmt.Fprintf(os.Stderr, "  --limit <n>       Max results (default: %d from config)\n", cfg.Query.DefaultLimit)
-		fmt.Fprintf(os.Stderr, "  --no-l2           Use L1 bitmap only (skip hierarchical L2 lookup)\n\n")
-		fmt.Fprintf(os.Stderr, "By default, query uses hierarchical L1+L2 bitmap with auto-fallback to L1.\n")
-		fmt.Fprintf(os.Stderr, "Timing stats are always shown.\n\n")
+		fmt.Fprintf(os.Stderr, "\nTiming stats are always shown.\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  query 55000000                              # Query single ledger\n")
 		fmt.Fprintf(os.Stderr, "  query 55000000 56000000                     # Query range\n")
 		fmt.Fprintf(os.Stderr, "  query 55000000 --contract <base64_id>       # Filter by contract\n")
 		fmt.Fprintf(os.Stderr, "  query 55000000 56000000 --topic0 <base64>   # Filter by topic\n")
-		fmt.Fprintf(os.Stderr, "  query 55000000 --contract <id> --no-l2      # Use L1 only\n")
 	}
 
 	// Custom parsing to handle positional args before flags
@@ -112,10 +108,10 @@ func runQuery(cfg *config.Config, args []string) {
 		queryLimit = cfg.Query.DefaultLimit
 	}
 
-	cmdQuery(cfg, uint32(startLedger), uint32(endLedger), *contract, *topic0, *topic1, *topic2, *topic3, queryLimit, *noL2)
+	cmdQuery(cfg, uint32(startLedger), uint32(endLedger), *contract, *topic0, *topic1, *topic2, *topic3, queryLimit)
 }
 
-func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, topic0, topic1, topic2, topic3 string, limit int, skipL2 bool) {
+func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, topic0, topic1, topic2, topic3 string, limit int) {
 	eventStore, err := openEventStore(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open event store: %v\n", err)
@@ -218,16 +214,11 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 
 	// Configure query options
 	opts := &query.Options{
-		Limit:      limit,
-		UseL2Index: !skipL2,
+		Limit: limit,
 	}
 
 	// Execute query
-	if skipL2 {
-		fmt.Fprintf(os.Stderr, "Querying with L1 bitmap index in ledgers %d-%d...\n", startLedger, endLedger)
-	} else {
-		fmt.Fprintf(os.Stderr, "Querying with HIERARCHICAL L1+L2 bitmap in ledgers %d-%d...\n", startLedger, endLedger)
-	}
+	fmt.Fprintf(os.Stderr, "Querying with bitmap index in ledgers %d-%d...\n", startLedger, endLedger)
 
 	result, err := engine.Query(filter, startLedger, endLedger, opts)
 	if err != nil {
@@ -236,7 +227,7 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 	}
 
 	// Display results
-	printQueryResult(result, skipL2)
+	printQueryResult(result)
 
 	output, err := json.MarshalIndent(result.Events, "", "  ")
 	if err != nil {
@@ -247,47 +238,29 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 }
 
 // printQueryResult displays query statistics to stderr
-func printQueryResult(result *query.Result, isL1Only bool) {
-	if isL1Only {
-		fmt.Fprintf(os.Stderr, "\n=== L1 Bitmap Query Results ===\n")
-		fmt.Fprintf(os.Stderr, "  Ledger range:      %d ledgers\n", result.LedgerRange)
-		fmt.Fprintf(os.Stderr, "  Matching ledgers:  %d\n", result.MatchingLedgers)
-		fmt.Fprintf(os.Stderr, "  Events scanned:    %d\n", result.EventsScanned)
-		fmt.Fprintf(os.Stderr, "  Events returned:   %d\n", result.EventsReturned)
+func printQueryResult(result *query.Result) {
+	fmt.Fprintf(os.Stderr, "\n=== Bitmap Query Results ===\n")
+	fmt.Fprintf(os.Stderr, "  Ledger range:      %d ledgers\n", result.LedgerRange)
+	fmt.Fprintf(os.Stderr, "  Matching ledgers:  %d\n", result.MatchingLedgers)
+	fmt.Fprintf(os.Stderr, "  Events scanned:    %d\n", result.EventsScanned)
+	fmt.Fprintf(os.Stderr, "  Events returned:   %d\n", result.EventsReturned)
 
-		if result.LedgerRange > 0 {
-			ledgerSelectivity := float64(result.MatchingLedgers) / float64(result.LedgerRange) * 100
-			fmt.Fprintf(os.Stderr, "  Ledger selectivity: %.4f%% (%.0fx reduction)\n",
-				ledgerSelectivity,
-				float64(result.LedgerRange)/float64(max(result.MatchingLedgers, 1)))
-		}
+	if result.LedgerRange > 0 {
+		ledgerSelectivity := float64(result.MatchingLedgers) / float64(result.LedgerRange) * 100
+		fmt.Fprintf(os.Stderr, "  Ledger selectivity: %.4f%% (%.0fx reduction)\n",
+			ledgerSelectivity,
+			float64(result.LedgerRange)/float64(max(result.MatchingLedgers, 1)))
+	}
 
-		fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
-		fmt.Fprintf(os.Stderr, "  Bitmap lookup:     %s\n", formatDuration(result.L1LookupTime))
-		fmt.Fprintf(os.Stderr, "  Event fetch:       %s (iterate + filter)\n", formatDuration(result.EventFetchTime))
-		fmt.Fprintf(os.Stderr, "  Total time:        %s\n", formatDuration(result.TotalTime))
+	fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
+	fmt.Fprintf(os.Stderr, "  Index lookup:      %s\n", formatDuration(result.IndexLookupTime))
+	fmt.Fprintf(os.Stderr, "  Event fetch:       %s (iterate + filter)\n", formatDuration(result.EventFetchTime))
+	fmt.Fprintf(os.Stderr, "  Total time:        %s\n", formatDuration(result.TotalTime))
 
-		if result.TotalTime > 0 {
-			bitmapPct := float64(result.L1LookupTime) / float64(result.TotalTime) * 100
-			fetchPct := float64(result.EventFetchTime) / float64(result.TotalTime) * 100
-			fmt.Fprintf(os.Stderr, "  Time distribution: bitmap=%.1f%%, fetch=%.1f%%\n", bitmapPct, fetchPct)
-		}
-	} else {
-		fmt.Fprintf(os.Stderr, "\n=== Hierarchical L1+L2 Query Results ===\n")
-		fmt.Fprintf(os.Stderr, "  Matching ledgers (L1): %d\n", result.MatchingLedgers)
-		fmt.Fprintf(os.Stderr, "  Matching events (L2):  %d\n", result.MatchingEvents)
-		fmt.Fprintf(os.Stderr, "  Events returned:       %d\n", result.EventsReturned)
-
-		fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
-		fmt.Fprintf(os.Stderr, "  Index lookup:      %s\n", formatDuration(result.IndexLookupTime))
-		fmt.Fprintf(os.Stderr, "  Event fetch:       %s (MultiGet)\n", formatDuration(result.EventFetchTime))
-		fmt.Fprintf(os.Stderr, "  Total time:        %s\n", formatDuration(result.TotalTime))
-
-		if result.TotalTime > 0 {
-			indexPct := float64(result.IndexLookupTime) / float64(result.TotalTime) * 100
-			fetchPct := float64(result.EventFetchTime) / float64(result.TotalTime) * 100
-			fmt.Fprintf(os.Stderr, "  Time distribution: index=%.1f%%, fetch=%.1f%%\n", indexPct, fetchPct)
-		}
+	if result.TotalTime > 0 {
+		indexPct := float64(result.IndexLookupTime) / float64(result.TotalTime) * 100
+		fetchPct := float64(result.EventFetchTime) / float64(result.TotalTime) * 100
+		fmt.Fprintf(os.Stderr, "  Time distribution: index=%.1f%%, fetch=%.1f%%\n", indexPct, fetchPct)
 	}
 
 	fmt.Fprintf(os.Stderr, "\n")

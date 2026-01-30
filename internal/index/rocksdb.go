@@ -12,9 +12,6 @@ import (
 type IndexReader interface {
 	// QueryLedgers returns a bitmap of ledgers matching the filter criteria.
 	QueryLedgers(contractID []byte, topics [][]byte, startLedger, endLedger uint32) (*roaring.Bitmap, error)
-
-	// QueryEvents returns precise event keys matching the filter criteria.
-	QueryEvents(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int) ([]EventKey, int, error)
 }
 
 // Verify RocksDBStore implements IndexReader at compile time
@@ -68,15 +65,9 @@ func (s *RocksDBStore) Close() error {
 // SegmentLoader Implementation
 // =============================================================================
 
-// LoadL1Segment loads an L1 bitmap segment from RocksDB.
-func (s *RocksDBStore) LoadL1Segment(prefix byte, keyValue []byte, segmentID uint32) (*roaring.Bitmap, error) {
+// LoadSegment loads a bitmap segment from RocksDB.
+func (s *RocksDBStore) LoadSegment(prefix byte, keyValue []byte, segmentID uint32) (*roaring.Bitmap, error) {
 	dbKey := MakeL1Key(prefix, keyValue, segmentID)
-	return s.loadBitmap(dbKey)
-}
-
-// LoadL2Segment loads an L2 bitmap segment from RocksDB.
-func (s *RocksDBStore) LoadL2Segment(prefix byte, keyValue []byte, ledgerSeq uint32) (*roaring.Bitmap, error) {
-	dbKey := MakeL2Key(prefix, keyValue, ledgerSeq)
 	return s.loadBitmap(dbKey)
 }
 
@@ -101,81 +92,19 @@ func (s *RocksDBStore) loadBitmap(key []byte) (*roaring.Bitmap, error) {
 	return bitmap, nil
 }
 
-// loadBitmapsMulti loads multiple bitmaps from RocksDB using MultiGet.
-// Returns a slice of bitmaps in the same order as keys (nil for missing keys).
-func (s *RocksDBStore) loadBitmapsMulti(keys [][]byte) ([]*roaring.Bitmap, error) {
-	if len(keys) == 0 {
-		return nil, nil
-	}
-
-	// Use MultiGetCF for batch read
-	values, err := s.db.MultiGetCF(s.ro, s.cf, keys...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to multi-get bitmaps: %w", err)
-	}
-
-	bitmaps := make([]*roaring.Bitmap, len(keys))
-	for i, data := range values {
-		if data.Size() == 0 {
-			data.Free()
-			continue // nil bitmap for missing key
-		}
-
-		bitmap := roaring.New()
-		if err := bitmap.UnmarshalBinary(data.Data()); err != nil {
-			data.Free()
-			// Continue with nil for this bitmap rather than failing entirely
-			continue
-		}
-		bitmaps[i] = bitmap
-		data.Free()
-	}
-
-	return bitmaps, nil
-}
-
-// LoadL2SegmentsMulti loads multiple L2 bitmap segments from RocksDB using MultiGet.
-// prefixes and keyValues must have the same length. All lookups use the same ledgerSeq.
-// Returns bitmaps in the same order as the input slices (nil for missing keys).
-func (s *RocksDBStore) LoadL2SegmentsMulti(prefixes []byte, keyValues [][]byte, ledgerSeq uint32) ([]*roaring.Bitmap, error) {
-	if len(prefixes) == 0 || len(prefixes) != len(keyValues) {
-		return nil, nil
-	}
-
-	// Build all keys
-	keys := make([][]byte, len(prefixes))
-	for i := range prefixes {
-		keys[i] = MakeL2Key(prefixes[i], keyValues[i], ledgerSeq)
-	}
-
-	return s.loadBitmapsMulti(keys)
-}
-
 // =============================================================================
 // Store Interface Implementation - Write Operations
 // =============================================================================
 
-// AddContractLedger adds a ledger to the L1 contract index.
+// AddContractLedger adds a ledger to the contract index.
 func (s *RocksDBStore) AddContractLedger(contractID []byte, ledger uint32) error {
 	s.bitmap.AddContractIndex(contractID, ledger)
 	return nil
 }
 
-// AddTopicLedger adds a ledger to the L1 topic index.
+// AddTopicLedger adds a ledger to the topic index.
 func (s *RocksDBStore) AddTopicLedger(position int, topic []byte, ledger uint32) error {
 	s.bitmap.AddTopicIndex(position, topic, ledger)
-	return nil
-}
-
-// AddContractEvent adds an event to the L2 contract index.
-func (s *RocksDBStore) AddContractEvent(contractID []byte, ledger uint32, txIdx, opIdx, eventIdx uint16) error {
-	s.bitmap.AddContractL2Index(contractID, ledger, txIdx, opIdx, eventIdx)
-	return nil
-}
-
-// AddTopicEvent adds an event to the L2 topic index.
-func (s *RocksDBStore) AddTopicEvent(position int, topic []byte, ledger uint32, txIdx, opIdx, eventIdx uint16) error {
-	s.bitmap.AddTopicL2Index(position, topic, ledger, txIdx, opIdx, eventIdx)
 	return nil
 }
 
@@ -214,101 +143,6 @@ func (s *RocksDBStore) QueryLedgers(contractID []byte, topics [][]byte, startLed
 
 	// Use FastAnd for efficient intersection (avoids Clone + multiple And calls)
 	return roaring.FastAnd(bitmaps...), nil
-}
-
-// QueryEvents returns precise event keys matching the filter criteria.
-// Uses batched MultiGet for L2 lookups and FastAnd for efficient intersection.
-func (s *RocksDBStore) QueryEvents(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int) ([]EventKey, int, error) {
-	// First, get matching ledgers using L1 index
-	ledgerBitmap, err := s.QueryLedgers(contractID, topics, startLedger, endLedger)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	matchingLedgers := int(ledgerBitmap.GetCardinality())
-	if ledgerBitmap.IsEmpty() {
-		return nil, matchingLedgers, nil
-	}
-
-	// Build the list of L2 prefixes and key values to query per ledger
-	// This is constant for all ledgers, so we build it once
-	var l2Prefixes []byte
-	var l2KeyValues [][]byte
-
-	if len(contractID) > 0 {
-		l2Prefixes = append(l2Prefixes, PrefixContractL2)
-		l2KeyValues = append(l2KeyValues, contractID)
-	}
-
-	for i, topic := range topics {
-		if len(topic) == 0 {
-			continue
-		}
-		prefix := TopicL2Prefix(i)
-		if prefix == 0 {
-			continue
-		}
-		l2Prefixes = append(l2Prefixes, prefix)
-		l2KeyValues = append(l2KeyValues, topic)
-	}
-
-	if len(l2Prefixes) == 0 {
-		return nil, matchingLedgers, nil
-	}
-
-	// Then query L2 indexes for each matching ledger
-	var eventKeys []EventKey
-	ledgers := ledgerBitmap.ToArray()
-
-	for _, ledgerSeq := range ledgers {
-		if limit > 0 && len(eventKeys) >= limit {
-			break
-		}
-
-		// Batch load all L2 bitmaps for this ledger using MultiGet
-		l2Bitmaps, err := s.LoadL2SegmentsMulti(l2Prefixes, l2KeyValues, ledgerSeq)
-		if err != nil {
-			return nil, matchingLedgers, err
-		}
-
-		// Filter out nil bitmaps
-		var validBitmaps []*roaring.Bitmap
-		for _, bm := range l2Bitmaps {
-			if bm != nil {
-				validBitmaps = append(validBitmaps, bm)
-			}
-		}
-
-		if len(validBitmaps) == 0 {
-			continue
-		}
-
-		// Use FastAnd for efficient intersection
-		var l2Result *roaring.Bitmap
-		if len(validBitmaps) == 1 {
-			l2Result = validBitmaps[0]
-		} else {
-			l2Result = roaring.FastAnd(validBitmaps...)
-		}
-
-		if l2Result.IsEmpty() {
-			continue
-		}
-
-		// Convert to event keys
-		eventIndices := l2Result.ToArray()
-		for _, encodedIdx := range eventIndices {
-			if limit > 0 && len(eventKeys) >= limit {
-				break
-			}
-			eventKeys = append(eventKeys, EventKey{
-				LedgerSeq:  ledgerSeq,
-				EventIndex: encodedIdx,
-			})
-		}
-	}
-
-	return eventKeys, matchingLedgers, nil
 }
 
 // =============================================================================
@@ -355,55 +189,50 @@ func (s *RocksDBStore) countIndexEntries(prefix byte) int64 {
 // Store Interface Implementation - Lifecycle
 // =============================================================================
 
-// Flush persists all hot segments to RocksDB.
-// Uses a single drain/resume cycle for both L1 and L2 segments for efficiency.
+// Flush persists all hot segments to RocksDB, merging with existing data.
 func (s *RocksDBStore) Flush() error {
-	result, err := s.bitmap.GetAndClearAllSegments()
+	segments, err := s.bitmap.GetAndClearAllSegments()
 	if err != nil {
 		return fmt.Errorf("failed to get segments: %w", err)
 	}
 
-	// Write L1 segments
-	if len(result.L1Segments) > 0 {
-		batch := grocksdb.NewWriteBatch()
-		for _, seg := range result.L1Segments {
-			batch.PutCF(s.cf, seg.Key, seg.Data)
-		}
-		if err := s.db.Write(s.wo, batch); err != nil {
-			batch.Destroy()
-			return fmt.Errorf("failed to write L1 segments: %w", err)
-		}
-		batch.Destroy()
+	if len(segments) == 0 {
+		return nil
 	}
 
-	// Write L2 segments in batches
-	if len(result.L2Segments) > 0 {
-		const maxBatchSize = 10000
-		batch := grocksdb.NewWriteBatch()
-		batchCount := 0
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
 
-		for _, seg := range result.L2Segments {
-			batch.PutCF(s.cf, seg.Key, seg.Data)
-			batchCount++
-
-			if batchCount >= maxBatchSize {
-				if err := s.db.Write(s.wo, batch); err != nil {
-					batch.Destroy()
-					return fmt.Errorf("failed to write L2 segment batch: %w", err)
-				}
-				batch.Destroy()
-				batch = grocksdb.NewWriteBatch()
-				batchCount = 0
-			}
+	for _, seg := range segments {
+		// Load existing bitmap from RocksDB (if any)
+		existingBitmap, err := s.loadBitmap(seg.Key)
+		if err != nil {
+			return fmt.Errorf("failed to load existing bitmap for merge: %w", err)
 		}
 
-		if batchCount > 0 {
-			if err := s.db.Write(s.wo, batch); err != nil {
-				batch.Destroy()
-				return fmt.Errorf("failed to write L2 segment batch: %w", err)
+		var finalData []byte
+		if existingBitmap != nil {
+			// Merge: OR the new bitmap with existing
+			newBitmap := roaring.New()
+			if err := newBitmap.UnmarshalBinary(seg.Data); err != nil {
+				return fmt.Errorf("failed to unmarshal new bitmap: %w", err)
 			}
+			existingBitmap.Or(newBitmap)
+			existingBitmap.RunOptimize()
+			finalData, err = existingBitmap.ToBytes()
+			if err != nil {
+				return fmt.Errorf("failed to serialize merged bitmap: %w", err)
+			}
+		} else {
+			// No existing data, use the new bitmap as-is
+			finalData = seg.Data
 		}
-		batch.Destroy()
+
+		batch.PutCF(s.cf, seg.Key, finalData)
+	}
+
+	if err := s.db.Write(s.wo, batch); err != nil {
+		return fmt.Errorf("failed to write segments: %w", err)
 	}
 
 	return nil
