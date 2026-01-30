@@ -135,6 +135,12 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 
 	// No filter - scan all events in range (use direct store method)
 	if !hasAnyFilter {
+		// If comparison mode, run both unfiltered queries and compare
+		if compareDB != "" {
+			runUnfilteredComparisonQuery(cfg, eventStore, compareDB, compareFormat, startLedger, endLedger, limit)
+			return
+		}
+
 		fmt.Fprintf(os.Stderr, "Querying all events in ledgers %d-%d...\n", startLedger, endLedger)
 		startTime := time.Now()
 		rangeResult, err := eventStore.GetEventsInRangeWithTiming(startLedger, endLedger, limit)
@@ -299,6 +305,152 @@ func runComparisonQuery(cfg *config.Config, primaryStore *store.RocksDBEventStor
 	// Print comparison
 	fmt.Fprintf(os.Stderr, "\n=== Performance Comparison ===\n")
 	printPerformanceComparison(primaryResult, compareResult, cfg.Storage.EventFormat, compareStore.GetEventFormat())
+}
+
+// runUnfilteredComparisonQuery runs unfiltered queries against two databases and compares
+func runUnfilteredComparisonQuery(cfg *config.Config, primaryStore *store.RocksDBEventStore, compareDBPath, compareFormat string, startLedger, endLedger uint32, limit int) {
+	// Run query on primary database
+	fmt.Fprintf(os.Stderr, "=== Primary Database (%s format) ===\n", cfg.Storage.EventFormat)
+	fmt.Fprintf(os.Stderr, "Querying all events in ledgers %d-%d...\n", startLedger, endLedger)
+	primaryResult := executeUnfilteredQuery(primaryStore, startLedger, endLedger, limit)
+	if primaryResult == nil {
+		return
+	}
+	printCompactRangeResult("Primary", primaryResult)
+
+	// Open comparison database
+	compareStore, err := store.NewEventStoreWithOptions(compareDBPath, nil, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to open comparison database: %v\n", err)
+		os.Exit(1)
+	}
+	defer compareStore.Close()
+
+	// Set format for comparison store
+	if compareFormat != "" {
+		compareStore.SetEventFormat(compareFormat)
+	}
+
+	// Run query on comparison database
+	fmt.Fprintf(os.Stderr, "\n=== Comparison Database (%s format) ===\n", compareStore.GetEventFormat())
+	fmt.Fprintf(os.Stderr, "Querying all events in ledgers %d-%d...\n", startLedger, endLedger)
+	compareResult := executeUnfilteredQuery(compareStore, startLedger, endLedger, limit)
+	if compareResult == nil {
+		return
+	}
+	printCompactRangeResult("Compare", compareResult)
+
+	// Print comparison
+	fmt.Fprintf(os.Stderr, "\n=== Performance Comparison ===\n")
+	printUnfilteredPerformanceComparison(primaryResult, compareResult, cfg.Storage.EventFormat, compareStore.GetEventFormat())
+}
+
+// executeUnfilteredQuery runs an unfiltered range query and returns the result
+func executeUnfilteredQuery(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, limit int) *query.Result {
+	startTime := time.Now()
+	rangeResult, err := eventStore.GetEventsInRangeWithTiming(startLedger, endLedger, limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
+		return nil
+	}
+	totalTime := time.Since(startTime)
+
+	return &query.Result{
+		Events:         rangeResult.Events,
+		EventsScanned:  rangeResult.EventsScanned,
+		EventsReturned: len(rangeResult.Events),
+		LedgerRange:    endLedger - startLedger + 1,
+		DiskReadTime:   rangeResult.Timing.DiskReadTime,
+		UnmarshalTime:  rangeResult.Timing.UnmarshalTime,
+		BytesRead:      rangeResult.Timing.BytesRead,
+		EventFetchTime: totalTime,
+		TotalTime:      totalTime,
+	}
+}
+
+// printCompactRangeResult prints a compact version of unfiltered range query results
+func printCompactRangeResult(label string, result *query.Result) {
+	fmt.Fprintf(os.Stderr, "  Ledger range:      %d ledgers\n", result.LedgerRange)
+	fmt.Fprintf(os.Stderr, "  Events scanned:    %d\n", result.EventsScanned)
+	fmt.Fprintf(os.Stderr, "  Events returned:   %d\n", result.EventsReturned)
+	fmt.Fprintf(os.Stderr, "  Bytes read:        %s\n", formatBytes(result.BytesRead))
+	fmt.Fprintf(os.Stderr, "  Timing:\n")
+	fmt.Fprintf(os.Stderr, "    Disk read:       %s\n", formatDuration(result.DiskReadTime))
+	fmt.Fprintf(os.Stderr, "    Unmarshal:       %s\n", formatDuration(result.UnmarshalTime))
+	fmt.Fprintf(os.Stderr, "    Total:           %s\n", formatDuration(result.TotalTime))
+}
+
+// printUnfilteredPerformanceComparison prints a side-by-side comparison for unfiltered queries
+func printUnfilteredPerformanceComparison(primary, compare *query.Result, primaryFormat, compareFormat string) {
+	// Verify results match
+	if primary.EventsReturned != compare.EventsReturned {
+		fmt.Fprintf(os.Stderr, "  WARNING: Different events returned (%d vs %d)\n",
+			primary.EventsReturned, compare.EventsReturned)
+	}
+
+	// Calculate per-event metrics for fair comparison
+	var primaryPerEvent, comparePerEvent float64
+	if primary.EventsScanned > 0 {
+		primaryPerEvent = float64(primary.UnmarshalTime.Nanoseconds()) / float64(primary.EventsScanned)
+	}
+	if compare.EventsScanned > 0 {
+		comparePerEvent = float64(compare.UnmarshalTime.Nanoseconds()) / float64(compare.EventsScanned)
+	}
+
+	fmt.Fprintf(os.Stderr, "\n  %-20s %15s %15s\n", "Metric", primaryFormat, compareFormat)
+	fmt.Fprintf(os.Stderr, "  %-20s %15s %15s\n", "------", "------", "------")
+	fmt.Fprintf(os.Stderr, "  %-20s %15s %15s\n", "Total time", formatDuration(primary.TotalTime), formatDuration(compare.TotalTime))
+	fmt.Fprintf(os.Stderr, "  %-20s %15s %15s\n", "Disk read", formatDuration(primary.DiskReadTime), formatDuration(compare.DiskReadTime))
+	fmt.Fprintf(os.Stderr, "  %-20s %15s %15s\n", "Unmarshal", formatDuration(primary.UnmarshalTime), formatDuration(compare.UnmarshalTime))
+	fmt.Fprintf(os.Stderr, "  %-20s %15s %15s\n", "Bytes read", formatBytes(primary.BytesRead), formatBytes(compare.BytesRead))
+	fmt.Fprintf(os.Stderr, "  %-20s %15.2f ns %13.2f ns\n", "Unmarshal/event", primaryPerEvent, comparePerEvent)
+
+	// Disk throughput
+	var primaryMBps, compareMBps float64
+	if primary.DiskReadTime > 0 && primary.BytesRead > 0 {
+		primaryMBps = float64(primary.BytesRead) / (1024 * 1024) / primary.DiskReadTime.Seconds()
+	}
+	if compare.DiskReadTime > 0 && compare.BytesRead > 0 {
+		compareMBps = float64(compare.BytesRead) / (1024 * 1024) / compare.DiskReadTime.Seconds()
+	}
+	fmt.Fprintf(os.Stderr, "  %-20s %12.1f MB/s %10.1f MB/s\n", "Disk throughput", primaryMBps, compareMBps)
+
+	// Speedup calculations
+	if compare.TotalTime > 0 && primary.TotalTime > 0 {
+		totalSpeedup := float64(primary.TotalTime) / float64(compare.TotalTime)
+		fmt.Fprintf(os.Stderr, "\n  Total speedup: %.2fx", totalSpeedup)
+		if totalSpeedup > 1 {
+			fmt.Fprintf(os.Stderr, " (%s is faster)\n", compareFormat)
+		} else {
+			fmt.Fprintf(os.Stderr, " (%s is faster)\n", primaryFormat)
+		}
+	}
+
+	if comparePerEvent > 0 && primaryPerEvent > 0 {
+		unmarshalSpeedup := primaryPerEvent / comparePerEvent
+		fmt.Fprintf(os.Stderr, "  Unmarshal speedup: %.2fx per event\n", unmarshalSpeedup)
+	}
+
+	// Time saved
+	if primary.TotalTime > compare.TotalTime {
+		saved := primary.TotalTime - compare.TotalTime
+		pctSaved := float64(saved) / float64(primary.TotalTime) * 100
+		fmt.Fprintf(os.Stderr, "  Time saved: %s (%.1f%%)\n", formatDuration(saved), pctSaved)
+	} else if compare.TotalTime > primary.TotalTime {
+		saved := compare.TotalTime - primary.TotalTime
+		pctSaved := float64(saved) / float64(compare.TotalTime) * 100
+		fmt.Fprintf(os.Stderr, "  Time saved: %s (%.1f%%) with %s\n", formatDuration(saved), pctSaved, primaryFormat)
+	}
+
+	// Size comparison
+	if primary.BytesRead > 0 && compare.BytesRead > 0 {
+		sizeRatio := float64(compare.BytesRead) / float64(primary.BytesRead)
+		if sizeRatio > 1 {
+			fmt.Fprintf(os.Stderr, "  Size overhead: %.1f%% larger with %s\n", (sizeRatio-1)*100, compareFormat)
+		} else if sizeRatio < 1 {
+			fmt.Fprintf(os.Stderr, "  Size savings: %.1f%% smaller with %s\n", (1-sizeRatio)*100, compareFormat)
+		}
+	}
 }
 
 // executeQuery runs a query and returns the result

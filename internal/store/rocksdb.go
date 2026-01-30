@@ -1573,6 +1573,155 @@ func (es *RocksDBEventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.
 	return result, nil
 }
 
+// GetEventsInLedgerWithFilter retrieves matching events from a ledger with early filtering.
+// For binary format, this filters at the header level before full decode, avoiding
+// expensive base64 encoding and object creation for non-matching events.
+func (es *RocksDBEventStore) GetEventsInLedgerWithFilter(ledger uint32, contractID []byte, topics [][]byte, limit int) (*query.FilteredFetchResult, error) {
+	result := &query.FilteredFetchResult{
+		Timing: query.FilteredFetchTiming{},
+	}
+
+	startKey := eventKeyFromParts(ledger, 0, 0, 0)
+
+	// Time iterator creation and seek
+	diskStart := time.Now()
+	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
+	defer it.Close()
+	it.Seek(startKey)
+	result.Timing.DiskReadTime += time.Since(diskStart)
+
+	for it.Valid() {
+		// Check limit on returned events
+		if limit > 0 && len(result.Events) >= limit {
+			break
+		}
+
+		// Time key access (disk read)
+		diskStart = time.Now()
+		key := it.Key().Data()
+		result.Timing.DiskReadTime += time.Since(diskStart)
+
+		if len(key) < 10 {
+			break
+		}
+
+		keyLedger := binary.BigEndian.Uint32(key[0:4])
+		if keyLedger != ledger {
+			break
+		}
+
+		_, tx, op, eventIdx := parseEventKey(key)
+
+		// Time value access (disk read)
+		diskStart = time.Now()
+		valueData := it.Value().Data()
+		result.Timing.DiskReadTime += time.Since(diskStart)
+		result.Timing.BytesRead += int64(len(valueData))
+
+		result.EventsScanned++
+
+		// Filter and decode based on format
+		if es.eventFormat == "binary" {
+			// Binary format: filter at header level BEFORE full decode
+			filterStart := time.Now()
+			header := ParseBinaryHeader(valueData)
+			if header == nil {
+				result.Timing.FilterTime += time.Since(filterStart)
+				diskStart = time.Now()
+				it.Next()
+				result.Timing.DiskReadTime += time.Since(diskStart)
+				continue
+			}
+
+			// Fast filter check using raw bytes - no allocations
+			matches := true
+			if len(contractID) > 0 && !header.MatchesContractID(contractID) {
+				matches = false
+			}
+			if matches && !header.MatchesTopics(topics) {
+				matches = false
+			}
+			result.Timing.FilterTime += time.Since(filterStart)
+
+			if !matches {
+				diskStart = time.Now()
+				it.Next()
+				result.Timing.DiskReadTime += time.Since(diskStart)
+				continue
+			}
+
+			// Only decode matching events
+			decodeStart := time.Now()
+			event, err := DecodeBinaryToQueryEvent(valueData, ledger, tx, op, eventIdx)
+			result.Timing.DecodeTime += time.Since(decodeStart)
+
+			if err == nil {
+				result.Events = append(result.Events, event)
+			}
+		} else {
+			// XDR format: must unmarshal to filter
+			decodeStart := time.Now()
+			event, err := parseRawXDRToQueryEvent(valueData, ledger, tx, op, eventIdx)
+			result.Timing.DecodeTime += time.Since(decodeStart)
+
+			if err != nil {
+				diskStart = time.Now()
+				it.Next()
+				result.Timing.DiskReadTime += time.Since(diskStart)
+				continue
+			}
+
+			// Filter after decode for XDR
+			filterStart := time.Now()
+			if matchesXDRFilter(event, contractID, topics) {
+				result.Events = append(result.Events, event)
+			}
+			result.Timing.FilterTime += time.Since(filterStart)
+		}
+
+		// Time next iteration
+		diskStart = time.Now()
+		it.Next()
+		result.Timing.DiskReadTime += time.Since(diskStart)
+	}
+
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("iterator error: %w", err)
+	}
+
+	return result, nil
+}
+
+// matchesXDRFilter checks if a decoded event matches the given filters.
+func matchesXDRFilter(event *query.Event, contractID []byte, topics [][]byte) bool {
+	// Check contract ID
+	if len(contractID) > 0 {
+		if event.ContractID == "" {
+			return false
+		}
+		filterBase64 := base64.StdEncoding.EncodeToString(contractID)
+		if event.ContractID != filterBase64 {
+			return false
+		}
+	}
+
+	// Check topics
+	for i, topicFilter := range topics {
+		if len(topicFilter) == 0 {
+			continue
+		}
+		if i >= len(event.Topics) {
+			return false
+		}
+		filterBase64 := base64.StdEncoding.EncodeToString(topicFilter)
+		if event.Topics[i] != filterBase64 {
+			return false
+		}
+	}
+
+	return true
+}
+
 // parseRawXDRToQueryEvent converts raw XDR bytes to a query.Event
 func parseRawXDRToQueryEvent(rawXDR []byte, ledger uint32, tx, op, eventIdx uint16) (*query.Event, error) {
 	var xdrEvent xdr.ContractEvent

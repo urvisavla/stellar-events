@@ -104,6 +104,21 @@ type FetchResult struct {
 	Timing FetchTiming
 }
 
+// FilteredFetchResult holds the result of fetching and filtering events with detailed timing.
+type FilteredFetchResult struct {
+	Events        []*Event
+	EventsScanned int64 // Total events examined
+	Timing        FilteredFetchTiming
+}
+
+// FilteredFetchTiming holds timing for filtered fetch operations.
+type FilteredFetchTiming struct {
+	DiskReadTime  time.Duration // Time spent reading from storage
+	FilterTime    time.Duration // Time spent filtering (at header level for binary)
+	DecodeTime    time.Duration // Time spent decoding matching events only
+	BytesRead     int64         // Total bytes read from disk
+}
+
 // RangeResult holds the result of fetching events from a ledger range with timing info.
 type RangeResult struct {
 	Events        []*Event
