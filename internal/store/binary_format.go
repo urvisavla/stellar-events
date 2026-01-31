@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/urvisavla/stellar-events/internal/query"
 )
 
@@ -223,9 +224,11 @@ func DecodeBinaryToQueryEvent(data []byte, ledger uint32, tx, op, eventIdx uint1
 		EventIndex:       int(eventIdx),
 	}
 
-	// Contract ID - direct byte access
+	// Contract ID - encode as strkey (C...)
 	if h.HasContractID() {
-		event.ContractID = base64.StdEncoding.EncodeToString(h.ContractID)
+		if encoded, err := strkey.Encode(strkey.VersionByteContract, h.ContractID); err == nil {
+			event.ContractID = encoded
+		}
 	}
 
 	// Type - direct byte access

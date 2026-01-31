@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 
@@ -69,6 +70,11 @@ func configToIndexOptions(cfg *config.IndexConfig) *store.IndexConfig {
 // decodeBase64 decodes a base64 string
 func decodeBase64(s string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(s)
+}
+
+// decodeContractID decodes a strkey-encoded contract ID (C...)
+func decodeContractID(s string) ([]byte, error) {
+	return strkey.Decode(strkey.VersionByteContract, s)
 }
 
 // =============================================================================

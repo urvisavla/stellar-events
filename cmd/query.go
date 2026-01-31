@@ -195,9 +195,9 @@ func buildFilter(contractID, topic0, topic1, topic2, topic3 string) *query.Filte
 	filter := &query.Filter{}
 
 	if contractID != "" {
-		contractBytes, decErr := decodeBase64(contractID)
+		contractBytes, decErr := decodeContractID(contractID)
 		if decErr != nil {
-			fmt.Fprintf(os.Stderr, "Error: invalid contract ID: %v\n", decErr)
+			fmt.Fprintf(os.Stderr, "Error: invalid contract ID (expected C... format): %v\n", decErr)
 			return nil
 		}
 		filter.ContractID = contractBytes

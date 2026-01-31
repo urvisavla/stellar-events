@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linxGnu/grocksdb"
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/urvisavla/stellar-events/internal/index"
@@ -133,9 +134,11 @@ func parseRawXDRToEvent(rawXDR []byte, ledger uint32, tx, op, eventIdx uint16) (
 		EventIndex:       int(eventIdx),
 	}
 
-	// Extract contract ID if present
+	// Extract contract ID if present - encode as strkey (C...)
 	if xdrEvent.ContractId != nil {
-		event.ContractID = base64.StdEncoding.EncodeToString(xdrEvent.ContractId[:])
+		if encoded, err := strkey.Encode(strkey.VersionByteContract, xdrEvent.ContractId[:]); err == nil {
+			event.ContractID = encoded
+		}
 	}
 
 	// Event type
@@ -1736,9 +1739,11 @@ func parseRawXDRToQueryEvent(rawXDR []byte, ledger uint32, tx, op, eventIdx uint
 		EventIndex:       int(eventIdx),
 	}
 
-	// Extract contract ID if present
+	// Extract contract ID if present - encode as strkey (C...)
 	if xdrEvent.ContractId != nil {
-		event.ContractID = base64.StdEncoding.EncodeToString(xdrEvent.ContractId[:])
+		if encoded, err := strkey.Encode(strkey.VersionByteContract, xdrEvent.ContractId[:]); err == nil {
+			event.ContractID = encoded
+		}
 	}
 
 	// Event type
