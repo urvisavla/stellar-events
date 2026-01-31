@@ -46,7 +46,7 @@ type StoreOptions struct {
 type ContractEvent struct {
 	LedgerSequence   uint32   `json:"ledger_sequence"`
 	TransactionIndex int      `json:"transaction_index"`
-	OperationIndex   int      `json:"operation_index,omitempty"`
+	OperationIndex   int      `json:"operation_index"`
 	EventIndex       int      `json:"event_index"`
 	ContractID       string   `json:"contract_id,omitempty"`
 	Type             string   `json:"type"`
@@ -139,6 +139,9 @@ type DistributionStats struct {
 	P99   int64      `json:"p99"`
 	Total int64      `json:"total"`
 	TopN  []TopEntry `json:"top_n,omitempty"`
+
+	// Key size metrics (for bitmap index truncation analysis)
+	Over32Bytes int64 `json:"over_32_bytes"` // Count of unique values > 32 bytes
 }
 
 // TopEntry represents a top item by event count.
@@ -180,6 +183,12 @@ type BitmapStats struct {
 	Topic1IndexCount   int64  `json:"topic1_index_count"`
 	Topic2IndexCount   int64  `json:"topic2_index_count"`
 	Topic3IndexCount   int64  `json:"topic3_index_count"`
+}
+
+// LedgerTxStats holds statistics about transactions per ledger.
+type LedgerTxStats struct {
+	TotalLedgers      int64 `json:"total_ledgers"`
+	LedgersOver10kTx  int64 `json:"ledgers_over_10k_tx"`
 }
 
 // =============================================================================

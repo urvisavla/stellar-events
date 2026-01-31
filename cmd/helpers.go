@@ -155,6 +155,12 @@ func printDistribution(name string, stats *store.DistributionStats) {
 	p.Printf("  Max:    %d events\n", stats.Max)
 	p.Printf("  Mean:   %.2f events\n", stats.Mean)
 
+	// Show count of values > 32 bytes (relevant for bitmap index truncation)
+	if stats.Over32Bytes > 0 {
+		pct := float64(stats.Over32Bytes) * 100.0 / float64(stats.Count)
+		p.Printf("  >32 bytes: %d values (%.2f%% - may collide in bitmap index)\n", stats.Over32Bytes, pct)
+	}
+
 	if len(stats.TopN) > 0 {
 		p.Printf("  Top %d by event count:\n", len(stats.TopN))
 		for i, entry := range stats.TopN {

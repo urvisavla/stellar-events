@@ -1013,6 +1013,54 @@ func (es *RocksDBEventStore) GetStats() (*DBStats, error) {
 	return stats, nil
 }
 
+// GetLedgerTxStats scans events to count ledgers with high transaction counts.
+func (es *RocksDBEventStore) GetLedgerTxStats() (*LedgerTxStats, error) {
+	stats := &LedgerTxStats{}
+
+	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
+	defer it.Close()
+
+	var currentLedger uint32
+	var maxTxIdx uint16
+	var first = true
+
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		key := it.Key().Data()
+		if len(key) < 6 {
+			continue
+		}
+
+		ledger := binary.BigEndian.Uint32(key[0:4])
+		txIdx := binary.BigEndian.Uint16(key[4:6])
+
+		if first || ledger != currentLedger {
+			// Process previous ledger
+			if !first && maxTxIdx >= 10000 {
+				stats.LedgersOver10kTx++
+			}
+			if !first {
+				stats.TotalLedgers++
+			}
+
+			currentLedger = ledger
+			maxTxIdx = txIdx
+			first = false
+		} else if txIdx > maxTxIdx {
+			maxTxIdx = txIdx
+		}
+	}
+
+	// Process last ledger
+	if !first {
+		stats.TotalLedgers++
+		if maxTxIdx >= 10000 {
+			stats.LedgersOver10kTx++
+		}
+	}
+
+	return stats, it.Err()
+}
+
 // CompactAllWithStats runs manual compaction and returns before/after stats per column family.
 func (es *RocksDBEventStore) CompactAllWithStats() (*CompactionSummary, error) {
 	before, err := es.GetStorageSnapshot()
@@ -1301,10 +1349,11 @@ func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN int
 	const partitions = 16
 
 	type partitionResult struct {
-		counts []int64
-		total  int64
-		topN   []TopEntry
-		err    error
+		counts      []int64
+		total       int64
+		over32Bytes int64
+		topN        []TopEntry
+		err         error
 	}
 
 	results := make(chan partitionResult, partitions)
@@ -1315,8 +1364,8 @@ func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN int
 		wg.Add(1)
 		go func(partition int) {
 			defer wg.Done()
-			counts, total, top, err := es.scanDistributionPartition(indexType, partition, partitions, topN)
-			results <- partitionResult{counts, total, top, err}
+			counts, total, over32, top, err := es.scanDistributionPartition(indexType, partition, partitions, topN)
+			results <- partitionResult{counts, total, over32, top, err}
 		}(p)
 	}
 
@@ -1328,6 +1377,7 @@ func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN int
 	// Merge results from all partitions
 	var allCounts []int64
 	var totalSum int64
+	var over32Sum int64
 	mergedTopN := &topNHeap{maxSize: topN, entries: make([]TopEntry, 0, topN)}
 
 	for r := range results {
@@ -1336,6 +1386,7 @@ func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN int
 		}
 		allCounts = append(allCounts, r.counts...)
 		totalSum += r.total
+		over32Sum += r.over32Bytes
 
 		// Merge top-N entries
 		for _, entry := range r.topN {
@@ -1358,21 +1409,23 @@ func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN int
 	})
 
 	return &DistributionStats{
-		Count: int64(len(allCounts)),
-		Min:   allCounts[0],
-		Max:   allCounts[len(allCounts)-1],
-		Mean:  float64(totalSum) / float64(len(allCounts)),
-		Total: totalSum,
-		P50:   percentile(allCounts, 50),
-		P75:   percentile(allCounts, 75),
-		P90:   percentile(allCounts, 90),
-		P99:   percentile(allCounts, 99),
-		TopN:  mergedTopN.getSorted(),
+		Count:       int64(len(allCounts)),
+		Min:         allCounts[0],
+		Max:         allCounts[len(allCounts)-1],
+		Mean:        float64(totalSum) / float64(len(allCounts)),
+		Total:       totalSum,
+		P50:         percentile(allCounts, 50),
+		P75:         percentile(allCounts, 75),
+		P90:         percentile(allCounts, 90),
+		P99:         percentile(allCounts, 99),
+		TopN:        mergedTopN.getSorted(),
+		Over32Bytes: over32Sum,
 	}, nil
 }
 
 // scanDistributionPartition scans a partition and returns counts for distribution
-func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition, totalPartitions, topN int) ([]int64, int64, []TopEntry, error) {
+// Returns: counts, total, over32Bytes, topN entries, error
+func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition, totalPartitions, topN int) ([]int64, int64, int64, []TopEntry, error) {
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 
@@ -1390,6 +1443,7 @@ func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition
 	startKey := []byte{indexType, startByte}
 	var counts []int64
 	var total int64
+	var over32Bytes int64
 	topHeap := &topNHeap{maxSize: topN, entries: make([]TopEntry, 0, topN)}
 
 	for it.Seek(startKey); it.Valid(); it.Next() {
@@ -1403,6 +1457,12 @@ func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition
 			break
 		}
 
+		// Count values > 32 bytes (key[1:] is the value portion)
+		valueLen := len(key) - 1
+		if valueLen > 32 {
+			over32Bytes++
+		}
+
 		var eventCount int64
 		if it.Value().Size() == 8 {
 			eventCount = int64(binary.BigEndian.Uint64(it.Value().Data()))
@@ -1414,10 +1474,10 @@ func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition
 	}
 
 	if err := it.Err(); err != nil {
-		return nil, 0, nil, fmt.Errorf("iterator error for type %d partition %d: %w", indexType, partition, err)
+		return nil, 0, 0, nil, fmt.Errorf("iterator error for type %d partition %d: %w", indexType, partition, err)
 	}
 
-	return counts, total, topHeap.getSorted(), nil
+	return counts, total, over32Bytes, topHeap.getSorted(), nil
 }
 
 // percentile calculates the p-th percentile from a sorted slice

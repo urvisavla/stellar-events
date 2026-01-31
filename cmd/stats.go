@@ -68,12 +68,26 @@ func cmdStats(cfg *config.Config, top int) {
 	p.Printf("  Last processed ledger: %d\n", dbStats.LastProcessed)
 	p.Printf("  Unique contracts:      %d\n", dbStats.UniqueContracts)
 
+	// Ledger transaction stats
+	fmt.Fprintf(os.Stderr, "Scanning ledger transaction counts...\n")
+	ledgerTxStats, err := eventStore.GetLedgerTxStats()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to get ledger tx stats: %v\n", err)
+	} else if ledgerTxStats != nil {
+		p.Printf("  Ledgers with >10k tx:  %d\n", ledgerTxStats.LedgersOver10kTx)
+	}
+
 	// Per-column-family storage stats
 	snapshot, err := eventStore.GetStorageSnapshot()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get storage stats: %v\n", err)
 	} else {
 		printStorageStats(snapshot)
+		// Compute avg bytes per event
+		if eventsCF, ok := snapshot.ColumnFamilies["events"]; ok && dbStats.TotalEvents > 0 {
+			avgBytes := float64(eventsCF.SSTFilesBytes) / float64(dbStats.TotalEvents)
+			p.Printf("  Avg bytes/event:       %.1f bytes\n", avgBytes)
+		}
 	}
 
 	// Bitmap index stats

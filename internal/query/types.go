@@ -135,7 +135,7 @@ type RangeResult struct {
 type Event struct {
 	LedgerSequence   uint32   `json:"ledger_sequence"`
 	TransactionIndex int      `json:"transaction_index"`
-	OperationIndex   int      `json:"operation_index,omitempty"`
+	OperationIndex   int      `json:"operation_index"`
 	EventIndex       int      `json:"event_index"`
 	ContractID       string   `json:"contract_id,omitempty"`
 	Type             string   `json:"type"`
