@@ -97,6 +97,9 @@ type IngestionConfig struct {
 	Workers   int `toml:"workers"`    // Parallel workers (0 = NumCPU)
 	BatchSize int `toml:"batch_size"` // Ledgers per batch (default: 100)
 	QueueSize int `toml:"queue_size"` // Pipeline buffer (0 = workers * 2)
+
+	// Event filtering - skip events with these topic0 values (base64-encoded)
+	ExcludeTopic0 []string `toml:"exclude_topic0"`
 }
 
 // =============================================================================

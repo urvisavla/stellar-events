@@ -31,6 +31,10 @@ type IngestEvent struct {
 type StoreOptions struct {
 	UniqueIndexes bool // Maintain unique value indexes with counts
 	BitmapIndexes bool // Maintain roaring bitmap indexes for fast queries
+
+	// ExcludeTopic0 is a set of topic0 values (as strings) to skip during ingestion.
+	// Events with matching topic0 will not be stored.
+	ExcludeTopic0 map[string]struct{}
 }
 
 // =============================================================================

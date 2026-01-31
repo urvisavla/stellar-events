@@ -428,6 +428,14 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 	}
 
 	for _, event := range events {
+		// Skip events with excluded topic0 values
+		if len(opts.ExcludeTopic0) > 0 && len(event.Topics) > 0 {
+			topic0Key := string(event.Topics[0])
+			if _, excluded := opts.ExcludeTopic0[topic0Key]; excluded {
+				continue
+			}
+		}
+
 		key := eventKey(event)
 
 		// Encode event based on configured format

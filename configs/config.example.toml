@@ -109,6 +109,9 @@ batch_size = 100
 # Pipeline buffer size (0 = workers * 2)
 queue_size = 0
 
+
+#exclude_topic0 = ["AAAADwAAAAh0cmFuc2Zlcg==","AAAADwAAAANmZWUA","AAAADwAAAARtaW50","AAAADwAAAARidXJu","AAAADwAAAA5zZXRfYXV0aG9yaXplZAAA","AAAADwAAAAhjbGF3YmFjaw==","AAAADgAAAARzd2Fw","AAAADwAAAARzd2Fw"]
+
 # =============================================================================
 # Query
 # =============================================================================

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -16,24 +17,31 @@ import (
 // =============================================================================
 
 func runStats(cfg *config.Config, args []string) {
-	// Check for help flag
-	for _, arg := range args {
-		if arg == "-h" || arg == "--help" {
-			fmt.Fprintf(os.Stderr, "Usage: stats\n\n")
-			fmt.Fprintf(os.Stderr, "Shows comprehensive database statistics including:\n")
-			fmt.Fprintf(os.Stderr, "  - Event counts and ledger ranges\n")
-			fmt.Fprintf(os.Stderr, "  - RocksDB storage metrics per column family\n")
-			fmt.Fprintf(os.Stderr, "  - Bitmap index statistics\n")
-			fmt.Fprintf(os.Stderr, "  - Unique index entry counts\n")
-			fmt.Fprintf(os.Stderr, "  - Event distribution by contract/topic\n")
-			os.Exit(0)
-		}
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+
+	top := fs.Int("top", 10, "Number of top entries to show in distribution stats")
+
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: stats [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Shows comprehensive database statistics including:\n")
+		fmt.Fprintf(os.Stderr, "  - Event counts and ledger ranges\n")
+		fmt.Fprintf(os.Stderr, "  - RocksDB storage metrics per column family\n")
+		fmt.Fprintf(os.Stderr, "  - Bitmap index statistics\n")
+		fmt.Fprintf(os.Stderr, "  - Unique index entry counts\n")
+		fmt.Fprintf(os.Stderr, "  - Event distribution by contract/topic\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		fs.PrintDefaults()
 	}
 
-	cmdStats(cfg)
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+
+	cmdStats(cfg, *top)
 }
 
-func cmdStats(cfg *config.Config) {
+func cmdStats(cfg *config.Config, top int) {
 	p := message.NewPrinter(language.English)
 
 	eventStore, err := openEventStore(cfg)
@@ -102,9 +110,9 @@ func cmdStats(cfg *config.Config) {
 		p.Printf("  Topic3:    %d unique (%d total events)\n", uniqueCounts.UniqueTopic3, uniqueCounts.TotalTopic3Events)
 	}
 
-	// Distribution stats (top 10)
-	fmt.Fprintf(os.Stderr, "Computing distribution statistics...\n")
-	dist, err := eventStore.GetIndexDistribution(10)
+	// Distribution stats
+	fmt.Fprintf(os.Stderr, "Computing distribution statistics (top %d)...\n", top)
+	dist, err := eventStore.GetIndexDistribution(top)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to get distribution: %v\n", err)
 	} else {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"os"
@@ -106,6 +107,21 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		fmt.Fprintf(os.Stderr, "Progress file: %s\n", cfg.Ingestion.ProgressFile)
 	}
 
+	// Build exclude topic0 filter from config
+	var excludeTopic0 map[string]struct{}
+	if len(cfg.Ingestion.ExcludeTopic0) > 0 {
+		excludeTopic0 = make(map[string]struct{})
+		for _, b64 := range cfg.Ingestion.ExcludeTopic0 {
+			decoded, err := base64.StdEncoding.DecodeString(b64)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: invalid exclude_topic0 value %q: %v\n", b64, err)
+				continue
+			}
+			excludeTopic0[string(decoded)] = struct{}{}
+		}
+		fmt.Fprintf(os.Stderr, "Excluding %d topic0 values from ingestion\n", len(excludeTopic0))
+	}
+
 	pipelineConfig := ingest.PipelineConfig{
 		Workers:             workers,
 		BatchSize:           batchSize,
@@ -115,6 +131,7 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		MaintainUniqueIdx:   cfg.Ingestion.UniqueIndexes,
 		MaintainBitmapIdx:   cfg.Ingestion.BitmapIndexes,
 		BitmapFlushInterval: cfg.Ingestion.BitmapFlushInterval,
+		ExcludeTopic0:       excludeTopic0,
 	}
 
 	pipeline := ingest.NewPipeline(pipelineConfig, eventStore)

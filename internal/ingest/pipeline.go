@@ -21,6 +21,10 @@ type PipelineConfig struct {
 	MaintainUniqueIdx   bool   // Maintain unique indexes during ingestion
 	MaintainBitmapIdx   bool   // Maintain roaring bitmap indexes during ingestion
 	BitmapFlushInterval int    // Ledgers between bitmap index flushes (0 = only at end)
+
+	// ExcludeTopic0 is a set of topic0 values to skip during ingestion.
+	// Keys are the raw topic0 bytes as strings.
+	ExcludeTopic0 map[string]struct{}
 }
 
 // PipelineStats tracks pipeline performance
@@ -263,6 +267,7 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 				_, err := p.store.StoreEvents(eventBatch, &store.StoreOptions{
 					UniqueIndexes: p.config.MaintainUniqueIdx,
 					BitmapIndexes: p.config.MaintainBitmapIdx,
+					ExcludeTopic0: p.config.ExcludeTopic0,
 				})
 				atomic.AddInt64(&p.stats.WriteTimeNs, time.Since(writeStart).Nanoseconds())
 
