@@ -35,6 +35,9 @@ type StoreOptions struct {
 	// ExcludeTopic0 is a set of topic0 values (as strings) to skip during ingestion.
 	// Events with matching topic0 will not be stored.
 	ExcludeTopic0 map[string]struct{}
+
+	// ExcludeDiagnostic skips diagnostic events during ingestion.
+	ExcludeDiagnostic bool
 }
 
 // =============================================================================

@@ -100,6 +100,9 @@ type IngestionConfig struct {
 
 	// Event filtering - skip events with these topic0 values (base64-encoded)
 	ExcludeTopic0 []string `toml:"exclude_topic0"`
+
+	// Event type filtering - skip diagnostic events (default: false)
+	ExcludeDiagnostic bool `toml:"exclude_diagnostic"`
 }
 
 // =============================================================================

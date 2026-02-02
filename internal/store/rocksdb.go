@@ -428,6 +428,11 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 	}
 
 	for _, event := range events {
+		// Skip diagnostic events if configured
+		if opts.ExcludeDiagnostic && event.EventType == 2 {
+			continue
+		}
+
 		// Skip events with excluded topic0 values
 		if len(opts.ExcludeTopic0) > 0 && len(event.Topics) > 0 {
 			topic0Key := string(event.Topics[0])

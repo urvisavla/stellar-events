@@ -25,6 +25,9 @@ type PipelineConfig struct {
 	// ExcludeTopic0 is a set of topic0 values to skip during ingestion.
 	// Keys are the raw topic0 bytes as strings.
 	ExcludeTopic0 map[string]struct{}
+
+	// ExcludeDiagnostic skips diagnostic events during ingestion.
+	ExcludeDiagnostic bool
 }
 
 // PipelineStats tracks pipeline performance
@@ -182,7 +185,7 @@ func (p *Pipeline) processLedger(ledgerReader *reader.LedgerReader, seq uint32) 
 
 	// Parse XDR and extract events (use fast mode - events are written immediately)
 	unmarshalStart := time.Now()
-	events, err := ExtractEventsFast(xdrBytes, p.config.NetworkPassphrase, result.Stats)
+	events, err := ExtractEventsFastFiltered(xdrBytes, p.config.NetworkPassphrase, result.Stats, p.config.ExcludeDiagnostic)
 	result.UnmarshalTime = time.Since(unmarshalStart)
 
 	if err != nil {
@@ -265,9 +268,10 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 			if (batchFull || atEnd) && len(eventBatch) > 0 {
 				writeStart := time.Now()
 				_, err := p.store.StoreEvents(eventBatch, &store.StoreOptions{
-					UniqueIndexes: p.config.MaintainUniqueIdx,
-					BitmapIndexes: p.config.MaintainBitmapIdx,
-					ExcludeTopic0: p.config.ExcludeTopic0,
+					UniqueIndexes:     p.config.MaintainUniqueIdx,
+					BitmapIndexes:     p.config.MaintainBitmapIdx,
+					ExcludeTopic0:     p.config.ExcludeTopic0,
+					ExcludeDiagnostic: p.config.ExcludeDiagnostic,
 				})
 				atomic.AddInt64(&p.stats.WriteTimeNs, time.Since(writeStart).Nanoseconds())
 

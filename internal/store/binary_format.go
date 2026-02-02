@@ -32,8 +32,9 @@ const (
 	binaryFormatVersion = 0x01
 
 	// BinaryEventType* constants match XDR ContractEventType
-	BinaryEventTypeContract   = 0
-	BinaryEventTypeSystem     = 1
+	// XDR: SYSTEM=0, CONTRACT=1, DIAGNOSTIC=2
+	BinaryEventTypeSystem     = 0
+	BinaryEventTypeContract   = 1
 	BinaryEventTypeDiagnostic = 2
 
 	// Flags

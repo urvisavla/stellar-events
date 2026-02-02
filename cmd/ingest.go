@@ -132,6 +132,7 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		MaintainBitmapIdx:   cfg.Ingestion.BitmapIndexes,
 		BitmapFlushInterval: cfg.Ingestion.BitmapFlushInterval,
 		ExcludeTopic0:       excludeTopic0,
+		ExcludeDiagnostic:   cfg.Ingestion.ExcludeDiagnostic,
 	}
 
 	pipeline := ingest.NewPipeline(pipelineConfig, eventStore)

@@ -14,19 +14,25 @@ import (
 // This is the fastest extraction mode - no field parsing, just raw bytes.
 // Uses defensive copies to prevent memory leaks (safe for long-lived events).
 func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats) ([]*store.IngestEvent, error) {
-	return ExtractEventsWithOptions(xdrBytes, networkPassphrase, stats, false)
+	return ExtractEventsWithOptions(xdrBytes, networkPassphrase, stats, false, false)
 }
 
 // ExtractEventsFast extracts events without defensive memory copies.
 // Use this for bulk ingestion where events are written immediately and not held in memory.
 // The returned events are only valid until the next call or until xdrBytes is modified.
 func ExtractEventsFast(xdrBytes []byte, networkPassphrase string, stats *LedgerStats) ([]*store.IngestEvent, error) {
-	return ExtractEventsWithOptions(xdrBytes, networkPassphrase, stats, true)
+	return ExtractEventsWithOptions(xdrBytes, networkPassphrase, stats, true, false)
+}
+
+// ExtractEventsFastFiltered extracts events without defensive memory copies, with optional diagnostic filtering.
+func ExtractEventsFastFiltered(xdrBytes []byte, networkPassphrase string, stats *LedgerStats, excludeDiagnostic bool) ([]*store.IngestEvent, error) {
+	return ExtractEventsWithOptions(xdrBytes, networkPassphrase, stats, true, excludeDiagnostic)
 }
 
 // ExtractEventsWithOptions extracts events with configurable memory behavior.
 // When fastMode is true, skips defensive copies for better performance during bulk ingestion.
-func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *LedgerStats, fastMode bool) ([]*store.IngestEvent, error) {
+// When excludeDiagnostic is true, skips diagnostic events (type=2).
+func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *LedgerStats, fastMode bool, excludeDiagnostic bool) ([]*store.IngestEvent, error) {
 	var lcm xdr.LedgerCloseMeta
 	if err := lcm.UnmarshalBinary(xdrBytes); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal LedgerCloseMeta: %w", err)
@@ -79,6 +85,11 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 
 		// Process transaction-level events
 		for eventIndex, event := range txEvents.TransactionEvents {
+			// Skip diagnostic events if configured
+			if excludeDiagnostic && event.Event.Type == xdr.ContractEventTypeDiagnostic {
+				continue
+			}
+
 			if stats != nil {
 				stats.TransactionEvents++
 				stats.TotalEvents++
@@ -113,7 +124,7 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 			events = append(events, &store.IngestEvent{
 				LedgerSequence:   ledgerSeq,
 				TransactionIndex: uint16(tx.Index),
-				OperationIndex:   0, // Transaction-level events have no operation
+				OperationIndex:   0xFFFF, // Transaction-level events use sentinel value
 				EventIndex:       uint16(eventIndex),
 				RawXDR:           rawXDR,
 				ContractID:       contractID,
@@ -127,6 +138,11 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 		// Process operation-level events
 		for opIndex, opEvents := range txEvents.OperationEvents {
 			for eventIndex, event := range opEvents {
+				// Skip diagnostic events if configured
+				if excludeDiagnostic && event.Type == xdr.ContractEventTypeDiagnostic {
+					continue
+				}
+
 				if stats != nil {
 					stats.OperationEvents++
 					stats.TotalEvents++
