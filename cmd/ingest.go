@@ -123,16 +123,17 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	}
 
 	pipelineConfig := ingest.PipelineConfig{
-		Workers:             workers,
-		BatchSize:           batchSize,
-		QueueSize:           queueSize,
-		DataDir:             cfg.Source.LedgerDir,
-		NetworkPassphrase:   networkPassphrase,
-		MaintainUniqueIdx:   cfg.Ingestion.UniqueIndexes,
-		MaintainBitmapIdx:   cfg.Ingestion.BitmapIndexes,
-		BitmapFlushInterval: cfg.Ingestion.BitmapFlushInterval,
-		ExcludeTopic0:       excludeTopic0,
-		ExcludeDiagnostic:   cfg.Ingestion.ExcludeDiagnostic,
+		Workers:                workers,
+		BatchSize:              batchSize,
+		QueueSize:              queueSize,
+		DataDir:                cfg.Source.LedgerDir,
+		NetworkPassphrase:      networkPassphrase,
+		MaintainUniqueIdx:      cfg.Ingestion.UniqueIndexes,
+		MaintainBitmapIdx:      cfg.Ingestion.BitmapIndexes,
+		MaintainPostingListIdx: cfg.Ingestion.PostingListIndexes,
+		IndexFlushInterval:     cfg.Ingestion.IndexFlushInterval,
+		ExcludeTopic0:          excludeTopic0,
+		ExcludeDiagnostic:      cfg.Ingestion.ExcludeDiagnostic,
 	}
 
 	pipeline := ingest.NewPipeline(pipelineConfig, eventStore)
@@ -322,7 +323,7 @@ func printStorageSnapshot(sb *strings.Builder, snapshot *store.StorageSnapshot) 
 	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
 
 	// Print in a consistent order
-	cfOrder := []string{"events", "bitmap", "unique", "default"}
+	cfOrder := []string{"events", "contracts", "topics", "bitmap", "unique", "default"}
 	for _, name := range cfOrder {
 		cf, ok := snapshot.ColumnFamilies[name]
 		if !ok {
@@ -352,7 +353,7 @@ func printCompactionSummary(sb *strings.Builder, cs *store.CompactionSummary) {
 	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
 
 	// Print in a consistent order
-	cfOrder := []string{"events", "bitmap", "unique", "default"}
+	cfOrder := []string{"events", "contracts", "topics", "bitmap", "unique", "default"}
 	for _, name := range cfOrder {
 		cf, ok := cs.PerCF[name]
 		if !ok {

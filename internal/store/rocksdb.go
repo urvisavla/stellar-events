@@ -21,10 +21,12 @@ import (
 
 // Column family names
 const (
-	CFDefault = "default" // Metadata (last_processed_ledger, etc.)
-	CFEvents  = "events"  // Primary event storage (raw XDR)
-	CFUnique  = "unique"  // Unique value indexes with counts
-	CFBitmap  = "bitmap"  // Roaring bitmap inverted indexes
+	CFDefault   = "default"   // Metadata (last_processed_ledger, etc.)
+	CFEvents    = "events"    // Primary event storage (raw XDR or binary)
+	CFUnique    = "unique"    // Unique value indexes with counts
+	CFBitmap    = "bitmap"    // Roaring bitmap inverted indexes
+	CFContracts = "contracts" // Contract ID posting lists (TOID lists)
+	CFTopics    = "topics"    // Topic posting lists (TOID lists)
 )
 
 // Unique index type prefixes within CFUnique
@@ -78,35 +80,75 @@ func (m *uint64AddMergeOperator) PartialMerge(key, leftOperand, rightOperand []b
 	return result, true
 }
 
-// eventKey generates a 10-byte binary key for events
-// Format: [ledger:4][tx:2][op:2][event:2]
+// postingListMergeOperator implements a merge operator that concatenates TOID lists.
+// Since events arrive in ledger order, new TOIDs are always >= existing TOIDs,
+// so simple concatenation maintains sorted order.
+type postingListMergeOperator struct{}
+
+func (m *postingListMergeOperator) Name() string {
+	return "posting-list-append"
+}
+
+func (m *postingListMergeOperator) FullMerge(key, existingValue []byte, operands [][]byte) ([]byte, bool) {
+	// Calculate total size needed
+	totalSize := len(existingValue)
+	for _, operand := range operands {
+		totalSize += len(operand)
+	}
+
+	// Concatenate all values
+	result := make([]byte, 0, totalSize)
+	if len(existingValue) > 0 {
+		result = append(result, existingValue...)
+	}
+	for _, operand := range operands {
+		result = append(result, operand...)
+	}
+
+	return result, true
+}
+
+func (m *postingListMergeOperator) PartialMerge(key, leftOperand, rightOperand []byte) ([]byte, bool) {
+	// Simple concatenation - append right to left
+	result := make([]byte, len(leftOperand)+len(rightOperand))
+	copy(result, leftOperand)
+	copy(result[len(leftOperand):], rightOperand)
+	return result, true
+}
+
+// eventKey generates a 10-byte binary key for events using TOID format.
+// Format: [toid:8][event_index:2]
+// TOID = (ledger << 32) | (tx << 12) | op
 func eventKey(e *IngestEvent) []byte {
+	toid := (uint64(e.LedgerSequence) << 32) |
+		(uint64(e.TransactionIndex&0xFFFFF) << 12) |
+		uint64(e.OperationIndex&0xFFF)
 	key := make([]byte, 10)
-	binary.BigEndian.PutUint32(key[0:4], e.LedgerSequence)
-	binary.BigEndian.PutUint16(key[4:6], e.TransactionIndex)
-	binary.BigEndian.PutUint16(key[6:8], e.OperationIndex)
+	binary.BigEndian.PutUint64(key[0:8], toid)
 	binary.BigEndian.PutUint16(key[8:10], e.EventIndex)
 	return key
 }
 
-// eventKeyFromParts generates a 10-byte binary key from components
-func eventKeyFromParts(ledger uint32, tx, op, event uint16) []byte {
+// eventKeyFromParts generates a 10-byte binary key from components using TOID format.
+// tx supports 20 bits (0-1,048,575), op supports 12 bits (0-4,095)
+func eventKeyFromParts(ledger uint32, tx, op uint32, event uint16) []byte {
+	toid := (uint64(ledger) << 32) | (uint64(tx&0xFFFFF) << 12) | uint64(op&0xFFF)
 	key := make([]byte, 10)
-	binary.BigEndian.PutUint32(key[0:4], ledger)
-	binary.BigEndian.PutUint16(key[4:6], tx)
-	binary.BigEndian.PutUint16(key[6:8], op)
+	binary.BigEndian.PutUint64(key[0:8], toid)
 	binary.BigEndian.PutUint16(key[8:10], event)
 	return key
 }
 
-// parseEventKey extracts position info from a binary key
-func parseEventKey(key []byte) (ledger uint32, tx, op, event uint16) {
+// parseEventKey extracts position info from a 10-byte TOID-format key.
+// Returns ledger, tx (20 bits), op (12 bits), and event index.
+func parseEventKey(key []byte) (ledger uint32, tx, op uint32, event uint16) {
 	if len(key) < 10 {
 		return 0, 0, 0, 0
 	}
-	ledger = binary.BigEndian.Uint32(key[0:4])
-	tx = binary.BigEndian.Uint16(key[4:6])
-	op = binary.BigEndian.Uint16(key[6:8])
+	toid := binary.BigEndian.Uint64(key[0:8])
+	ledger = uint32(toid >> 32)
+	tx = uint32((toid >> 12) & 0xFFFFF)
+	op = uint32(toid & 0xFFF)
 	event = binary.BigEndian.Uint16(key[8:10])
 	return
 }
@@ -121,7 +163,7 @@ func uniqueKey(uniqueType byte, value []byte) []byte {
 }
 
 // parseRawXDRToEvent converts raw XDR bytes and key info to a ContractEvent
-func parseRawXDRToEvent(rawXDR []byte, ledger uint32, tx, op, eventIdx uint16) (*ContractEvent, error) {
+func parseRawXDRToEvent(rawXDR []byte, ledger uint32, tx, op uint32, eventIdx uint16) (*ContractEvent, error) {
 	var xdrEvent xdr.ContractEvent
 	if err := xdrEvent.UnmarshalBinary(rawXDR); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal XDR event: %w", err)
@@ -179,11 +221,13 @@ type RocksDBEventStore struct {
 	eventFormat string // "xdr" or "binary"
 
 	// Column family handles (managed by DB, don't destroy manually)
-	cfHandles []*grocksdb.ColumnFamilyHandle
-	cfDefault *grocksdb.ColumnFamilyHandle // Metadata
-	cfEvents  *grocksdb.ColumnFamilyHandle // Primary event storage
-	cfUnique  *grocksdb.ColumnFamilyHandle // Unique value indexes with counts
-	cfBitmap  *grocksdb.ColumnFamilyHandle // Roaring bitmap indexes
+	cfHandles   []*grocksdb.ColumnFamilyHandle
+	cfDefault   *grocksdb.ColumnFamilyHandle // Metadata
+	cfEvents    *grocksdb.ColumnFamilyHandle // Primary event storage
+	cfUnique    *grocksdb.ColumnFamilyHandle // Unique value indexes with counts
+	cfBitmap    *grocksdb.ColumnFamilyHandle // Roaring bitmap indexes
+	cfContracts *grocksdb.ColumnFamilyHandle // Contract ID posting lists
+	cfTopics    *grocksdb.ColumnFamilyHandle // Topic posting lists
 
 	// Index store (manages bitmap indexes with RocksDB persistence)
 	indexStore *index.RocksDBStore
@@ -195,6 +239,12 @@ type RocksDBEventStore struct {
 
 	// Keep merge operator alive to prevent GC (RocksDB holds a reference)
 	mergeOp grocksdb.MergeOperator
+
+	// In-memory posting list accumulation (for efficient batch writes)
+	postingsMu        sync.Mutex
+	contractPostings  map[string][]byte // index key -> accumulated TOIDs
+	topicPostings     map[string][]byte // index key -> accumulated TOIDs
+	postingsLedgerCnt int               // ledgers accumulated since last flush
 }
 
 // NewEventStore creates a new event store with RocksDB backend
@@ -249,9 +299,35 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 	}
 	bitmapOpts.SetBlockBasedTableFactory(bitmapBBTO)
 
-	cfNames := []string{CFDefault, CFEvents, CFUnique, CFBitmap}
-	cfOpts := []*grocksdb.Options{defaultOpts, eventsOpts, uniqueOpts, bitmapOpts}
-	bbtoList := []*grocksdb.BlockBasedTableOptions{eventsBBTO, uniqueBBTO, bitmapBBTO}
+	// Contracts CF - posting lists (TOID arrays) for contract ID lookups
+	// Uses merge operator for append-only writes
+	contractsOpts := grocksdb.NewDefaultOptions()
+	applyRocksDBOptions(contractsOpts, rocksOpts)
+	contractsMergeOp := &postingListMergeOperator{}
+	contractsOpts.SetMergeOperator(contractsMergeOp)
+	contractsBBTO := grocksdb.NewDefaultBlockBasedTableOptions()
+	contractsBBTO.SetBlockSize(16 * 1024)
+	if rocksOpts != nil && rocksOpts.BloomFilterBitsPerKey > 0 {
+		contractsBBTO.SetFilterPolicy(grocksdb.NewBloomFilter(float64(rocksOpts.BloomFilterBitsPerKey)))
+	}
+	contractsOpts.SetBlockBasedTableFactory(contractsBBTO)
+
+	// Topics CF - posting lists (TOID arrays) for topic lookups
+	// Uses merge operator for append-only writes
+	topicsOpts := grocksdb.NewDefaultOptions()
+	applyRocksDBOptions(topicsOpts, rocksOpts)
+	topicsMergeOp := &postingListMergeOperator{}
+	topicsOpts.SetMergeOperator(topicsMergeOp)
+	topicsBBTO := grocksdb.NewDefaultBlockBasedTableOptions()
+	topicsBBTO.SetBlockSize(16 * 1024)
+	if rocksOpts != nil && rocksOpts.BloomFilterBitsPerKey > 0 {
+		topicsBBTO.SetFilterPolicy(grocksdb.NewBloomFilter(float64(rocksOpts.BloomFilterBitsPerKey)))
+	}
+	topicsOpts.SetBlockBasedTableFactory(topicsBBTO)
+
+	cfNames := []string{CFDefault, CFEvents, CFUnique, CFBitmap, CFContracts, CFTopics}
+	cfOpts := []*grocksdb.Options{defaultOpts, eventsOpts, uniqueOpts, bitmapOpts, contractsOpts, topicsOpts}
+	bbtoList := []*grocksdb.BlockBasedTableOptions{eventsBBTO, uniqueBBTO, bitmapBBTO, contractsBBTO, topicsBBTO}
 
 	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(baseOpts, dbPath, cfNames, cfOpts)
 	if err != nil {
@@ -291,22 +367,26 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 	}
 
 	return &RocksDBEventStore{
-		db:          db,
-		dbPath:      dbPath,
-		wo:          wo,
-		ro:          grocksdb.NewDefaultReadOptions(),
-		indexes:     indexes,
-		eventFormat: "xdr", // Default to XDR format
-		cfHandles:   cfHandles,
-		cfDefault:   cfHandles[0],
-		cfEvents:    cfHandles[1],
-		cfUnique:    cfHandles[2],
-		cfBitmap:    cfHandles[3],
-		indexStore:  indexStore,
-		baseOpts:    baseOpts,
-		cfOpts:      cfOpts,
-		bbtoList:    bbtoList,
-		mergeOp:     mergeOp,
+		db:               db,
+		dbPath:           dbPath,
+		wo:               wo,
+		ro:               grocksdb.NewDefaultReadOptions(),
+		indexes:          indexes,
+		eventFormat:      "xdr", // Default to XDR format
+		cfHandles:        cfHandles,
+		cfDefault:        cfHandles[0],
+		cfEvents:         cfHandles[1],
+		cfUnique:         cfHandles[2],
+		cfBitmap:         cfHandles[3],
+		cfContracts:      cfHandles[4],
+		cfTopics:         cfHandles[5],
+		indexStore:       indexStore,
+		baseOpts:         baseOpts,
+		cfOpts:           cfOpts,
+		bbtoList:         bbtoList,
+		mergeOp:          mergeOp,
+		contractPostings: make(map[string][]byte),
+		topicPostings:    make(map[string][]byte),
 	}, nil
 }
 
@@ -427,6 +507,12 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 		bitmapIdx = es.indexStore.GetBitmapIndex()
 	}
 
+	// Lock posting list maps if we'll be updating them
+	if opts.PostingListIndexes {
+		es.postingsMu.Lock()
+		defer es.postingsMu.Unlock()
+	}
+
 	for _, event := range events {
 		// Skip diagnostic events if configured
 		if opts.ExcludeDiagnostic && event.EventType == 2 {
@@ -446,7 +532,7 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 		// Encode event based on configured format
 		var value []byte
 		if es.eventFormat == "binary" {
-			value = EncodeBinaryEvent(event, event.EventType, event.DataBytes)
+			value = EncodeBinaryEvent(event)
 		} else {
 			value = event.RawXDR
 		}
@@ -466,6 +552,28 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 					break // Only index first 4 topics
 				}
 				bitmapIdx.AddTopicIndex(i, topicBytes, event.LedgerSequence)
+			}
+		}
+
+		// Accumulate posting list TOIDs in memory (flushed periodically)
+		if opts.PostingListIndexes {
+			// Compute TOID for this event
+			toid := index.EncodeTOID(event.LedgerSequence, uint32(event.TransactionIndex), uint32(event.OperationIndex))
+			toidBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(toidBytes, toid)
+
+			// Accumulate contract ID -> TOIDs
+			if len(event.ContractID) > 0 {
+				termKey := index.ContractTermKey(event.ContractID)
+				indexKey := string(index.EncodeIndexKey(termKey, event.LedgerSequence))
+				es.contractPostings[indexKey] = append(es.contractPostings[indexKey], toidBytes...)
+			}
+
+			// Accumulate all topics (non-positional) -> TOIDs
+			for _, topicBytes := range event.Topics {
+				termKey := index.TopicTermKey(topicBytes)
+				indexKey := string(index.EncodeIndexKey(termKey, event.LedgerSequence))
+				es.topicPostings[indexKey] = append(es.topicPostings[indexKey], toidBytes...)
 			}
 		}
 
@@ -511,6 +619,9 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 		}
 	}
 
+	// Note: Posting list indexes are accumulated in memory and flushed
+	// periodically via FlushPostingListIndexes() for better write efficiency
+
 	if err := es.db.Write(es.wo, batch); err != nil {
 		return 0, fmt.Errorf("failed to write batch: %w", err)
 	}
@@ -524,6 +635,64 @@ func (es *RocksDBEventStore) FlushBitmapIndexes() error {
 		return nil
 	}
 	return es.indexStore.Flush()
+}
+
+// FlushPostingListIndexes flushes accumulated posting list entries to disk.
+// Returns the number of contract and topic keys flushed.
+func (es *RocksDBEventStore) FlushPostingListIndexes() (int, int, error) {
+	es.postingsMu.Lock()
+	defer es.postingsMu.Unlock()
+
+	if len(es.contractPostings) == 0 && len(es.topicPostings) == 0 {
+		return 0, 0, nil
+	}
+
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+
+	contractKeys := 0
+	topicKeys := 0
+
+	// Write all accumulated contract postings
+	for keyStr, toids := range es.contractPostings {
+		batch.MergeCF(es.cfContracts, []byte(keyStr), toids)
+		contractKeys++
+	}
+
+	// Write all accumulated topic postings
+	for keyStr, toids := range es.topicPostings {
+		batch.MergeCF(es.cfTopics, []byte(keyStr), toids)
+		topicKeys++
+	}
+
+	if err := es.db.Write(es.wo, batch); err != nil {
+		return 0, 0, fmt.Errorf("failed to flush posting list indexes: %w", err)
+	}
+
+	// Clear the maps
+	es.contractPostings = make(map[string][]byte)
+	es.topicPostings = make(map[string][]byte)
+	es.postingsLedgerCnt = 0
+
+	return contractKeys, topicKeys, nil
+}
+
+// GetPostingListStats returns statistics about in-memory posting list accumulation.
+func (es *RocksDBEventStore) GetPostingListStats() (contractKeys, topicKeys int, contractBytes, topicBytes int64) {
+	es.postingsMu.Lock()
+	defer es.postingsMu.Unlock()
+
+	contractKeys = len(es.contractPostings)
+	topicKeys = len(es.topicPostings)
+
+	for _, v := range es.contractPostings {
+		contractBytes += int64(len(v))
+	}
+	for _, v := range es.topicPostings {
+		topicBytes += int64(len(v))
+	}
+
+	return
 }
 
 // GetBitmapStats returns bitmap index statistics
@@ -916,7 +1085,7 @@ func (es *RocksDBEventStore) GetStorageSnapshot() (*StorageSnapshot, error) {
 		ColumnFamilies: make(map[string]*ColumnFamilyStats),
 	}
 
-	cfNames := []string{CFDefault, CFEvents, CFUnique, CFBitmap}
+	cfNames := []string{CFDefault, CFEvents, CFUnique, CFBitmap, CFContracts, CFTopics}
 
 	// Helper to parse uint64 from RocksDB property string
 	parseUint64 := func(val string) uint64 {
@@ -1243,8 +1412,9 @@ func (es *RocksDBEventStore) countIndexTypePartition(indexType byte, partition, 
 
 // topNHeap is a min-heap for tracking top N entries by count
 type topNHeap struct {
-	entries []TopEntry
-	maxSize int
+	entries   []TopEntry
+	maxSize   int
+	indexType byte // Used to determine encoding format (strkey for contracts)
 }
 
 func (h *topNHeap) Len() int           { return len(h.entries) }
@@ -1268,15 +1438,30 @@ func (h *topNHeap) tryAdd(value []byte, count int64) {
 	if h.maxSize <= 0 {
 		return
 	}
+
+	// Encode value based on index type
+	var encoded string
+	if h.indexType == UniqueTypeContract && len(value) == 32 {
+		// Contract IDs: encode as strkey (C...)
+		if s, err := strkey.Encode(strkey.VersionByteContract, value); err == nil {
+			encoded = s
+		} else {
+			encoded = base64.StdEncoding.EncodeToString(value)
+		}
+	} else {
+		// Topics and other values: use base64
+		encoded = base64.StdEncoding.EncodeToString(value)
+	}
+
 	if len(h.entries) < h.maxSize {
 		heap.Push(h, TopEntry{
-			Value:      base64.StdEncoding.EncodeToString(value),
+			Value:      encoded,
 			EventCount: count,
 		})
 	} else if count > h.entries[0].EventCount {
 		// Replace smallest if this is larger
 		h.entries[0] = TopEntry{
-			Value:      base64.StdEncoding.EncodeToString(value),
+			Value:      encoded,
 			EventCount: count,
 		}
 		heap.Fix(h, 0)
@@ -1449,7 +1634,7 @@ func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition
 	var counts []int64
 	var total int64
 	var over32Bytes int64
-	topHeap := &topNHeap{maxSize: topN, entries: make([]TopEntry, 0, topN)}
+	topHeap := &topNHeap{maxSize: topN, entries: make([]TopEntry, 0, topN), indexType: indexType}
 
 	for it.Seek(startKey); it.Valid(); it.Next() {
 		key := it.Key().Data()
@@ -1799,7 +1984,7 @@ func matchesXDRFilter(event *query.Event, contractID []byte, topics [][]byte) bo
 }
 
 // parseRawXDRToQueryEvent converts raw XDR bytes to a query.Event
-func parseRawXDRToQueryEvent(rawXDR []byte, ledger uint32, tx, op, eventIdx uint16) (*query.Event, error) {
+func parseRawXDRToQueryEvent(rawXDR []byte, ledger uint32, tx, op uint32, eventIdx uint16) (*query.Event, error) {
 	var xdrEvent xdr.ContractEvent
 	if err := xdrEvent.UnmarshalBinary(rawXDR); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal XDR event: %w", err)
@@ -2326,8 +2511,8 @@ func (es *RocksDBEventStore) indexCollector(entryCh <-chan *indexEntry, opts *Bu
 
 	for entry := range entryCh {
 		// Periodic flush on ledger boundary
-		if opts.BitmapFlushInterval > 0 && entry.Ledger != prevLedger && prevLedger > 0 {
-			if (entry.Ledger - lastFlushLedger) >= uint32(opts.BitmapFlushInterval) {
+		if opts.IndexFlushInterval > 0 && entry.Ledger != prevLedger && prevLedger > 0 {
+			if (entry.Ledger - lastFlushLedger) >= uint32(opts.IndexFlushInterval) {
 				if err := es.indexStore.Flush(); err != nil {
 					return fmt.Errorf("failed to flush bitmap indexes: %w", err)
 				}
@@ -2367,6 +2552,329 @@ func (es *RocksDBEventStore) indexCollector(entryCh <-chan *indexEntry, opts *Bu
 	}
 
 	return nil
+}
+
+// =============================================================================
+// Posting List Index Queries
+// =============================================================================
+
+// QueryPostingListByContract queries the contract posting list index for TOIDs.
+// Returns TOIDs matching the given contract ID within the ledger range.
+func (es *RocksDBEventStore) QueryPostingListByContract(contractID []byte, startLedger, endLedger uint32) ([]uint64, error) {
+	if es.cfContracts == nil {
+		return nil, fmt.Errorf("contracts index not available")
+	}
+
+	termKey := index.ContractTermKey(contractID)
+	return es.queryPostingList(es.cfContracts, termKey, startLedger, endLedger)
+}
+
+// QueryPostingListByTopic queries the topic posting list index for TOIDs.
+// Returns TOIDs matching the given topic XDR within the ledger range.
+// Topics are non-positional - any topic matching the value will be returned.
+func (es *RocksDBEventStore) QueryPostingListByTopic(topicXDR []byte, startLedger, endLedger uint32) ([]uint64, error) {
+	if es.cfTopics == nil {
+		return nil, fmt.Errorf("topics index not available")
+	}
+
+	termKey := index.TopicTermKey(topicXDR)
+	return es.queryPostingList(es.cfTopics, termKey, startLedger, endLedger)
+}
+
+// queryPostingList reads posting lists from a column family across bucket range.
+func (es *RocksDBEventStore) queryPostingList(cf *grocksdb.ColumnFamilyHandle, termKey [32]byte, startLedger, endLedger uint32) ([]uint64, error) {
+	buckets := index.GetBucketsForRange(startLedger, endLedger)
+
+	var allTOIDs []uint64
+
+	for _, bucketID := range buckets {
+		indexKey := index.EncodeIndexKeyWithBucket(termKey, bucketID)
+
+		value, err := es.db.GetCF(es.ro, cf, indexKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read posting list: %w", err)
+		}
+
+		if value.Exists() {
+			toids := index.DecodeTOIDList(value.Data())
+			// Filter TOIDs to the actual ledger range
+			filtered := index.FilterTOIDsByLedgerRange(toids, startLedger, endLedger)
+			allTOIDs = append(allTOIDs, filtered...)
+		}
+		value.Free()
+	}
+
+	return allTOIDs, nil
+}
+
+// QueryEventsWithPostingList queries events using posting list indexes.
+// contractID and topics are ANDed together.
+// Returns events matching all filters within the ledger range.
+func (es *RocksDBEventStore) QueryEventsWithPostingList(contractID []byte, topics [][]byte, startLedger, endLedger uint32) ([]*query.Event, error) {
+	var resultTOIDs []uint64
+	var initialized bool
+
+	// Query contract ID posting list if specified
+	if len(contractID) > 0 {
+		toids, err := es.QueryPostingListByContract(contractID, startLedger, endLedger)
+		if err != nil {
+			return nil, err
+		}
+		resultTOIDs = toids
+		initialized = true
+	}
+
+	// Query topic posting lists and intersect
+	for _, topicXDR := range topics {
+		if len(topicXDR) == 0 {
+			continue
+		}
+
+		toids, err := es.QueryPostingListByTopic(topicXDR, startLedger, endLedger)
+		if err != nil {
+			return nil, err
+		}
+
+		if !initialized {
+			resultTOIDs = toids
+			initialized = true
+		} else {
+			// Intersect with previous results
+			resultTOIDs = index.IntersectTOIDLists(resultTOIDs, toids)
+		}
+
+		// Early exit if intersection is empty
+		if len(resultTOIDs) == 0 {
+			return nil, nil
+		}
+	}
+
+	// Fetch events by TOID
+	return es.fetchEventsByTOIDs(resultTOIDs)
+}
+
+// QueryEventsWithPostingListTiming queries events with detailed timing and stats.
+func (es *RocksDBEventStore) QueryEventsWithPostingListTiming(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int) (*PostingListQueryResult, []*query.Event, error) {
+	totalStart := time.Now()
+	result := &PostingListQueryResult{
+		LedgerRange: endLedger - startLedger + 1,
+	}
+
+	var resultTOIDs []uint64
+	var initialized bool
+
+	// Phase 1: Query posting lists
+	plStart := time.Now()
+
+	// Query contract ID posting list if specified
+	if len(contractID) > 0 {
+		toids, buckets, bytesRead, err := es.queryPostingListWithStats(es.cfContracts, index.ContractTermKey(contractID), startLedger, endLedger)
+		if err != nil {
+			return nil, nil, err
+		}
+		result.BucketsScanned += buckets
+		result.PostingListsRead++
+		result.PostingListBytes += bytesRead
+		result.TOIDsFromContract = len(toids)
+		resultTOIDs = toids
+		initialized = true
+	}
+
+	// Query topic posting lists
+	for _, topicXDR := range topics {
+		if len(topicXDR) == 0 {
+			continue
+		}
+
+		toids, buckets, bytesRead, err := es.queryPostingListWithStats(es.cfTopics, index.TopicTermKey(topicXDR), startLedger, endLedger)
+		if err != nil {
+			return nil, nil, err
+		}
+		result.BucketsScanned += buckets
+		result.PostingListsRead++
+		result.PostingListBytes += bytesRead
+		result.TOIDsFromTopics += len(toids)
+
+		if !initialized {
+			resultTOIDs = toids
+			initialized = true
+		} else {
+			// Intersect with previous results
+			intersectStart := time.Now()
+			resultTOIDs = index.IntersectTOIDLists(resultTOIDs, toids)
+			result.IntersectTime += time.Since(intersectStart)
+		}
+
+		// Early exit if intersection is empty
+		if len(resultTOIDs) == 0 {
+			result.PostingListTime = time.Since(plStart)
+			result.TotalTime = time.Since(totalStart)
+			return result, nil, nil
+		}
+	}
+
+	result.PostingListTime = time.Since(plStart) - result.IntersectTime
+	result.TOIDsAfterIntersect = len(resultTOIDs)
+
+	// Count unique ledgers
+	ledgerSet := make(map[uint32]struct{})
+	for _, toid := range resultTOIDs {
+		ledger, _, _ := index.DecodeTOID(toid)
+		ledgerSet[ledger] = struct{}{}
+	}
+	result.UniqueLedgers = len(ledgerSet)
+
+	// Phase 2: Fetch events
+	fetchStart := time.Now()
+	events, bytesRead, scanned, decodeTime, err := es.fetchEventsByTOIDsWithStats(resultTOIDs, limit)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	result.EventFetchTime = time.Since(fetchStart) - decodeTime
+	result.DecodeTime = decodeTime
+	result.EventBytesRead = bytesRead
+	result.EventsScanned = scanned
+	result.EventsReturned = len(events)
+	result.TotalTime = time.Since(totalStart)
+
+	return result, events, nil
+}
+
+// queryPostingListWithStats reads posting lists and returns stats.
+func (es *RocksDBEventStore) queryPostingListWithStats(cf *grocksdb.ColumnFamilyHandle, termKey [32]byte, startLedger, endLedger uint32) ([]uint64, int, int64, error) {
+	buckets := index.GetBucketsForRange(startLedger, endLedger)
+
+	var allTOIDs []uint64
+	var bytesRead int64
+
+	for _, bucketID := range buckets {
+		indexKey := index.EncodeIndexKeyWithBucket(termKey, bucketID)
+
+		value, err := es.db.GetCF(es.ro, cf, indexKey)
+		if err != nil {
+			return nil, 0, 0, fmt.Errorf("failed to read posting list: %w", err)
+		}
+
+		if value.Exists() {
+			data := value.Data()
+			bytesRead += int64(len(data))
+			toids := index.DecodeTOIDList(data)
+			filtered := index.FilterTOIDsByLedgerRange(toids, startLedger, endLedger)
+			allTOIDs = append(allTOIDs, filtered...)
+		}
+		value.Free()
+	}
+
+	return allTOIDs, len(buckets), bytesRead, nil
+}
+
+// fetchEventsByTOIDsWithStats fetches events with detailed stats.
+func (es *RocksDBEventStore) fetchEventsByTOIDsWithStats(toids []uint64, limit int) ([]*query.Event, int64, int, time.Duration, error) {
+	events := make([]*query.Event, 0, len(toids))
+	var bytesRead int64
+	var scanned int
+	var decodeTime time.Duration
+
+	for _, toid := range toids {
+		if limit > 0 && len(events) >= limit {
+			break
+		}
+
+		ledger, tx, op := index.DecodeTOID(toid)
+		startKey := index.EncodeEventKey(toid, 0)
+
+		it := es.db.NewIteratorCF(es.ro, es.cfEvents)
+
+		for it.Seek(startKey); it.Valid(); it.Next() {
+			if limit > 0 && len(events) >= limit {
+				break
+			}
+
+			key := it.Key().Data()
+			if len(key) < 10 {
+				break
+			}
+
+			keyTOID := binary.BigEndian.Uint64(key[0:8])
+			if keyTOID > toid {
+				break
+			}
+
+			eventIdx := binary.BigEndian.Uint16(key[8:10])
+			valueData := it.Value().Data()
+			bytesRead += int64(len(valueData))
+			scanned++
+
+			decodeStart := time.Now()
+			var event *query.Event
+			var err error
+
+			if es.eventFormat == "binary" {
+				event, err = DecodeBinaryToQueryEvent(valueData, ledger, tx, op, eventIdx)
+			} else {
+				event, err = parseRawXDRToQueryEvent(valueData, ledger, tx, op, eventIdx)
+			}
+			decodeTime += time.Since(decodeStart)
+
+			if err != nil {
+				continue
+			}
+
+			events = append(events, event)
+		}
+		it.Close()
+	}
+
+	return events, bytesRead, scanned, decodeTime, nil
+}
+
+// fetchEventsByTOIDs fetches events from primary storage by TOID.
+func (es *RocksDBEventStore) fetchEventsByTOIDs(toids []uint64) ([]*query.Event, error) {
+	events := make([]*query.Event, 0, len(toids))
+
+	for _, toid := range toids {
+		ledger, tx, op := index.DecodeTOID(toid)
+
+		// We need to scan for events with this TOID (could have multiple event indices)
+		startKey := index.EncodeEventKey(toid, 0)
+
+		it := es.db.NewIteratorCF(es.ro, es.cfEvents)
+		defer it.Close()
+
+		for it.Seek(startKey); it.Valid(); it.Next() {
+			key := it.Key().Data()
+			if len(key) < 10 {
+				break
+			}
+
+			// Check if we're past the end key
+			keyTOID := binary.BigEndian.Uint64(key[0:8])
+			if keyTOID > toid {
+				break
+			}
+
+			eventIdx := binary.BigEndian.Uint16(key[8:10])
+			valueData := it.Value().Data()
+
+			var event *query.Event
+			var err error
+
+			if es.eventFormat == "binary" {
+				event, err = DecodeBinaryToQueryEvent(valueData, ledger, tx, op, eventIdx)
+			} else {
+				event, err = parseRawXDRToQueryEvent(valueData, ledger, tx, op, eventIdx)
+			}
+
+			if err != nil {
+				continue
+			}
+
+			events = append(events, event)
+		}
+	}
+
+	return events, nil
 }
 
 // =============================================================================

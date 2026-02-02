@@ -12,8 +12,8 @@ import "time"
 // Pre-extracted fields avoid re-parsing XDR during indexing and querying.
 type IngestEvent struct {
 	LedgerSequence   uint32
-	TransactionIndex uint16
-	OperationIndex   uint16
+	TransactionIndex uint32 // Changed from uint16: TOID uses 20 bits (0-1,048,575)
+	OperationIndex   uint16 // TOID uses 12 bits (0-4,095)
 	EventIndex       uint16
 	RawXDR           []byte
 
@@ -23,14 +23,17 @@ type IngestEvent struct {
 	TxHash     []byte   // 32 bytes - transaction hash
 
 	// Pre-extracted fields for binary format storage (avoids XDR parsing at query time)
-	EventType int    // 0=contract, 1=system, 2=diagnostic
-	DataBytes []byte // Pre-marshaled SCVal data bytes
+	EventType      int       // 0=contract, 1=system, 2=diagnostic
+	DataBytes      []byte    // Pre-marshaled SCVal data bytes
+	LedgerClosedAt time.Time // Ledger close time for the event
+	Successful     bool      // True if event is from a successful contract call
 }
 
 // StoreOptions configures what indexes to update when storing events.
 type StoreOptions struct {
-	UniqueIndexes bool // Maintain unique value indexes with counts
-	BitmapIndexes bool // Maintain roaring bitmap indexes for fast queries
+	UniqueIndexes      bool // Maintain unique value indexes with counts
+	BitmapIndexes      bool // Maintain roaring bitmap indexes for fast queries
+	PostingListIndexes bool // Maintain posting list indexes for contracts and topics
 
 	// ExcludeTopic0 is a set of topic0 values (as strings) to skip during ingestion.
 	// Events with matching topic0 will not be stored.
@@ -195,6 +198,37 @@ type LedgerTxStats struct {
 }
 
 // =============================================================================
+// Posting List Query Result
+// =============================================================================
+
+// PostingListQueryResult holds detailed results from a posting list query.
+type PostingListQueryResult struct {
+	// Ledger range
+	LedgerRange uint32 // endLedger - startLedger + 1
+
+	// Posting list stats
+	BucketsScanned      int   // Number of bucket ranges scanned
+	PostingListsRead    int   // Number of posting list keys read
+	PostingListBytes    int64 // Total bytes read from posting lists
+	TOIDsFromContract   int   // TOIDs from contract posting list
+	TOIDsFromTopics     int   // TOIDs from topic posting lists (before intersect)
+	TOIDsAfterIntersect int   // TOIDs after intersection (final count)
+
+	// Event fetch stats
+	UniqueLedgers  int   // Unique ledgers containing matching events
+	EventsScanned  int   // Events scanned from storage
+	EventsReturned int   // Events returned after filtering
+	EventBytesRead int64 // Bytes read from event storage
+
+	// Timing breakdown
+	PostingListTime time.Duration // Time reading posting lists
+	IntersectTime   time.Duration // Time intersecting TOID lists
+	EventFetchTime  time.Duration // Time fetching events
+	DecodeTime      time.Duration // Time decoding events
+	TotalTime       time.Duration // Total query time
+}
+
+// =============================================================================
 // Benchmark Types
 // =============================================================================
 
@@ -233,7 +267,7 @@ type IndexConfig struct {
 type BuildIndexOptions struct {
 	UniqueIndexes       bool // Build unique value counts (for stats)
 	BitmapIndexes       bool // Build bitmap indexes (ledger-level)
-	BitmapFlushInterval int  // Ledgers between bitmap flushes (0 = only at end)
+	IndexFlushInterval int  // Ledgers between index flushes (0 = only at end)
 }
 
 // indexEntry holds extracted data for index updates (used by collector pattern)

@@ -133,17 +133,21 @@ type RangeResult struct {
 // Event represents a contract event returned by queries.
 // This is the decoded, JSON-serializable representation.
 type Event struct {
-	LedgerSequence   uint32   `json:"ledger_sequence"`
-	TransactionIndex int      `json:"transaction_index"`
-	OperationIndex   int      `json:"operation_index"`
-	EventIndex       int      `json:"event_index"`
-	ContractID       string   `json:"contract_id,omitempty"`
-	Type             string   `json:"type"`
-	EventStage       string   `json:"event_stage,omitempty"`
-	Topics           []string `json:"topics"`
-	Data             string   `json:"data"`
-	TransactionHash  string   `json:"transaction_hash"`
-	Successful       bool     `json:"successful"`
+	LedgerSequence           uint32    `json:"ledger"`
+	LedgerClosedAt           time.Time `json:"ledgerClosedAt"`
+	TransactionIndex         int       `json:"transactionIndex"`
+	OperationIndex           int       `json:"operationIndex"`
+	EventIndex               int       `json:"eventIndex,omitempty"`
+	ContractID               string    `json:"contractId,omitempty"`
+	Type                     string    `json:"type"`
+	EventStage               string    `json:"event_stage,omitempty"`
+	Topics                   []string  `json:"topics"`
+	Data                     string    `json:"data"`
+	TransactionHash          string    `json:"txHash"`
+	InSuccessfulContractCall bool      `json:"inSuccessfulContractCall"`
+
+	// Computed ID field (format: "{ledger}-{eventIndex}")
+	ID string `json:"id,omitempty"`
 
 	// Optional raw XDR (only if Options.IncludeXDR is true)
 	RawXDR []byte `json:"raw_xdr,omitempty"`

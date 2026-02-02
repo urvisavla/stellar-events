@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/urvisavla/stellar-events/internal/config"
@@ -21,8 +22,10 @@ func runQuery(cfg *config.Config, args []string) {
 	fs := flag.NewFlagSet("query", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
-	contract := fs.String("contract", "", "Contract ID (base64)")
-	topic0 := fs.String("topic0", "", "Topic0 (base64)")
+	contract := fs.String("contract", "", "Contract ID (C... strkey format)")
+	topics := fs.String("topics", "", "Comma-separated topics (base64), position-independent AND logic")
+	useBitmap := fs.Bool("bitmap", false, "Use bitmap index instead of posting list (default: posting list)")
+	topic0 := fs.String("topic0", "", "Topic0 (base64) - positional, use --topics for non-positional")
 	topic1 := fs.String("topic1", "", "Topic1 (base64)")
 	topic2 := fs.String("topic2", "", "Topic2 (base64)")
 	topic3 := fs.String("topic3", "", "Topic3 (base64)")
@@ -37,11 +40,13 @@ func runQuery(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "  <start>           Start ledger (required)\n")
 		fmt.Fprintf(os.Stderr, "  [end]             End ledger (default: start + %d from config)\n\n", cfg.Query.MaxLedgerRange)
 		fmt.Fprintf(os.Stderr, "Options:\n")
-		fmt.Fprintf(os.Stderr, "  --contract <id>   Filter by contract ID (base64)\n")
-		fmt.Fprintf(os.Stderr, "  --topic0 <val>    Filter by topic0 (base64)\n")
-		fmt.Fprintf(os.Stderr, "  --topic1 <val>    Filter by topic1 (base64)\n")
-		fmt.Fprintf(os.Stderr, "  --topic2 <val>    Filter by topic2 (base64)\n")
-		fmt.Fprintf(os.Stderr, "  --topic3 <val>    Filter by topic3 (base64)\n")
+		fmt.Fprintf(os.Stderr, "  --contract <id>   Filter by contract ID (C... strkey format)\n")
+		fmt.Fprintf(os.Stderr, "  --topics <list>   Comma-separated topics (base64), position-independent AND\n")
+		fmt.Fprintf(os.Stderr, "  --bitmap          Use bitmap index instead of posting list (legacy)\n")
+		fmt.Fprintf(os.Stderr, "  --topic0 <val>    Filter by topic0 (base64) - positional, requires --bitmap\n")
+		fmt.Fprintf(os.Stderr, "  --topic1 <val>    Filter by topic1 (base64) - positional, requires --bitmap\n")
+		fmt.Fprintf(os.Stderr, "  --topic2 <val>    Filter by topic2 (base64) - positional, requires --bitmap\n")
+		fmt.Fprintf(os.Stderr, "  --topic3 <val>    Filter by topic3 (base64) - positional, requires --bitmap\n")
 		fmt.Fprintf(os.Stderr, "  --limit <n>       Max results (default: %d from config)\n", cfg.Query.DefaultLimit)
 		fmt.Fprintf(os.Stderr, "  --compare-db <path>     Compare with another database\n")
 		fmt.Fprintf(os.Stderr, "  --compare-format <fmt>  Format of compare DB (xdr/binary)\n")
@@ -49,9 +54,9 @@ func runQuery(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  query 55000000                              # Query single ledger\n")
 		fmt.Fprintf(os.Stderr, "  query 55000000 56000000                     # Query range\n")
-		fmt.Fprintf(os.Stderr, "  query 55000000 --contract <base64_id>       # Filter by contract\n")
-		fmt.Fprintf(os.Stderr, "  query 55000000 56000000 --topic0 <base64>   # Filter by topic\n")
-		fmt.Fprintf(os.Stderr, "  query 55000000 --contract <id> --compare-db /path/to/other.db --compare-format xdr\n")
+		fmt.Fprintf(os.Stderr, "  query 55000000 --contract C...              # Filter by contract (strkey)\n")
+		fmt.Fprintf(os.Stderr, "  query 55000000 --topics <b64>,<b64>         # Filter by topics (AND)\n")
+		fmt.Fprintf(os.Stderr, "  query 55000000 --contract C... --bitmap     # Use bitmap index (legacy)\n")
 	}
 
 	// Custom parsing to handle positional args before flags
@@ -114,10 +119,10 @@ func runQuery(cfg *config.Config, args []string) {
 		queryLimit = cfg.Query.DefaultLimit
 	}
 
-	cmdQuery(cfg, uint32(startLedger), uint32(endLedger), *contract, *topic0, *topic1, *topic2, *topic3, queryLimit, *compareDB, *compareFormat)
+	cmdQuery(cfg, uint32(startLedger), uint32(endLedger), *contract, *topics, *topic0, *topic1, *topic2, *topic3, queryLimit, !*useBitmap, *compareDB, *compareFormat)
 }
 
-func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, topic0, topic1, topic2, topic3 string, limit int, compareDB, compareFormat string) {
+func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, topicsCSV, topic0, topic1, topic2, topic3 string, limit int, usePostingList bool, compareDB, compareFormat string) {
 	eventStore, err := openEventStore(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open event store: %v\n", err)
@@ -127,11 +132,12 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 
 	// Check if any filter is specified
 	hasContract := contractID != ""
+	hasTopics := topicsCSV != ""
 	hasTopic0 := topic0 != ""
 	hasTopic1 := topic1 != ""
 	hasTopic2 := topic2 != ""
 	hasTopic3 := topic3 != ""
-	hasAnyFilter := hasContract || hasTopic0 || hasTopic1 || hasTopic2 || hasTopic3
+	hasAnyFilter := hasContract || hasTopics || hasTopic0 || hasTopic1 || hasTopic2 || hasTopic3
 
 	// No filter - scan all events in range (use direct store method)
 	if !hasAnyFilter {
@@ -174,7 +180,13 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 		return
 	}
 
-	// Build query filter
+	// Use posting list index if requested
+	if usePostingList {
+		runPostingListQuery(eventStore, contractID, topicsCSV, startLedger, endLedger, limit)
+		return
+	}
+
+	// Build query filter for bitmap index
 	filter := buildFilter(contractID, topic0, topic1, topic2, topic3)
 	if filter == nil {
 		os.Exit(2)
@@ -186,7 +198,7 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 		return
 	}
 
-	// Single database query
+	// Single database query (bitmap index)
 	runSingleQuery(eventStore, filter, startLedger, endLedger, limit)
 }
 
@@ -242,7 +254,7 @@ func buildFilter(contractID, topic0, topic1, topic2, topic3 string) *query.Filte
 	return filter
 }
 
-// runSingleQuery runs a query against a single database
+// runSingleQuery runs a query against a single database (bitmap index)
 func runSingleQuery(eventStore *store.RocksDBEventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) {
 	indexReader := eventStore.GetIndexReader()
 	if indexReader == nil {
@@ -269,6 +281,104 @@ func runSingleQuery(eventStore *store.RocksDBEventStore, filter *query.Filter, s
 		os.Exit(1)
 	}
 	fmt.Println(string(output))
+}
+
+// runPostingListQuery runs a query using posting list indexes
+func runPostingListQuery(eventStore *store.RocksDBEventStore, contractID, topicsCSV string, startLedger, endLedger uint32, limit int) {
+	fmt.Fprintf(os.Stderr, "Querying with posting list index in ledgers %d-%d...\n", startLedger, endLedger)
+
+	// Parse contract ID (strkey format)
+	var contractBytes []byte
+	if contractID != "" {
+		var err error
+		contractBytes, err = decodeContractID(contractID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid contract ID (expected C... format): %v\n", err)
+			os.Exit(2)
+		}
+	}
+
+	// Parse comma-separated topics (base64)
+	var topicsList [][]byte
+	if topicsCSV != "" {
+		topicStrs := strings.Split(topicsCSV, ",")
+		for _, topicStr := range topicStrs {
+			topicStr = strings.TrimSpace(topicStr)
+			if topicStr == "" {
+				continue
+			}
+			topicBytes, err := decodeBase64(topicStr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid topic (expected base64): %v\n", err)
+				os.Exit(2)
+			}
+			topicsList = append(topicsList, topicBytes)
+		}
+	}
+
+	// Query using posting list index with detailed stats
+	stats, events, err := eventStore.QueryEventsWithPostingListTiming(contractBytes, topicsList, startLedger, endLedger, limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Print detailed results
+	printPostingListResult(stats)
+
+	if events == nil {
+		fmt.Println("[]")
+		return
+	}
+
+	output, err := json.MarshalIndent(events, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to marshal events: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(output))
+}
+
+// printPostingListResult prints detailed posting list query stats
+func printPostingListResult(r *store.PostingListQueryResult) {
+	fmt.Fprintf(os.Stderr, "\n=== Posting List Query Results ===\n")
+	fmt.Fprintf(os.Stderr, "  Ledger range:      %d ledgers\n", r.LedgerRange)
+	fmt.Fprintf(os.Stderr, "  Unique ledgers:    %d (with matching events)\n", r.UniqueLedgers)
+	fmt.Fprintf(os.Stderr, "  Events scanned:    %d\n", r.EventsScanned)
+	fmt.Fprintf(os.Stderr, "  Events returned:   %d\n", r.EventsReturned)
+
+	fmt.Fprintf(os.Stderr, "\n=== Posting List Stats ===\n")
+	fmt.Fprintf(os.Stderr, "  Buckets scanned:   %d\n", r.BucketsScanned)
+	fmt.Fprintf(os.Stderr, "  Posting lists:     %d\n", r.PostingListsRead)
+	fmt.Fprintf(os.Stderr, "  PL bytes read:     %s\n", formatBytes(r.PostingListBytes))
+	if r.TOIDsFromContract > 0 {
+		fmt.Fprintf(os.Stderr, "  TOIDs (contract):  %d\n", r.TOIDsFromContract)
+	}
+	if r.TOIDsFromTopics > 0 {
+		fmt.Fprintf(os.Stderr, "  TOIDs (topics):    %d\n", r.TOIDsFromTopics)
+	}
+	fmt.Fprintf(os.Stderr, "  TOIDs (final):     %d\n", r.TOIDsAfterIntersect)
+
+	fmt.Fprintf(os.Stderr, "\n=== Event Fetch Stats ===\n")
+	fmt.Fprintf(os.Stderr, "  Event bytes read:  %s\n", formatBytes(r.EventBytesRead))
+
+	fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
+	fmt.Fprintf(os.Stderr, "  Posting list read: %s\n", formatDuration(r.PostingListTime))
+	if r.IntersectTime > 0 {
+		fmt.Fprintf(os.Stderr, "  TOID intersect:    %s\n", formatDuration(r.IntersectTime))
+	}
+	fmt.Fprintf(os.Stderr, "  Event fetch:       %s\n", formatDuration(r.EventFetchTime))
+	fmt.Fprintf(os.Stderr, "  Event decode:      %s\n", formatDuration(r.DecodeTime))
+	fmt.Fprintf(os.Stderr, "  Total time:        %s\n", formatDuration(r.TotalTime))
+
+	// Time distribution
+	if r.TotalTime > 0 {
+		plPct := float64(r.PostingListTime) / float64(r.TotalTime) * 100
+		fetchPct := float64(r.EventFetchTime) / float64(r.TotalTime) * 100
+		decodePct := float64(r.DecodeTime) / float64(r.TotalTime) * 100
+		fmt.Fprintf(os.Stderr, "  Time distribution: pl=%.1f%%, fetch=%.1f%%, decode=%.1f%%\n", plPct, fetchPct, decodePct)
+	}
+	fmt.Fprintf(os.Stderr, "\n")
 }
 
 // runComparisonQuery runs the same query against two databases and compares

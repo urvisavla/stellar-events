@@ -3,6 +3,7 @@ package ingest
 import (
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/ingest"
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -56,6 +57,9 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 	var events []*store.IngestEvent
 	ledgerSeq := lcm.LedgerSequence()
 
+	// Extract ledger close time (Unix timestamp to time.Time)
+	ledgerCloseTime := time.Unix(lcm.LedgerCloseTime(), 0).UTC()
+
 	for {
 		tx, err := txReader.Read()
 		if err == io.EOF {
@@ -68,6 +72,9 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 		if stats != nil {
 			stats.TotalTransactions++
 		}
+
+		// Check if transaction was successful
+		txSuccessful := tx.Result.Successful()
 
 		txEvents, err := tx.GetTransactionEvents()
 		if err != nil {
@@ -123,7 +130,7 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 
 			events = append(events, &store.IngestEvent{
 				LedgerSequence:   ledgerSeq,
-				TransactionIndex: uint16(tx.Index),
+				TransactionIndex: uint32(tx.Index),
 				OperationIndex:   0xFFFF, // Transaction-level events use sentinel value
 				EventIndex:       uint16(eventIndex),
 				RawXDR:           rawXDR,
@@ -132,6 +139,8 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 				TxHash:           txHash,
 				EventType:        int(event.Event.Type),
 				DataBytes:        dataBytes,
+				LedgerClosedAt:   ledgerCloseTime,
+				Successful:       txSuccessful,
 			})
 		}
 
@@ -176,7 +185,7 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 
 				events = append(events, &store.IngestEvent{
 					LedgerSequence:   ledgerSeq,
-					TransactionIndex: uint16(tx.Index),
+					TransactionIndex: uint32(tx.Index),
 					OperationIndex:   uint16(opIndex),
 					EventIndex:       uint16(eventIndex),
 					RawXDR:           rawXDR,
@@ -185,6 +194,8 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 					TxHash:           txHash,
 					EventType:        int(event.Type),
 					DataBytes:        dataBytes,
+					LedgerClosedAt:   ledgerCloseTime,
+					Successful:       txSuccessful,
 				})
 			}
 		}

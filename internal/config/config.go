@@ -87,11 +87,12 @@ type IngestionConfig struct {
 	ComputeStats    bool `toml:"compute_stats"`    // Compute event stats after ingestion (default: false)
 
 	// Index maintenance during ingestion
-	BitmapIndexes bool `toml:"bitmap_indexes"` // Maintain bitmap indexes (default: true)
-	UniqueIndexes bool `toml:"unique_indexes"` // Maintain unique value counts (default: false)
+	BitmapIndexes      bool `toml:"bitmap_indexes"`       // Maintain bitmap indexes (default: true)
+	PostingListIndexes bool `toml:"posting_list_indexes"` // Maintain posting list indexes (default: false)
+	UniqueIndexes      bool `toml:"unique_indexes"`       // Maintain unique value counts (default: false)
 
-	// Bitmap flush interval
-	BitmapFlushInterval int `toml:"bitmap_flush_interval"` // Ledgers between bitmap index flushes (default: 10000)
+	// Index flush interval (applies to both bitmap and posting list indexes)
+	IndexFlushInterval int `toml:"index_flush_interval"` // Ledgers between index flushes (default: 10000)
 
 	// Parallelism
 	Workers   int `toml:"workers"`    // Parallel workers (0 = NumCPU)
@@ -160,15 +161,16 @@ func DefaultConfig() *Config {
 			MaxBytesForLevelBaseMB: 1024,
 		},
 		Ingestion: IngestionConfig{
-			ProgressFile:        "", // Empty = disabled
-			FinalCompaction:     true,
-			ComputeStats:        false,
-			BitmapIndexes:       true,
-			UniqueIndexes:       false,
-			BitmapFlushInterval: 10000, // Flush hot segments every 10K ledgers
-			Workers:             0,     // 0 = NumCPU
-			BatchSize:           100,
-			QueueSize:           0, // 0 = workers * 2
+			ProgressFile:       "", // Empty = disabled
+			FinalCompaction:    true,
+			ComputeStats:       false,
+			BitmapIndexes:      true,
+			PostingListIndexes: false,
+			UniqueIndexes:      false,
+			IndexFlushInterval: 10000, // Flush indexes every 10K ledgers
+			Workers:            0,     // 0 = NumCPU
+			BatchSize:          100,
+			QueueSize:          0, // 0 = workers * 2
 		},
 		Query: QueryConfig{
 			MaxLedgerRange: 100000,

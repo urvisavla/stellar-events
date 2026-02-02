@@ -147,7 +147,7 @@ func printStorageStats(snapshot *store.StorageSnapshot) {
 	p.Printf("  ─────────────────────────────────────────────────────────────────────────────\n")
 
 	// Print in a consistent order
-	cfOrder := []string{"events", "bitmap", "unique", "default"}
+	cfOrder := []string{"events", "contracts", "topics", "bitmap", "unique", "default"}
 	for _, name := range cfOrder {
 		cf, ok := snapshot.ColumnFamilies[name]
 		if !ok {

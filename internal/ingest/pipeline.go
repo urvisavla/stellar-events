@@ -18,9 +18,10 @@ type PipelineConfig struct {
 	QueueSize           int    // Channel buffer size
 	DataDir             string // Ledger data directory
 	NetworkPassphrase   string // Network passphrase for XDR parsing
-	MaintainUniqueIdx   bool   // Maintain unique indexes during ingestion
-	MaintainBitmapIdx   bool   // Maintain roaring bitmap indexes during ingestion
-	BitmapFlushInterval int    // Ledgers between bitmap index flushes (0 = only at end)
+	MaintainUniqueIdx      bool // Maintain unique indexes during ingestion
+	MaintainBitmapIdx      bool // Maintain roaring bitmap indexes during ingestion
+	MaintainPostingListIdx bool // Maintain posting list indexes during ingestion
+	IndexFlushInterval     int  // Ledgers between index flushes (0 = only at end)
 
 	// ExcludeTopic0 is a set of topic0 values to skip during ingestion.
 	// Keys are the raw topic0 bytes as strings.
@@ -268,10 +269,11 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 			if (batchFull || atEnd) && len(eventBatch) > 0 {
 				writeStart := time.Now()
 				_, err := p.store.StoreEvents(eventBatch, &store.StoreOptions{
-					UniqueIndexes:     p.config.MaintainUniqueIdx,
-					BitmapIndexes:     p.config.MaintainBitmapIdx,
-					ExcludeTopic0:     p.config.ExcludeTopic0,
-					ExcludeDiagnostic: p.config.ExcludeDiagnostic,
+					UniqueIndexes:      p.config.MaintainUniqueIdx,
+					BitmapIndexes:      p.config.MaintainBitmapIdx,
+					PostingListIndexes: p.config.MaintainPostingListIdx,
+					ExcludeTopic0:      p.config.ExcludeTopic0,
+					ExcludeDiagnostic:  p.config.ExcludeDiagnostic,
 				})
 				atomic.AddInt64(&p.stats.WriteTimeNs, time.Since(writeStart).Nanoseconds())
 
@@ -290,10 +292,18 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 				batchStartSeq = nextSeq
 
 				// Periodic bitmap flush to prevent hot segment memory growth
-				if p.config.MaintainBitmapIdx && p.config.BitmapFlushInterval > 0 &&
-					ledgersProcessed%p.config.BitmapFlushInterval == 0 {
+				if p.config.MaintainBitmapIdx && p.config.IndexFlushInterval > 0 &&
+					ledgersProcessed%p.config.IndexFlushInterval == 0 {
 					if err := p.store.FlushBitmapIndexes(); err != nil {
 						return fmt.Errorf("failed to flush bitmap indexes: %w", err)
+					}
+				}
+
+				// Periodic posting list flush to prevent memory growth
+				if p.config.MaintainPostingListIdx && p.config.IndexFlushInterval > 0 &&
+					ledgersProcessed%p.config.IndexFlushInterval == 0 {
+					if _, _, err := p.store.FlushPostingListIndexes(); err != nil {
+						return fmt.Errorf("failed to flush posting list indexes: %w", err)
 					}
 				}
 			}
@@ -309,6 +319,13 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 	if p.config.MaintainBitmapIdx {
 		if err := p.store.FlushBitmapIndexes(); err != nil {
 			return fmt.Errorf("failed to flush bitmap indexes: %w", err)
+		}
+	}
+
+	// Flush posting list indexes if enabled
+	if p.config.MaintainPostingListIdx {
+		if _, _, err := p.store.FlushPostingListIndexes(); err != nil {
+			return fmt.Errorf("failed to flush posting list indexes: %w", err)
 		}
 	}
 
