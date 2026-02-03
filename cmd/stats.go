@@ -94,17 +94,14 @@ func cmdStats(cfg *config.Config, top int) {
 	bitmapStats := eventStore.GetBitmapStats()
 	if bitmapStats != nil {
 		p.Printf("\n=== Bitmap Index Stats ===\n")
-		p.Printf("  Current segment ID:    %d (each segment = 1M ledgers)\n", bitmapStats.CurrentSegmentID)
+		p.Printf("  Current segment ID:    %d (each segment = 10K ledgers)\n", bitmapStats.CurrentSegmentID)
 		p.Printf("  Hot segments (memory): %d segments, %d entries, %.2f MB\n",
 			bitmapStats.HotSegmentCount,
 			bitmapStats.HotSegmentCards,
 			float64(bitmapStats.HotSegmentMemBytes)/(1024*1024))
 		p.Printf("  Stored bitmap segments:\n")
 		p.Printf("    Contracts: %d\n", bitmapStats.ContractIndexCount)
-		p.Printf("    Topic0:    %d\n", bitmapStats.Topic0IndexCount)
-		p.Printf("    Topic1:    %d\n", bitmapStats.Topic1IndexCount)
-		p.Printf("    Topic2:    %d\n", bitmapStats.Topic2IndexCount)
-		p.Printf("    Topic3:    %d\n", bitmapStats.Topic3IndexCount)
+		p.Printf("    Topics:    %d\n", bitmapStats.TopicIndexCount)
 	} else {
 		p.Printf("\n=== Bitmap Index Stats ===\n")
 		p.Printf("  (not available)\n")
@@ -147,7 +144,12 @@ func printStorageStats(snapshot *store.StorageSnapshot) {
 	p.Printf("  ─────────────────────────────────────────────────────────────────────────────\n")
 
 	// Print in a consistent order
-	cfOrder := []string{"events", "contracts", "topics", "bitmap", "unique", "default"}
+	cfOrder := []string{
+		"events", "unique", "default",
+		"contracts_pl", "topics_pl",
+		"contracts_bm", "topics_bm",
+		"contracts_bm64", "topics_bm64",
+	}
 	for _, name := range cfOrder {
 		cf, ok := snapshot.ColumnFamilies[name]
 		if !ok {

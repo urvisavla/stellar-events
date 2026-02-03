@@ -6,25 +6,26 @@ import (
 	"github.com/RoaringBitmap/roaring/roaring64"
 )
 
-// Event-level index prefixes (event-level granularity using Roaring64)
+// TOID-level index prefixes (operation-level granularity using Roaring64)
+// Matches posting list structure: one index for contracts, one for topics (non-positional)
+// Each TOID represents a unique operation; events are fetched by iterating the operation's events.
 const (
-	PrefixEventContract byte = 0x10
-	PrefixEventTopic0   byte = 0x11
-	PrefixEventTopic1   byte = 0x12
-	PrefixEventTopic2   byte = 0x13
-	PrefixEventTopic3   byte = 0x14
+	PrefixEventContract byte = 0x10 // Contract ID → TOID bitmap
+	PrefixEventTopic    byte = 0x11 // Topic (any position) → TOID bitmap
 )
 
 // EventSegmentLoader provides segment loading capability for event-level queries.
 type EventSegmentLoader interface {
 	// LoadEventSegment loads a Roaring64 bitmap segment from storage.
 	LoadEventSegment(prefix byte, keyValue []byte, segmentID uint32) (*roaring64.Bitmap, error)
+	// LoadEventSegmentWithStats loads a segment and returns bytes read.
+	LoadEventSegmentWithStats(prefix byte, keyValue []byte, segmentID uint32) (*roaring64.Bitmap, int64, error)
 }
 
-// EventBitmapIndex manages segmented Roaring64 bitmap indexes for event-level granularity.
-// Similar to BitmapIndex but stores 64-bit event keys instead of 32-bit ledger numbers.
+// EventBitmapIndex manages segmented Roaring64 bitmap indexes for TOID-level granularity.
+// Stores 64-bit TOIDs (operation identifiers), same granularity as posting lists.
 type EventBitmapIndex struct {
-	// Hot segment cache - maps key to bitmap of event keys
+	// Hot segment cache - maps key to bitmap of TOIDs
 	hotSegments map[[keySize]byte]*roaring64.Bitmap
 
 	// Current hot segment ID
@@ -47,10 +48,11 @@ func (bi *EventBitmapIndex) SetLoader(loader EventSegmentLoader) {
 	bi.loader = loader
 }
 
-// AddToIndex adds an event key to the index.
+// AddToIndex adds a TOID to the index.
+// The evt parameter is accepted for API compatibility but ignored (bitmap stores at TOID level).
 func (bi *EventBitmapIndex) AddToIndex(prefix byte, keyValue []byte, ledger uint32, tx, op, evt uint16) {
 	segmentID := SegmentID(ledger)
-	eventKey := EncodeBitmapKey(ledger, tx, op, evt)
+	toid := EncodeBitmapKey(ledger, tx, op, evt) // evt is ignored, stores TOID
 
 	key := makeKey(prefix, keyValue, segmentID)
 
@@ -60,7 +62,7 @@ func (bi *EventBitmapIndex) AddToIndex(prefix byte, keyValue []byte, ledger uint
 		bi.hotSegments[key] = bitmap
 	}
 
-	bitmap.Add(eventKey)
+	bitmap.Add(toid)
 
 	if segmentID > bi.currentSegmentID {
 		bi.currentSegmentID = segmentID
@@ -72,13 +74,10 @@ func (bi *EventBitmapIndex) AddContractEvent(contractID []byte, ledger uint32, t
 	bi.AddToIndex(PrefixEventContract, contractID, ledger, tx, op, evt)
 }
 
-// AddTopicEvent adds an event to a topic index.
-func (bi *EventBitmapIndex) AddTopicEvent(topicPosition int, topicValue []byte, ledger uint32, tx, op, evt uint16) {
-	prefix := EventTopicPrefix(topicPosition)
-	if prefix == 0 {
-		return
-	}
-	bi.AddToIndex(prefix, topicValue, ledger, tx, op, evt)
+// AddTopicEvent adds an event to the topic index (non-positional).
+// All topics are indexed regardless of their position, matching posting list semantics.
+func (bi *EventBitmapIndex) AddTopicEvent(topicValue []byte, ledger uint32, tx, op, evt uint16) {
+	bi.AddToIndex(PrefixEventTopic, topicValue, ledger, tx, op, evt)
 }
 
 // QueryIndex returns all event keys matching a key within a ledger range.
@@ -98,10 +97,10 @@ func (bi *EventBitmapIndex) QueryIndex(prefix byte, keyValue []byte, startLedger
 			continue
 		}
 
-		// For event-level bitmaps, we need to filter by ledger range
-		// Event keys encode ledger in high 32 bits
-		startKey := EncodeBitmapKey(startLedger, 0, 0, 0)
-		endKey := EncodeBitmapKey(endLedger, 0xFFFF, 0xFF, 0xFF)
+		// Filter by ledger range using TOID boundaries
+		// Bitmap64 stores TOIDs (operation-level), not event keys
+		startKey := EncodeTOID(startLedger, 0, 0)
+		endKey := EncodeTOID(endLedger, 0xFFFFF, 0xFFF)
 
 		// Filter to range using iterator
 		iter := bitmap.Iterator()
@@ -138,13 +137,78 @@ func (bi *EventBitmapIndex) QueryContractEvents(contractID []byte, startLedger, 
 	return bi.QueryIndex(PrefixEventContract, contractID, startLedger, endLedger)
 }
 
-// QueryTopicEvents queries event keys for a topic value.
-func (bi *EventBitmapIndex) QueryTopicEvents(topicPosition int, topicValue []byte, startLedger, endLedger uint32) (*roaring64.Bitmap, error) {
-	prefix := EventTopicPrefix(topicPosition)
-	if prefix == 0 {
-		return nil, nil
+// QueryTopicEvents queries event keys for a topic value (non-positional).
+func (bi *EventBitmapIndex) QueryTopicEvents(topicValue []byte, startLedger, endLedger uint32) (*roaring64.Bitmap, error) {
+	return bi.QueryIndex(PrefixEventTopic, topicValue, startLedger, endLedger)
+}
+
+// QueryIndexWithStats returns event keys and tracks bytes read from storage.
+func (bi *EventBitmapIndex) QueryIndexWithStats(prefix byte, keyValue []byte, startLedger, endLedger uint32) (*roaring64.Bitmap, int64, int, error) {
+	result := roaring64.New()
+	var bytesRead int64
+	var segmentsRead int
+
+	startSegment := SegmentID(startLedger)
+	endSegment := SegmentID(endLedger)
+
+	for segID := startSegment; segID <= endSegment; segID++ {
+		bitmap, segBytes, err := bi.getSegmentWithStats(prefix, keyValue, segID)
+		if err != nil {
+			return nil, bytesRead, segmentsRead, err
+		}
+
+		bytesRead += segBytes
+		if segBytes > 0 {
+			segmentsRead++
+		}
+
+		if bitmap == nil || bitmap.IsEmpty() {
+			continue
+		}
+
+		// Filter by ledger range using TOID boundaries
+		// Bitmap64 stores TOIDs (operation-level), not event keys
+		startKey := EncodeTOID(startLedger, 0, 0)
+		endKey := EncodeTOID(endLedger, 0xFFFFF, 0xFFF)
+
+		// Filter to range using iterator
+		iter := bitmap.Iterator()
+		for iter.HasNext() {
+			eventKey := iter.Next()
+			if eventKey >= startKey && eventKey <= endKey {
+				result.Add(eventKey)
+			}
+		}
 	}
-	return bi.QueryIndex(prefix, topicValue, startLedger, endLedger)
+
+	return result, bytesRead, segmentsRead, nil
+}
+
+// getSegmentWithStats retrieves a segment and tracks bytes read.
+func (bi *EventBitmapIndex) getSegmentWithStats(prefix byte, keyValue []byte, segmentID uint32) (*roaring64.Bitmap, int64, error) {
+	key := makeKey(prefix, keyValue, segmentID)
+
+	// Check hot cache first - no disk read
+	if bitmap, exists := bi.hotSegments[key]; exists {
+		return bitmap, 0, nil
+	}
+
+	// Load from storage if loader is available
+	if bi.loader != nil {
+		return bi.loader.LoadEventSegmentWithStats(prefix, keyValue, segmentID)
+	}
+
+	return nil, 0, nil
+}
+
+// QueryContractEventsWithStats queries event keys for a contract ID with byte tracking.
+func (bi *EventBitmapIndex) QueryContractEventsWithStats(contractID []byte, startLedger, endLedger uint32) (*roaring64.Bitmap, int64, int, error) {
+	return bi.QueryIndexWithStats(PrefixEventContract, contractID, startLedger, endLedger)
+}
+
+// QueryTopicEventsWithStats queries event keys for a topic with byte tracking.
+func (bi *EventBitmapIndex) QueryTopicEventsWithStats(topicValue []byte, startLedger, endLedger uint32) (*roaring64.Bitmap, int64, int, error) {
+	return bi.QueryIndexWithStats(PrefixEventTopic, topicValue, startLedger, endLedger)
 }
 
 // EventSegment represents a serializable event bitmap segment.
@@ -194,22 +258,6 @@ func (bi *EventBitmapIndex) GetHotSegmentStats() (count int, totalCards uint64, 
 // GetCurrentSegmentID returns the current segment ID being written to.
 func (bi *EventBitmapIndex) GetCurrentSegmentID() uint32 {
 	return bi.currentSegmentID
-}
-
-// EventTopicPrefix returns the event-level prefix for a topic position.
-func EventTopicPrefix(position int) byte {
-	switch position {
-	case 0:
-		return PrefixEventTopic0
-	case 1:
-		return PrefixEventTopic1
-	case 2:
-		return PrefixEventTopic2
-	case 3:
-		return PrefixEventTopic3
-	default:
-		return 0
-	}
 }
 
 // MakeEventKey creates a database key for an event bitmap segment.

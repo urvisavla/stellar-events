@@ -130,6 +130,7 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		NetworkPassphrase:      networkPassphrase,
 		MaintainUniqueIdx:      cfg.Ingestion.UniqueIndexes,
 		MaintainBitmapIdx:      cfg.Ingestion.BitmapIndexes,
+		MaintainBitmap64Idx:    cfg.Ingestion.Bitmap64Indexes,
 		MaintainPostingListIdx: cfg.Ingestion.PostingListIndexes,
 		IndexFlushInterval:     cfg.Ingestion.IndexFlushInterval,
 		ExcludeTopic0:          excludeTopic0,
@@ -323,7 +324,12 @@ func printStorageSnapshot(sb *strings.Builder, snapshot *store.StorageSnapshot) 
 	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
 
 	// Print in a consistent order
-	cfOrder := []string{"events", "contracts", "topics", "bitmap", "unique", "default"}
+	cfOrder := []string{
+		"events", "unique", "default",
+		"contracts_pl", "topics_pl",
+		"contracts_bm", "topics_bm",
+		"contracts_bm64", "topics_bm64",
+	}
 	for _, name := range cfOrder {
 		cf, ok := snapshot.ColumnFamilies[name]
 		if !ok {
@@ -353,7 +359,12 @@ func printCompactionSummary(sb *strings.Builder, cs *store.CompactionSummary) {
 	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
 
 	// Print in a consistent order
-	cfOrder := []string{"events", "contracts", "topics", "bitmap", "unique", "default"}
+	cfOrder := []string{
+		"events", "unique", "default",
+		"contracts_pl", "topics_pl",
+		"contracts_bm", "topics_bm",
+		"contracts_bm64", "topics_bm64",
+	}
 	for _, name := range cfOrder {
 		cf, ok := cs.PerCF[name]
 		if !ok {

@@ -32,7 +32,8 @@ type IngestEvent struct {
 // StoreOptions configures what indexes to update when storing events.
 type StoreOptions struct {
 	UniqueIndexes      bool // Maintain unique value indexes with counts
-	BitmapIndexes      bool // Maintain roaring bitmap indexes for fast queries
+	BitmapIndexes      bool // Maintain 32-bit roaring bitmap indexes (ledger-level)
+	Bitmap64Indexes    bool // Maintain 64-bit roaring bitmap indexes (event-level)
 	PostingListIndexes bool // Maintain posting list indexes for contracts and topics
 
 	// ExcludeTopic0 is a set of topic0 values (as strings) to skip during ingestion.
@@ -185,16 +186,137 @@ type BitmapStats struct {
 	HotSegmentCards    uint64 `json:"hot_segment_cards"`
 	HotSegmentMemBytes uint64 `json:"hot_segment_mem_bytes"`
 	ContractIndexCount int64  `json:"contract_index_count"`
-	Topic0IndexCount   int64  `json:"topic0_index_count"`
-	Topic1IndexCount   int64  `json:"topic1_index_count"`
-	Topic2IndexCount   int64  `json:"topic2_index_count"`
-	Topic3IndexCount   int64  `json:"topic3_index_count"`
+	TopicIndexCount    int64  `json:"topic_index_count"` // All topics (non-positional)
 }
 
 // LedgerTxStats holds statistics about transactions per ledger.
 type LedgerTxStats struct {
 	TotalLedgers      int64 `json:"total_ledgers"`
 	LedgersOver10kTx  int64 `json:"ledgers_over_10k_tx"`
+}
+
+// =============================================================================
+// Unified Query Result (for all index types)
+// =============================================================================
+
+// UnifiedQueryResult holds query results in a common format for all index types.
+// This enables consistent output and comparison across Posting List, Bitmap32, and Bitmap64.
+type UnifiedQueryResult struct {
+	// Index identification
+	IndexType string // "posting", "bitmap32", or "bitmap64"
+
+	// Ledger range
+	LedgerRange   uint32 // endLedger - startLedger + 1
+	IndexMatches  int    // Matches from index (ledgers, keys, or TOIDs depending on type)
+	MatchUnitName string // "ledgers", "event keys", or "TOIDs" - describes what IndexMatches counts
+
+	// Event stats
+	EventsScanned  int // Events scanned from storage
+	EventsReturned int // Events returned after filtering
+
+	// I/O stats
+	IndexBytesRead int64 // Bytes read from index
+	EventBytesRead int64 // Bytes read from event storage
+
+	// Timing breakdown
+	IndexLookupTime time.Duration // Time querying index
+	EventFetchTime  time.Duration // Time fetching events from storage
+	DecodeTime      time.Duration // Time decoding/unmarshalling events
+	FilterTime      time.Duration // Time filtering events (post-fetch)
+	TotalTime       time.Duration // Total query time
+}
+
+// =============================================================================
+// Bitmap Query Result (32-bit, ledger-level)
+// =============================================================================
+
+// BitmapQueryResult holds detailed results from a 32-bit bitmap query.
+type BitmapQueryResult struct {
+	// Ledger range
+	LedgerRange     uint32 // endLedger - startLedger + 1
+	MatchingLedgers int    // Ledgers matching index query
+
+	// Index stats
+	SegmentsScanned int   // Number of segments scanned
+	IndexBytesRead  int64 // Bytes read from bitmap index
+
+	// Event fetch stats
+	EventsScanned  int   // Events scanned from storage
+	EventsReturned int   // Events returned after filtering
+	EventBytesRead int64 // Bytes read from event storage
+
+	// Timing breakdown
+	IndexLookupTime time.Duration // Time querying bitmap index
+	EventFetchTime  time.Duration // Time fetching events (total)
+	DiskReadTime    time.Duration // Time reading from disk
+	DecodeTime      time.Duration // Time decoding/unmarshalling
+	FilterTime      time.Duration // Time filtering events
+	TotalTime       time.Duration // Total query time
+}
+
+// ToUnified converts BitmapQueryResult to UnifiedQueryResult
+func (r *BitmapQueryResult) ToUnified() *UnifiedQueryResult {
+	return &UnifiedQueryResult{
+		IndexType:       "bitmap32",
+		LedgerRange:     r.LedgerRange,
+		IndexMatches:    r.MatchingLedgers,
+		MatchUnitName:   "ledgers",
+		EventsScanned:   r.EventsScanned,
+		EventsReturned:  r.EventsReturned,
+		IndexBytesRead:  r.IndexBytesRead,
+		EventBytesRead:  r.EventBytesRead,
+		IndexLookupTime: r.IndexLookupTime,
+		EventFetchTime:  r.EventFetchTime,
+		DecodeTime:      r.DecodeTime,
+		FilterTime:      r.FilterTime,
+		TotalTime:       r.TotalTime,
+	}
+}
+
+// =============================================================================
+// Bitmap64 Query Result (64-bit, TOID-level)
+// =============================================================================
+
+// Bitmap64QueryResult holds detailed results from a 64-bit bitmap query.
+// Bitmap64 now stores TOIDs (operation-level granularity), same as posting list.
+type Bitmap64QueryResult struct {
+	// Ledger range
+	LedgerRange   uint32 // endLedger - startLedger + 1
+	MatchingTOIDs int    // TOIDs matching index query
+
+	// Index stats
+	SegmentsScanned int   // Number of segments scanned
+	IndexBytesRead  int64 // Bytes read from bitmap index
+
+	// Event fetch stats
+	EventsScanned  int   // Events scanned from storage
+	EventsReturned int   // Events returned
+	EventBytesRead int64 // Bytes read from event storage
+
+	// Timing breakdown
+	IndexLookupTime time.Duration // Time querying bitmap index
+	EventFetchTime  time.Duration // Time fetching events
+	DecodeTime      time.Duration // Time decoding events
+	TotalTime       time.Duration // Total query time
+}
+
+// ToUnified converts Bitmap64QueryResult to UnifiedQueryResult
+func (r *Bitmap64QueryResult) ToUnified() *UnifiedQueryResult {
+	return &UnifiedQueryResult{
+		IndexType:       "bitmap64",
+		LedgerRange:     r.LedgerRange,
+		IndexMatches:    r.MatchingTOIDs,
+		MatchUnitName:   "TOIDs",
+		EventsScanned:   r.EventsScanned,
+		EventsReturned:  r.EventsReturned,
+		IndexBytesRead:  r.IndexBytesRead,
+		EventBytesRead:  r.EventBytesRead,
+		IndexLookupTime: r.IndexLookupTime,
+		EventFetchTime:  r.EventFetchTime,
+		DecodeTime:      r.DecodeTime,
+		FilterTime:      0, // bitmap64 doesn't have separate filter time
+		TotalTime:       r.TotalTime,
+	}
 }
 
 // =============================================================================
@@ -227,7 +349,27 @@ type PostingListQueryResult struct {
 	IntersectTime   time.Duration // Time intersecting TOID lists
 	EventFetchTime  time.Duration // Time fetching events
 	DecodeTime      time.Duration // Time decoding events
+	FilterTime      time.Duration // Time filtering events by contract/topics
 	TotalTime       time.Duration // Total query time
+}
+
+// ToUnified converts PostingListQueryResult to UnifiedQueryResult
+func (r *PostingListQueryResult) ToUnified() *UnifiedQueryResult {
+	return &UnifiedQueryResult{
+		IndexType:       "posting",
+		LedgerRange:     r.LedgerRange,
+		IndexMatches:    r.TOIDsAfterIntersect,
+		MatchUnitName:   "TOIDs",
+		EventsScanned:   r.EventsScanned,
+		EventsReturned:  r.EventsReturned,
+		IndexBytesRead:  r.PostingListBytes,
+		EventBytesRead:  r.EventBytesRead,
+		IndexLookupTime: r.PostingListTime + r.IntersectTime, // Include intersect time in index lookup
+		EventFetchTime:  r.EventFetchTime,
+		DecodeTime:      r.DecodeTime,
+		FilterTime:      r.FilterTime,
+		TotalTime:       r.TotalTime,
+	}
 }
 
 // =============================================================================

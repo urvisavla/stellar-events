@@ -12,6 +12,8 @@ import (
 type IndexReader interface {
 	// QueryLedgers returns a bitmap of ledgers matching the filter criteria.
 	QueryLedgers(contractID []byte, topics [][]byte, startLedger, endLedger uint32) (*roaring.Bitmap, error)
+	// QueryLedgersWithStats returns ledgers and query statistics.
+	QueryLedgersWithStats(contractID []byte, topics [][]byte, startLedger, endLedger uint32) (*LedgerQueryResult, error)
 }
 
 // Verify RocksDBStore implements IndexReader at compile time
@@ -25,8 +27,9 @@ var _ IndexReader = (*RocksDBStore)(nil)
 // It combines an in-memory BitmapIndex with RocksDB storage.
 // Bitmap data is stored directly; RocksDB handles compression via LZ4.
 type RocksDBStore struct {
-	db *grocksdb.DB
-	cf *grocksdb.ColumnFamilyHandle
+	db          *grocksdb.DB
+	cfContracts *grocksdb.ColumnFamilyHandle // Contract ID index CF
+	cfTopics    *grocksdb.ColumnFamilyHandle // Topic index CF
 
 	// In-memory bitmap index (this store handles its persistence)
 	bitmap *BitmapIndex
@@ -37,21 +40,31 @@ type RocksDBStore struct {
 }
 
 // NewRocksDBStore creates a new RocksDB-backed index store.
-func NewRocksDBStore(db *grocksdb.DB, cf *grocksdb.ColumnFamilyHandle) (*RocksDBStore, error) {
+// Uses separate column families for contracts and topics.
+func NewRocksDBStore(db *grocksdb.DB, cfContracts, cfTopics *grocksdb.ColumnFamilyHandle) (*RocksDBStore, error) {
 	wo := grocksdb.NewDefaultWriteOptions()
 	wo.DisableWAL(true) // WAL disabled for bulk ingestion
 
 	store := &RocksDBStore{
-		db: db,
-		cf: cf,
-		wo: wo,
-		ro: grocksdb.NewDefaultReadOptions(),
+		db:          db,
+		cfContracts: cfContracts,
+		cfTopics:    cfTopics,
+		wo:          wo,
+		ro:          grocksdb.NewDefaultReadOptions(),
 	}
 
 	// Create bitmap index with this store as the segment loader
 	store.bitmap = NewBitmapIndex(store)
 
 	return store, nil
+}
+
+// getCF returns the appropriate column family for a given prefix.
+func (s *RocksDBStore) getCF(prefix byte) *grocksdb.ColumnFamilyHandle {
+	if prefix == PrefixContractIndex {
+		return s.cfContracts
+	}
+	return s.cfTopics
 }
 
 // Close releases resources.
@@ -67,29 +80,42 @@ func (s *RocksDBStore) Close() error {
 
 // LoadSegment loads a bitmap segment from RocksDB.
 func (s *RocksDBStore) LoadSegment(prefix byte, keyValue []byte, segmentID uint32) (*roaring.Bitmap, error) {
-	dbKey := MakeL1Key(prefix, keyValue, segmentID)
-	return s.loadBitmap(dbKey)
+	bitmap, _, err := s.LoadSegmentWithStats(prefix, keyValue, segmentID)
+	return bitmap, err
 }
 
-// loadBitmap loads a bitmap from RocksDB.
+// LoadSegmentWithStats loads a segment and returns bytes read.
+func (s *RocksDBStore) LoadSegmentWithStats(prefix byte, keyValue []byte, segmentID uint32) (*roaring.Bitmap, int64, error) {
+	dbKey := MakeL1Key(prefix, keyValue, segmentID)
+	cf := s.getCF(prefix)
+	return s.loadBitmapFromCFWithStats(cf, dbKey)
+}
+
+// loadBitmapFromCF loads a bitmap from a specific column family.
 // RocksDB handles compression transparently via LZ4.
-func (s *RocksDBStore) loadBitmap(key []byte) (*roaring.Bitmap, error) {
-	data, err := s.db.GetCF(s.ro, s.cf, key)
+func (s *RocksDBStore) loadBitmapFromCF(cf *grocksdb.ColumnFamilyHandle, key []byte) (*roaring.Bitmap, error) {
+	bitmap, _, err := s.loadBitmapFromCFWithStats(cf, key)
+	return bitmap, err
+}
+
+func (s *RocksDBStore) loadBitmapFromCFWithStats(cf *grocksdb.ColumnFamilyHandle, key []byte) (*roaring.Bitmap, int64, error) {
+	data, err := s.db.GetCF(s.ro, cf, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get bitmap: %w", err)
+		return nil, 0, fmt.Errorf("failed to get bitmap: %w", err)
 	}
 	defer data.Free()
 
 	if data.Size() == 0 {
-		return nil, nil // No data for this key
+		return nil, 0, nil // No data for this key
 	}
 
+	bytesRead := int64(data.Size())
 	bitmap := roaring.New()
 	if err := bitmap.UnmarshalBinary(data.Data()); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal bitmap: %w", err)
+		return nil, bytesRead, fmt.Errorf("failed to unmarshal bitmap: %w", err)
 	}
 
-	return bitmap, nil
+	return bitmap, bytesRead, nil
 }
 
 // =============================================================================
@@ -102,9 +128,9 @@ func (s *RocksDBStore) AddContractLedger(contractID []byte, ledger uint32) error
 	return nil
 }
 
-// AddTopicLedger adds a ledger to the topic index.
-func (s *RocksDBStore) AddTopicLedger(position int, topic []byte, ledger uint32) error {
-	s.bitmap.AddTopicIndex(position, topic, ledger)
+// AddTopicLedger adds a ledger to the topic index (non-positional).
+func (s *RocksDBStore) AddTopicLedger(topic []byte, ledger uint32) error {
+	s.bitmap.AddTopicIndex(topic, ledger)
 	return nil
 }
 
@@ -112,37 +138,62 @@ func (s *RocksDBStore) AddTopicLedger(position int, topic []byte, ledger uint32)
 // Store Interface Implementation - Query Operations
 // =============================================================================
 
+// LedgerQueryResult holds the result of a ledger query including stats.
+type LedgerQueryResult struct {
+	Bitmap    *roaring.Bitmap
+	BytesRead int64
+	Segments  int
+}
+
 // QueryLedgers returns a bitmap of ledgers matching the filter criteria.
+// Topics are matched non-positionally (same semantics as posting list).
 func (s *RocksDBStore) QueryLedgers(contractID []byte, topics [][]byte, startLedger, endLedger uint32) (*roaring.Bitmap, error) {
+	result, err := s.QueryLedgersWithStats(contractID, topics, startLedger, endLedger)
+	if err != nil {
+		return nil, err
+	}
+	return result.Bitmap, nil
+}
+
+// QueryLedgersWithStats returns ledgers and query statistics.
+func (s *RocksDBStore) QueryLedgersWithStats(contractID []byte, topics [][]byte, startLedger, endLedger uint32) (*LedgerQueryResult, error) {
+	result := &LedgerQueryResult{
+		Bitmap: roaring.New(),
+	}
 	var bitmaps []*roaring.Bitmap
 
 	// Query contract index if specified
 	if len(contractID) > 0 {
-		bm, err := s.bitmap.QueryContractIndex(contractID, startLedger, endLedger)
+		bm, bytesRead, segments, err := s.bitmap.QueryContractIndexWithStats(contractID, startLedger, endLedger)
 		if err != nil {
 			return nil, fmt.Errorf("contract index query failed: %w", err)
 		}
+		result.BytesRead += bytesRead
+		result.Segments += segments
 		bitmaps = append(bitmaps, bm)
 	}
 
-	// Query topic indexes
-	for i, topic := range topics {
+	// Query topic index for each topic (non-positional)
+	for _, topic := range topics {
 		if len(topic) == 0 {
 			continue
 		}
-		bm, err := s.bitmap.QueryTopicIndex(i, topic, startLedger, endLedger)
+		bm, bytesRead, segments, err := s.bitmap.QueryTopicIndexWithStats(topic, startLedger, endLedger)
 		if err != nil {
-			return nil, fmt.Errorf("topic%d index query failed: %w", i, err)
+			return nil, fmt.Errorf("topic index query failed: %w", err)
 		}
+		result.BytesRead += bytesRead
+		result.Segments += segments
 		bitmaps = append(bitmaps, bm)
 	}
 
 	if len(bitmaps) == 0 {
-		return roaring.New(), nil
+		return result, nil
 	}
 
 	// Use FastAnd for efficient intersection (avoids Clone + multiple And calls)
-	return roaring.FastAnd(bitmaps...), nil
+	result.Bitmap = roaring.FastAnd(bitmaps...)
+	return result, nil
 }
 
 // =============================================================================
@@ -160,25 +211,21 @@ func (s *RocksDBStore) GetStats() *BitmapIndexStats {
 		CurrentSegmentID:   s.bitmap.GetCurrentSegmentID(),
 	}
 
-	// Count stored segments per index type
+	// Count stored segments per index type (non-positional)
 	stats.ContractIndexCount = s.countIndexEntries(PrefixContractIndex)
-	stats.Topic0IndexCount = s.countIndexEntries(PrefixTopic0Index)
-	stats.Topic1IndexCount = s.countIndexEntries(PrefixTopic1Index)
-	stats.Topic2IndexCount = s.countIndexEntries(PrefixTopic2Index)
-	stats.Topic3IndexCount = s.countIndexEntries(PrefixTopic3Index)
+	stats.TopicIndexCount = s.countIndexEntries(PrefixTopicIndex)
 
 	return stats
 }
 
 // countIndexEntries counts the number of stored bitmap segments for an index type.
 func (s *RocksDBStore) countIndexEntries(prefix byte) int64 {
-	iter := s.db.NewIteratorCF(s.ro, s.cf)
+	cf := s.getCF(prefix)
+	iter := s.db.NewIteratorCF(s.ro, cf)
 	defer iter.Close()
 
-	prefixBytes := []byte{prefix}
 	var count int64
-
-	for iter.Seek(prefixBytes); iter.ValidForPrefix(prefixBytes); iter.Next() {
+	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
 		count++
 	}
 
@@ -204,8 +251,12 @@ func (s *RocksDBStore) Flush() error {
 	defer batch.Destroy()
 
 	for _, seg := range segments {
+		// Extract prefix from key to determine CF
+		prefix := seg.Key[0]
+		cf := s.getCF(prefix)
+
 		// Load existing bitmap from RocksDB (if any)
-		existingBitmap, err := s.loadBitmap(seg.Key)
+		existingBitmap, err := s.loadBitmapFromCF(cf, seg.Key)
 		if err != nil {
 			return fmt.Errorf("failed to load existing bitmap for merge: %w", err)
 		}
@@ -228,7 +279,7 @@ func (s *RocksDBStore) Flush() error {
 			finalData = seg.Data
 		}
 
-		batch.PutCF(s.cf, seg.Key, finalData)
+		batch.PutCF(cf, seg.Key, finalData)
 	}
 
 	if err := s.db.Write(s.wo, batch); err != nil {

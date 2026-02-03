@@ -7,18 +7,15 @@ package index
 
 const (
 	// SegmentSize is the number of ledgers per bitmap segment.
-	// 1M ledgers ≈ 2 months of Stellar data.
-	// Small enough to limit write amplification, large enough to amortize overhead.
-	SegmentSize uint32 = 1_000_000
+	// Matches posting list BucketSize (10,000 ledgers ≈ 14 hours) for fair comparison.
+	SegmentSize uint32 = 10_000
 )
 
 // Level 1 index prefixes (ledger-level granularity)
+// Simplified to match posting list structure: one index for contracts, one for topics
 const (
-	PrefixContractIndex byte = 0x01
-	PrefixTopic0Index   byte = 0x02
-	PrefixTopic1Index   byte = 0x03
-	PrefixTopic2Index   byte = 0x04
-	PrefixTopic3Index   byte = 0x05
+	PrefixContractIndex byte = 0x01 // Contract ID → ledger bitmap
+	PrefixTopicIndex    byte = 0x02 // Topic (any position) → ledger bitmap
 )
 
 
@@ -33,10 +30,7 @@ type BitmapIndexStats struct {
 	HotSegmentMemBytes uint64
 	CurrentSegmentID   uint32
 	ContractIndexCount int64
-	Topic0IndexCount   int64
-	Topic1IndexCount   int64
-	Topic2IndexCount   int64
-	Topic3IndexCount   int64
+	TopicIndexCount    int64 // All topics (non-positional)
 }
 
 // =============================================================================

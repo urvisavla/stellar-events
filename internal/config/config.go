@@ -87,9 +87,10 @@ type IngestionConfig struct {
 	ComputeStats    bool `toml:"compute_stats"`    // Compute event stats after ingestion (default: false)
 
 	// Index maintenance during ingestion
-	BitmapIndexes      bool `toml:"bitmap_indexes"`       // Maintain bitmap indexes (default: true)
-	PostingListIndexes bool `toml:"posting_list_indexes"` // Maintain posting list indexes (default: false)
-	UniqueIndexes      bool `toml:"unique_indexes"`       // Maintain unique value counts (default: false)
+	BitmapIndexes      bool `toml:"bitmap_indexes"`        // Maintain 32-bit bitmap indexes (ledger-level, default: true)
+	Bitmap64Indexes    bool `toml:"bitmap64_indexes"`      // Maintain 64-bit bitmap indexes (event-level, default: false)
+	PostingListIndexes bool `toml:"posting_list_indexes"`  // Maintain posting list indexes (default: false)
+	UniqueIndexes      bool `toml:"unique_indexes"`        // Maintain unique value counts (default: false)
 
 	// Index flush interval (applies to both bitmap and posting list indexes)
 	IndexFlushInterval int `toml:"index_flush_interval"` // Ledgers between index flushes (default: 10000)
@@ -165,6 +166,7 @@ func DefaultConfig() *Config {
 			FinalCompaction:    true,
 			ComputeStats:       false,
 			BitmapIndexes:      true,
+			Bitmap64Indexes:    false, // Disabled by default (larger index)
 			PostingListIndexes: false,
 			UniqueIndexes:      false,
 			IndexFlushInterval: 10000, // Flush indexes every 10K ledgers

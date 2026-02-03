@@ -19,7 +19,8 @@ type PipelineConfig struct {
 	DataDir             string // Ledger data directory
 	NetworkPassphrase   string // Network passphrase for XDR parsing
 	MaintainUniqueIdx      bool // Maintain unique indexes during ingestion
-	MaintainBitmapIdx      bool // Maintain roaring bitmap indexes during ingestion
+	MaintainBitmapIdx      bool // Maintain 32-bit bitmap indexes during ingestion
+	MaintainBitmap64Idx    bool // Maintain 64-bit bitmap indexes during ingestion
 	MaintainPostingListIdx bool // Maintain posting list indexes during ingestion
 	IndexFlushInterval     int  // Ledgers between index flushes (0 = only at end)
 
@@ -271,6 +272,7 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 				_, err := p.store.StoreEvents(eventBatch, &store.StoreOptions{
 					UniqueIndexes:      p.config.MaintainUniqueIdx,
 					BitmapIndexes:      p.config.MaintainBitmapIdx,
+					Bitmap64Indexes:    p.config.MaintainBitmap64Idx,
 					PostingListIndexes: p.config.MaintainPostingListIdx,
 					ExcludeTopic0:      p.config.ExcludeTopic0,
 					ExcludeDiagnostic:  p.config.ExcludeDiagnostic,
@@ -292,7 +294,7 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 				batchStartSeq = nextSeq
 
 				// Periodic bitmap flush to prevent hot segment memory growth
-				if p.config.MaintainBitmapIdx && p.config.IndexFlushInterval > 0 &&
+				if (p.config.MaintainBitmapIdx || p.config.MaintainBitmap64Idx) && p.config.IndexFlushInterval > 0 &&
 					ledgersProcessed%p.config.IndexFlushInterval == 0 {
 					if err := p.store.FlushBitmapIndexes(); err != nil {
 						return fmt.Errorf("failed to flush bitmap indexes: %w", err)
@@ -315,8 +317,8 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 		}
 	}
 
-	// Flush bitmap indexes if enabled
-	if p.config.MaintainBitmapIdx {
+	// Flush bitmap indexes if enabled (32-bit or 64-bit)
+	if p.config.MaintainBitmapIdx || p.config.MaintainBitmap64Idx {
 		if err := p.store.FlushBitmapIndexes(); err != nil {
 			return fmt.Errorf("failed to flush bitmap indexes: %w", err)
 		}

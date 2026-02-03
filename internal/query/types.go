@@ -88,7 +88,8 @@ type Result struct {
 	DiskReadTime   time.Duration // Time spent reading from RocksDB (iterator operations)
 	UnmarshalTime  time.Duration // Time spent unmarshalling XDR
 	FilterTime     time.Duration // Time spent post-filtering events
-	BytesRead      int64         // Total bytes read from disk
+	IndexBytesRead int64         // Bytes read from index
+	BytesRead      int64         // Bytes read from event storage
 }
 
 // FetchTiming holds detailed timing for a single ledger fetch operation.

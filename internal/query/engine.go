@@ -69,11 +69,13 @@ func (e *Engine) Query(filter *Filter, startLedger, endLedger uint32, opts *Opti
 
 	// Phase 1: Index lookup - find matching ledgers
 	indexStart := time.Now()
-	matchingLedgers, err := e.indexReader.QueryLedgers(filter.ContractID, topics, startLedger, endLedger)
+	indexResult, err := e.indexReader.QueryLedgersWithStats(filter.ContractID, topics, startLedger, endLedger)
 	if err != nil {
 		return nil, fmt.Errorf("index query failed: %w", err)
 	}
 	result.IndexLookupTime = time.Since(indexStart)
+	result.IndexBytesRead = indexResult.BytesRead
+	matchingLedgers := indexResult.Bitmap
 	result.MatchingLedgers = int(matchingLedgers.GetCardinality())
 	result.MatchingLedgerSeqs = matchingLedgers.ToArray()
 

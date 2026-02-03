@@ -19,6 +19,8 @@ type SegmentLoader interface {
 	// LoadSegment loads a bitmap segment from storage.
 	// Returns nil, nil if segment doesn't exist.
 	LoadSegment(prefix byte, keyValue []byte, segmentID uint32) (*roaring.Bitmap, error)
+	// LoadSegmentWithStats loads a segment and returns bytes read.
+	LoadSegmentWithStats(prefix byte, keyValue []byte, segmentID uint32) (*roaring.Bitmap, int64, error)
 }
 
 // =============================================================================
@@ -119,22 +121,10 @@ func (bi *BitmapIndex) AddContractIndex(contractID []byte, ledgerSeq uint32) {
 	bi.AddToIndex(PrefixContractIndex, contractID, ledgerSeq)
 }
 
-// AddTopicIndex adds a ledger to a topic L1 index.
-func (bi *BitmapIndex) AddTopicIndex(topicPosition int, topicValue []byte, ledgerSeq uint32) {
-	var prefix byte
-	switch topicPosition {
-	case 0:
-		prefix = PrefixTopic0Index
-	case 1:
-		prefix = PrefixTopic1Index
-	case 2:
-		prefix = PrefixTopic2Index
-	case 3:
-		prefix = PrefixTopic3Index
-	default:
-		return // Invalid topic position
-	}
-	bi.AddToIndex(prefix, topicValue, ledgerSeq)
+// AddTopicIndex adds a ledger to the topic index (non-positional).
+// All topics are indexed regardless of their position.
+func (bi *BitmapIndex) AddTopicIndex(topicValue []byte, ledgerSeq uint32) {
+	bi.AddToIndex(PrefixTopicIndex, topicValue, ledgerSeq)
 }
 
 // =============================================================================
@@ -229,13 +219,107 @@ func (bi *BitmapIndex) QueryContractIndex(contractID []byte, startLedger, endLed
 	return bi.QueryIndex(PrefixContractIndex, contractID, startLedger, endLedger)
 }
 
-// QueryTopicIndex queries ledgers for a topic value.
-func (bi *BitmapIndex) QueryTopicIndex(topicPosition int, topicValue []byte, startLedger, endLedger uint32) (*roaring.Bitmap, error) {
-	prefix := TopicL1Prefix(topicPosition)
-	if prefix == 0 {
-		return nil, nil
+// QueryTopicIndex queries ledgers for a topic value (non-positional).
+func (bi *BitmapIndex) QueryTopicIndex(topicValue []byte, startLedger, endLedger uint32) (*roaring.Bitmap, error) {
+	return bi.QueryIndex(PrefixTopicIndex, topicValue, startLedger, endLedger)
+}
+
+// QueryIndexWithStats returns ledgers matching a key and tracks bytes read from storage.
+func (bi *BitmapIndex) QueryIndexWithStats(prefix byte, keyValue []byte, startLedger, endLedger uint32) (*roaring.Bitmap, int64, int, error) {
+	result := roaring.New()
+	var bytesRead int64
+	var segmentsRead int
+
+	startSegment := SegmentID(startLedger)
+	endSegment := SegmentID(endLedger)
+
+	for segID := startSegment; segID <= endSegment; segID++ {
+		bitmap, segBytes, err := bi.getL1SegmentWithStats(prefix, keyValue, segID)
+		if err != nil {
+			return nil, bytesRead, segmentsRead, err
+		}
+
+		bytesRead += segBytes
+		if segBytes > 0 {
+			segmentsRead++
+		}
+
+		if bitmap == nil || bitmap.IsEmpty() {
+			continue
+		}
+
+		segmentBase := segID * SegmentSize
+
+		// Apply range mask for partial segments (first and/or last segment)
+		isFirstSegment := segID == startSegment
+		isLastSegment := segID == endSegment
+		needsRangeMask := isFirstSegment || isLastSegment
+
+		if needsRangeMask {
+			// Calculate local range within this segment
+			localStart := uint64(0)
+			localEnd := uint64(SegmentSize)
+
+			if isFirstSegment && startLedger > segmentBase {
+				localStart = uint64(startLedger - segmentBase)
+			}
+			if isLastSegment {
+				segmentEnd := segmentBase + SegmentSize - 1
+				if endLedger < segmentEnd {
+					localEnd = uint64(endLedger - segmentBase + 1)
+				}
+			}
+
+			// Create range mask and apply with AND
+			mask := roaring.New()
+			mask.AddRange(localStart, localEnd)
+			bitmap = roaring.And(bitmap, mask)
+		}
+
+		if bitmap.IsEmpty() {
+			continue
+		}
+
+		// Convert local offsets to absolute ledger numbers and merge
+		localValues := bitmap.ToArray()
+		absoluteValues := make([]uint32, len(localValues))
+		for i, local := range localValues {
+			absoluteValues[i] = segmentBase + local
+		}
+
+		segmentResult := roaring.New()
+		segmentResult.AddMany(absoluteValues)
+		result.Or(segmentResult)
 	}
-	return bi.QueryIndex(prefix, topicValue, startLedger, endLedger)
+
+	return result, bytesRead, segmentsRead, nil
+}
+
+// getL1SegmentWithStats retrieves a segment and tracks bytes read.
+func (bi *BitmapIndex) getL1SegmentWithStats(prefix byte, keyValue []byte, segmentID uint32) (*roaring.Bitmap, int64, error) {
+	key := makeKey(prefix, keyValue, segmentID)
+
+	// Check hot cache first - no disk read
+	if bitmap, exists := bi.hotSegments[key]; exists {
+		return bitmap, 0, nil
+	}
+
+	// Load from storage if loader is available
+	if bi.loader != nil {
+		return bi.loader.LoadSegmentWithStats(prefix, keyValue, segmentID)
+	}
+
+	return nil, 0, nil
+}
+
+// QueryContractIndexWithStats queries ledgers for a contract ID with byte tracking.
+func (bi *BitmapIndex) QueryContractIndexWithStats(contractID []byte, startLedger, endLedger uint32) (*roaring.Bitmap, int64, int, error) {
+	return bi.QueryIndexWithStats(PrefixContractIndex, contractID, startLedger, endLedger)
+}
+
+// QueryTopicIndexWithStats queries ledgers for a topic with byte tracking.
+func (bi *BitmapIndex) QueryTopicIndexWithStats(topicValue []byte, startLedger, endLedger uint32) (*roaring.Bitmap, int64, int, error) {
+	return bi.QueryIndexWithStats(PrefixTopicIndex, topicValue, startLedger, endLedger)
 }
 
 // =============================================================================
@@ -301,19 +385,3 @@ func (bi *BitmapIndex) GetCurrentSegmentID() uint32 {
 // =============================================================================
 // Helper Functions
 // =============================================================================
-
-// TopicL1Prefix returns the L1 prefix for a topic position.
-func TopicL1Prefix(position int) byte {
-	switch position {
-	case 0:
-		return PrefixTopic0Index
-	case 1:
-		return PrefixTopic1Index
-	case 2:
-		return PrefixTopic2Index
-	case 3:
-		return PrefixTopic3Index
-	default:
-		return 0
-	}
-}

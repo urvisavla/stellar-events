@@ -72,24 +72,26 @@ func LedgerFromKey(key []byte) uint32 {
 }
 
 // =============================================================================
-// Legacy Bitmap Functions (for backward compatibility with event_bitmap.go)
+// Bitmap64 Key Functions (TOID-based, operation-level granularity)
 // =============================================================================
-// These use the old 64-bit format: [ledger:32][tx:16][op:8][evt:8]
-// Kept for bitmap index comparison purposes.
+// Bitmap64 now stores TOIDs directly (not event keys), making it comparable
+// to posting lists. Both index at operation-level, not event-level.
+//
+// Format: TOID = [ledger:32][tx:20][op:12] = 64 bits
+//
+// Note: Event index is NOT stored in bitmap. When fetching events, all events
+// for a TOID are retrieved (same as posting list behavior).
 
-// EncodeBitmapKey encodes event position into a 64-bit bitmap key.
-// Format: [ledger:32][tx:16][op:8][evt:8] = 64 bits
-// DEPRECATED: Use TOID-based functions for new code.
+// EncodeBitmapKey encodes event position into a 64-bit TOID for bitmap storage.
+// The evt parameter is ignored - bitmap64 stores at TOID (operation) level.
 func EncodeBitmapKey(ledger uint32, tx, op, evt uint16) uint64 {
-	return uint64(ledger)<<32 | uint64(tx)<<16 | uint64(op&0xFF)<<8 | uint64(evt&0xFF)
+	// Use EncodeTOID - evt is ignored, bitmap stores at operation level
+	return EncodeTOID(ledger, uint32(tx), uint32(op))
 }
 
-// DecodeBitmapKey decodes a 64-bit bitmap key into components.
-// DEPRECATED: Use TOID-based functions for new code.
+// DecodeBitmapKey decodes a 64-bit TOID from bitmap into components.
+// evt is always 0 since bitmap stores at operation level.
 func DecodeBitmapKey(key uint64) (ledger uint32, tx, op, evt uint16) {
-	ledger = uint32(key >> 32)
-	tx = uint16((key >> 16) & 0xFFFF)
-	op = uint16((key >> 8) & 0xFF)
-	evt = uint16(key & 0xFF)
-	return
+	l, t, o := DecodeTOID(key)
+	return l, uint16(t), uint16(o), 0
 }
