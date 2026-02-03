@@ -351,11 +351,18 @@ func printPostingListResult(r *store.PostingListQueryResult) {
 	fmt.Fprintf(os.Stderr, "  Buckets scanned:   %d\n", r.BucketsScanned)
 	fmt.Fprintf(os.Stderr, "  Posting lists:     %d\n", r.PostingListsRead)
 	fmt.Fprintf(os.Stderr, "  PL bytes read:     %s\n", formatBytes(r.PostingListBytes))
+	fmt.Fprintf(os.Stderr, "  TOIDs in PL:       %d (total in posting lists)\n", r.TOIDsInPostingList)
+	if r.TOIDsInPostingList > 0 {
+		pct := float64(r.TOIDsDecoded) / float64(r.TOIDsInPostingList) * 100
+		fmt.Fprintf(os.Stderr, "  TOIDs decoded:     %d (%.1f%% - early termination)\n", r.TOIDsDecoded, pct)
+	} else {
+		fmt.Fprintf(os.Stderr, "  TOIDs decoded:     %d\n", r.TOIDsDecoded)
+	}
 	if r.TOIDsFromContract > 0 {
-		fmt.Fprintf(os.Stderr, "  TOIDs (contract):  %d\n", r.TOIDsFromContract)
+		fmt.Fprintf(os.Stderr, "  TOIDs (contract):  %d (in range)\n", r.TOIDsFromContract)
 	}
 	if r.TOIDsFromTopics > 0 {
-		fmt.Fprintf(os.Stderr, "  TOIDs (topics):    %d\n", r.TOIDsFromTopics)
+		fmt.Fprintf(os.Stderr, "  TOIDs (topics):    %d (in range)\n", r.TOIDsFromTopics)
 	}
 	fmt.Fprintf(os.Stderr, "  TOIDs (final):     %d\n", r.TOIDsAfterIntersect)
 

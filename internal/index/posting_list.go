@@ -203,6 +203,81 @@ func DecodeTOIDListDeltaVarint(data []byte) []uint64 {
 	return toids
 }
 
+// DeltaVarintIterator allows incremental decoding of delta-varint TOIDs.
+type DeltaVarintIterator struct {
+	data      []byte
+	count     uint64
+	index     uint64
+	prevTOID  uint64
+	exhausted bool
+}
+
+// NewDeltaVarintIterator creates an iterator for delta-varint encoded data.
+func NewDeltaVarintIterator(data []byte) *DeltaVarintIterator {
+	it := &DeltaVarintIterator{data: data}
+	if len(data) == 0 {
+		it.exhausted = true
+		return it
+	}
+
+	// Read count
+	count, n := readVarint(data)
+	if n <= 0 || count == 0 {
+		it.exhausted = true
+		return it
+	}
+	it.count = count
+	it.data = data[n:]
+
+	// Need at least 8 bytes for first TOID
+	if len(it.data) < 8 {
+		it.exhausted = true
+		return it
+	}
+
+	// Read first TOID but don't advance yet
+	it.prevTOID = binary.BigEndian.Uint64(it.data[:8])
+	return it
+}
+
+// Next returns the next TOID and whether it exists.
+func (it *DeltaVarintIterator) Next() (uint64, bool) {
+	if it.exhausted || it.index >= it.count {
+		return 0, false
+	}
+
+	if it.index == 0 {
+		// First TOID
+		it.data = it.data[8:]
+		it.index++
+		return it.prevTOID, true
+	}
+
+	// Read delta
+	delta, n := readVarint(it.data)
+	if n <= 0 {
+		it.exhausted = true
+		return 0, false
+	}
+	it.data = it.data[n:]
+	it.prevTOID += delta
+	it.index++
+	return it.prevTOID, true
+}
+
+// Count returns total number of TOIDs in the data.
+func (it *DeltaVarintIterator) Count() uint64 {
+	return it.count
+}
+
+// Remaining returns how many TOIDs are left to read.
+func (it *DeltaVarintIterator) Remaining() uint64 {
+	if it.index >= it.count {
+		return 0
+	}
+	return it.count - it.index
+}
+
 // appendVarint appends a varint-encoded uint64 to buf.
 func appendVarint(buf []byte, v uint64) []byte {
 	for v >= 0x80 {

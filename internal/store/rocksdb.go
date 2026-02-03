@@ -2798,6 +2798,10 @@ func (es *RocksDBEventStore) queryPostingListStreaming(contractID []byte, topics
 	ledgerSet := make(map[uint32]struct{})
 	var plTime, fetchTime, decodeTime time.Duration
 
+	// Precompute TOID boundaries for ledger range filtering
+	startTOID := index.EncodeTOID(startLedger, 0, 0)
+	endTOID := index.EncodeTOID(endLedger, 0xFFFFF, 0xFFF) // max tx and op for end ledger
+
 	for _, bucketID := range buckets {
 		if len(allEvents) >= limit {
 			break
@@ -2822,11 +2826,51 @@ func (es *RocksDBEventStore) queryPostingListStreaming(contractID []byte, topics
 		result.BucketsScanned++
 		result.PostingListsRead++
 
-		toids := index.DecodeTOIDListDeltaVarint(data)
+		// Copy data since we need to free value but iterator needs the bytes
+		dataCopy := make([]byte, len(data))
+		copy(dataCopy, data)
 		value.Free()
 
-		// Filter to ledger range
-		filtered := index.FilterTOIDsByLedgerRange(toids, startLedger, endLedger)
+		// Use incremental iterator for early termination
+		iter := index.NewDeltaVarintIterator(dataCopy)
+		result.TOIDsInPostingList += int(iter.Count())
+		remaining := limit - len(allEvents)
+
+		// Collect filtered TOIDs with early termination
+		// Buffer: collect up to 3x remaining to account for multi-event TOIDs
+		maxToCollect := remaining * 3
+		if maxToCollect < 1000 {
+			maxToCollect = 1000 // minimum batch size for efficiency
+		}
+
+		var filtered []uint64
+		toidsDecoded := 0
+
+		for {
+			toid, ok := iter.Next()
+			if !ok {
+				break
+			}
+			toidsDecoded++
+
+			// Skip if before start ledger (TOIDs are sorted, so we can continue)
+			if toid < startTOID {
+				continue
+			}
+			// Stop if past end ledger (TOIDs are sorted, no more matches possible)
+			if toid > endTOID {
+				break
+			}
+
+			filtered = append(filtered, toid)
+
+			// Early termination: stop when we have enough TOIDs
+			if len(filtered) >= maxToCollect {
+				break
+			}
+		}
+
+		result.TOIDsDecoded += toidsDecoded
 		if len(contractID) > 0 {
 			result.TOIDsFromContract += len(filtered)
 		} else {
@@ -2842,7 +2886,6 @@ func (es *RocksDBEventStore) queryPostingListStreaming(contractID []byte, topics
 		}
 
 		// Fetch events for this bucket's TOIDs
-		remaining := limit - len(allEvents)
 		fetchStart := time.Now()
 		events, bytesRead, scanned, decTime, err := es.fetchEventsByTOIDsWithStats(filtered, remaining)
 		if err != nil {

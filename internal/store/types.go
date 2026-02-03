@@ -210,8 +210,10 @@ type PostingListQueryResult struct {
 	BucketsScanned      int   // Number of bucket ranges scanned
 	PostingListsRead    int   // Number of posting list keys read
 	PostingListBytes    int64 // Total bytes read from posting lists
-	TOIDsFromContract   int   // TOIDs from contract posting list
-	TOIDsFromTopics     int   // TOIDs from topic posting lists (before intersect)
+	TOIDsInPostingList  int   // Total TOIDs in posting lists (before decoding)
+	TOIDsDecoded        int   // TOIDs actually decoded (shows early termination effect)
+	TOIDsFromContract   int   // TOIDs from contract posting list (in range)
+	TOIDsFromTopics     int   // TOIDs from topic posting lists (in range)
 	TOIDsAfterIntersect int   // TOIDs after intersection (final count)
 
 	// Event fetch stats
