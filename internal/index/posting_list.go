@@ -119,6 +119,138 @@ func DecodeTOIDList(data []byte) []uint64 {
 	return toids
 }
 
+// =============================================================================
+// Delta-Varint Encoding for Posting Lists
+// =============================================================================
+//
+// Delta-varint encoding dramatically reduces posting list size by:
+// 1. Storing deltas between consecutive TOIDs (usually small numbers)
+// 2. Using variable-length integer encoding (small numbers = fewer bytes)
+//
+// Example: TOIDs [1000000, 1000001, 1000005, 1000006]
+// - Raw: 4 × 8 = 32 bytes
+// - Delta: [1000000, 1, 4, 1]
+// - Varint: ~5 + 1 + 1 + 1 = ~8 bytes (4x compression)
+//
+// Format: [count:varint][first_toid:8bytes][delta1:varint][delta2:varint]...
+
+// EncodeTOIDListDeltaVarint encodes TOIDs using delta-varint compression.
+// TOIDs must be sorted in ascending order.
+func EncodeTOIDListDeltaVarint(toids []uint64) []byte {
+	if len(toids) == 0 {
+		return nil
+	}
+
+	// Estimate size: count (5) + first toid (8) + deltas (avg 2 bytes each)
+	buf := make([]byte, 0, 13+len(toids)*2)
+
+	// Write count as varint
+	buf = appendVarint(buf, uint64(len(toids)))
+
+	// Write first TOID as full 8 bytes (big-endian)
+	firstBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(firstBytes, toids[0])
+	buf = append(buf, firstBytes...)
+
+	// Write deltas as varints
+	prev := toids[0]
+	for i := 1; i < len(toids); i++ {
+		delta := toids[i] - prev
+		buf = appendVarint(buf, delta)
+		prev = toids[i]
+	}
+
+	return buf
+}
+
+// DecodeTOIDListDeltaVarint decodes delta-varint encoded TOIDs.
+func DecodeTOIDListDeltaVarint(data []byte) []uint64 {
+	if len(data) == 0 {
+		return nil
+	}
+
+	// Read count
+	count, n := readVarint(data)
+	if n <= 0 || count == 0 {
+		return nil
+	}
+	data = data[n:]
+
+	// Need at least 8 bytes for first TOID
+	if len(data) < 8 {
+		return nil
+	}
+
+	toids := make([]uint64, count)
+
+	// Read first TOID
+	toids[0] = binary.BigEndian.Uint64(data[:8])
+	data = data[8:]
+
+	// Read deltas
+	prev := toids[0]
+	for i := uint64(1); i < count; i++ {
+		delta, n := readVarint(data)
+		if n <= 0 {
+			// Truncated data, return what we have
+			return toids[:i]
+		}
+		data = data[n:]
+		toids[i] = prev + delta
+		prev = toids[i]
+	}
+
+	return toids
+}
+
+// appendVarint appends a varint-encoded uint64 to buf.
+func appendVarint(buf []byte, v uint64) []byte {
+	for v >= 0x80 {
+		buf = append(buf, byte(v)|0x80)
+		v >>= 7
+	}
+	buf = append(buf, byte(v))
+	return buf
+}
+
+// readVarint reads a varint from data, returns value and bytes consumed.
+func readVarint(data []byte) (uint64, int) {
+	var v uint64
+	var shift uint
+	for i, b := range data {
+		if i >= 10 { // max 10 bytes for uint64 varint
+			return 0, -1
+		}
+		v |= uint64(b&0x7F) << shift
+		if b < 0x80 {
+			return v, i + 1
+		}
+		shift += 7
+	}
+	return 0, -1 // incomplete varint
+}
+
+// MergeTOIDListsDeltaVarint merges two delta-varint encoded posting lists.
+// Both inputs must be sorted. Output is sorted delta-varint encoded.
+func MergeTOIDListsDeltaVarint(existing, new []byte) []byte {
+	// Decode both lists
+	existingTOIDs := DecodeTOIDListDeltaVarint(existing)
+	newTOIDs := DecodeTOIDListDeltaVarint(new)
+
+	if len(existingTOIDs) == 0 {
+		return new
+	}
+	if len(newTOIDs) == 0 {
+		return existing
+	}
+
+	// Merge sorted lists (union, preserving order)
+	merged := UnionTOIDLists(existingTOIDs, newTOIDs)
+
+	// Re-encode
+	return EncodeTOIDListDeltaVarint(merged)
+}
+
 // FilterTOIDsByLedgerRange filters TOIDs to only include those within the ledger range.
 // TOIDs are assumed to be sorted.
 func FilterTOIDsByLedgerRange(toids []uint64, startLedger, endLedger uint32) []uint64 {

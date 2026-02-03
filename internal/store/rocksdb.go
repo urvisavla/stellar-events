@@ -80,40 +80,55 @@ func (m *uint64AddMergeOperator) PartialMerge(key, leftOperand, rightOperand []b
 	return result, true
 }
 
-// postingListMergeOperator implements a merge operator that concatenates TOID lists.
-// Since events arrive in ledger order, new TOIDs are always >= existing TOIDs,
-// so simple concatenation maintains sorted order.
+// postingListMergeOperator implements a merge operator for delta-varint encoded TOID lists.
+// Decodes, merges (union), and re-encodes the posting lists.
 type postingListMergeOperator struct{}
 
 func (m *postingListMergeOperator) Name() string {
-	return "posting-list-append"
+	return "posting-list-delta-varint"
 }
 
 func (m *postingListMergeOperator) FullMerge(key, existingValue []byte, operands [][]byte) ([]byte, bool) {
-	// Calculate total size needed
-	totalSize := len(existingValue)
-	for _, operand := range operands {
-		totalSize += len(operand)
-	}
-
-	// Concatenate all values
-	result := make([]byte, 0, totalSize)
+	// Start with existing value
+	var result []uint64
 	if len(existingValue) > 0 {
-		result = append(result, existingValue...)
-	}
-	for _, operand := range operands {
-		result = append(result, operand...)
+		result = index.DecodeTOIDListDeltaVarint(existingValue)
 	}
 
-	return result, true
+	// Merge each operand
+	for _, operand := range operands {
+		if len(operand) == 0 {
+			continue
+		}
+		newTOIDs := index.DecodeTOIDListDeltaVarint(operand)
+		if len(result) == 0 {
+			result = newTOIDs
+		} else {
+			result = index.UnionTOIDLists(result, newTOIDs)
+		}
+	}
+
+	if len(result) == 0 {
+		return nil, true
+	}
+
+	return index.EncodeTOIDListDeltaVarint(result), true
 }
 
 func (m *postingListMergeOperator) PartialMerge(key, leftOperand, rightOperand []byte) ([]byte, bool) {
-	// Simple concatenation - append right to left
-	result := make([]byte, len(leftOperand)+len(rightOperand))
-	copy(result, leftOperand)
-	copy(result[len(leftOperand):], rightOperand)
-	return result, true
+	// Decode both, merge, re-encode
+	left := index.DecodeTOIDListDeltaVarint(leftOperand)
+	right := index.DecodeTOIDListDeltaVarint(rightOperand)
+
+	if len(left) == 0 {
+		return rightOperand, true
+	}
+	if len(right) == 0 {
+		return leftOperand, true
+	}
+
+	merged := index.UnionTOIDLists(left, right)
+	return index.EncodeTOIDListDeltaVarint(merged), true
 }
 
 // eventKey generates a 10-byte binary key for events using TOID format.
@@ -653,15 +668,23 @@ func (es *RocksDBEventStore) FlushPostingListIndexes() (int, int, error) {
 	contractKeys := 0
 	topicKeys := 0
 
-	// Write all accumulated contract postings
-	for keyStr, toids := range es.contractPostings {
-		batch.MergeCF(es.cfContracts, []byte(keyStr), toids)
+	// Write all accumulated contract postings (convert raw TOIDs to delta-varint)
+	for keyStr, rawToids := range es.contractPostings {
+		// Decode raw 8-byte TOIDs
+		toids := index.DecodeTOIDList(rawToids)
+		// Encode as delta-varint
+		encoded := index.EncodeTOIDListDeltaVarint(toids)
+		batch.MergeCF(es.cfContracts, []byte(keyStr), encoded)
 		contractKeys++
 	}
 
-	// Write all accumulated topic postings
-	for keyStr, toids := range es.topicPostings {
-		batch.MergeCF(es.cfTopics, []byte(keyStr), toids)
+	// Write all accumulated topic postings (convert raw TOIDs to delta-varint)
+	for keyStr, rawToids := range es.topicPostings {
+		// Decode raw 8-byte TOIDs
+		toids := index.DecodeTOIDList(rawToids)
+		// Encode as delta-varint
+		encoded := index.EncodeTOIDListDeltaVarint(toids)
+		batch.MergeCF(es.cfTopics, []byte(keyStr), encoded)
 		topicKeys++
 	}
 
@@ -2596,7 +2619,7 @@ func (es *RocksDBEventStore) queryPostingList(cf *grocksdb.ColumnFamilyHandle, t
 		}
 
 		if value.Exists() {
-			toids := index.DecodeTOIDList(value.Data())
+			toids := index.DecodeTOIDListDeltaVarint(value.Data())
 			// Filter TOIDs to the actual ledger range
 			filtered := index.FilterTOIDsByLedgerRange(toids, startLedger, endLedger)
 			allTOIDs = append(allTOIDs, filtered...)
@@ -2654,20 +2677,32 @@ func (es *RocksDBEventStore) QueryEventsWithPostingList(contractID []byte, topic
 }
 
 // QueryEventsWithPostingListTiming queries events with detailed timing and stats.
+// Uses streaming approach: reads posting lists bucket-by-bucket and stops early when limit is reached.
 func (es *RocksDBEventStore) QueryEventsWithPostingListTiming(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int) (*PostingListQueryResult, []*query.Event, error) {
 	totalStart := time.Now()
 	result := &PostingListQueryResult{
 		LedgerRange: endLedger - startLedger + 1,
 	}
 
+	// For single filter queries (contract OR topic, not both), use streaming approach
+	// For multi-filter queries, we need all TOIDs to intersect
+	hasContract := len(contractID) > 0
+	hasTopics := len(topics) > 0
+	multiFilter := hasContract && hasTopics
+
+	if !multiFilter && limit > 0 {
+		// Single filter with limit - use streaming approach
+		return es.queryPostingListStreaming(contractID, topics, startLedger, endLedger, limit, result, totalStart)
+	}
+
+	// Multi-filter or no limit - use original approach (need all TOIDs for intersection)
 	var resultTOIDs []uint64
 	var initialized bool
 
-	// Phase 1: Query posting lists
 	plStart := time.Now()
 
 	// Query contract ID posting list if specified
-	if len(contractID) > 0 {
+	if hasContract {
 		toids, buckets, bytesRead, err := es.queryPostingListWithStats(es.cfContracts, index.ContractTermKey(contractID), startLedger, endLedger)
 		if err != nil {
 			return nil, nil, err
@@ -2699,13 +2734,11 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListTiming(contractID []byte,
 			resultTOIDs = toids
 			initialized = true
 		} else {
-			// Intersect with previous results
 			intersectStart := time.Now()
 			resultTOIDs = index.IntersectTOIDLists(resultTOIDs, toids)
 			result.IntersectTime += time.Since(intersectStart)
 		}
 
-		// Early exit if intersection is empty
 		if len(resultTOIDs) == 0 {
 			result.PostingListTime = time.Since(plStart)
 			result.TotalTime = time.Since(totalStart)
@@ -2724,7 +2757,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListTiming(contractID []byte,
 	}
 	result.UniqueLedgers = len(ledgerSet)
 
-	// Phase 2: Fetch events
+	// Fetch events
 	fetchStart := time.Now()
 	events, bytesRead, scanned, decodeTime, err := es.fetchEventsByTOIDsWithStats(resultTOIDs, limit)
 	if err != nil {
@@ -2739,6 +2772,99 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListTiming(contractID []byte,
 	result.TotalTime = time.Since(totalStart)
 
 	return result, events, nil
+}
+
+// queryPostingListStreaming reads posting lists bucket-by-bucket and fetches events incrementally.
+// Stops early when limit is reached, avoiding reading unnecessary posting list data.
+func (es *RocksDBEventStore) queryPostingListStreaming(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int, result *PostingListQueryResult, totalStart time.Time) (*PostingListQueryResult, []*query.Event, error) {
+	buckets := index.GetBucketsForRange(startLedger, endLedger)
+
+	// Determine which CF and term key to use
+	var cf *grocksdb.ColumnFamilyHandle
+	var termKey [32]byte
+
+	if len(contractID) > 0 {
+		cf = es.cfContracts
+		termKey = index.ContractTermKey(contractID)
+	} else if len(topics) > 0 && len(topics[0]) > 0 {
+		cf = es.cfTopics
+		termKey = index.TopicTermKey(topics[0])
+	} else {
+		result.TotalTime = time.Since(totalStart)
+		return result, nil, nil
+	}
+
+	var allEvents []*query.Event
+	ledgerSet := make(map[uint32]struct{})
+	var plTime, fetchTime, decodeTime time.Duration
+
+	for _, bucketID := range buckets {
+		if len(allEvents) >= limit {
+			break
+		}
+
+		// Read this bucket's posting list
+		plStart := time.Now()
+		indexKey := index.EncodeIndexKeyWithBucket(termKey, bucketID)
+		value, err := es.db.GetCF(es.ro, cf, indexKey)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read posting list: %w", err)
+		}
+
+		if !value.Exists() {
+			value.Free()
+			result.BucketsScanned++
+			continue
+		}
+
+		data := value.Data()
+		result.PostingListBytes += int64(len(data))
+		result.BucketsScanned++
+		result.PostingListsRead++
+
+		toids := index.DecodeTOIDListDeltaVarint(data)
+		value.Free()
+
+		// Filter to ledger range
+		filtered := index.FilterTOIDsByLedgerRange(toids, startLedger, endLedger)
+		if len(contractID) > 0 {
+			result.TOIDsFromContract += len(filtered)
+		} else {
+			result.TOIDsFromTopics += len(filtered)
+		}
+		result.TOIDsAfterIntersect += len(filtered)
+		plTime += time.Since(plStart)
+
+		// Count unique ledgers
+		for _, toid := range filtered {
+			ledger, _, _ := index.DecodeTOID(toid)
+			ledgerSet[ledger] = struct{}{}
+		}
+
+		// Fetch events for this bucket's TOIDs
+		remaining := limit - len(allEvents)
+		fetchStart := time.Now()
+		events, bytesRead, scanned, decTime, err := es.fetchEventsByTOIDsWithStats(filtered, remaining)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		fetchTime += time.Since(fetchStart) - decTime
+		decodeTime += decTime
+		result.EventBytesRead += bytesRead
+		result.EventsScanned += scanned
+
+		allEvents = append(allEvents, events...)
+	}
+
+	result.PostingListTime = plTime
+	result.EventFetchTime = fetchTime
+	result.DecodeTime = decodeTime
+	result.UniqueLedgers = len(ledgerSet)
+	result.EventsReturned = len(allEvents)
+	result.TotalTime = time.Since(totalStart)
+
+	return result, allEvents, nil
 }
 
 // queryPostingListWithStats reads posting lists and returns stats.
@@ -2759,7 +2885,7 @@ func (es *RocksDBEventStore) queryPostingListWithStats(cf *grocksdb.ColumnFamily
 		if value.Exists() {
 			data := value.Data()
 			bytesRead += int64(len(data))
-			toids := index.DecodeTOIDList(data)
+			toids := index.DecodeTOIDListDeltaVarint(data)
 			filtered := index.FilterTOIDsByLedgerRange(toids, startLedger, endLedger)
 			allTOIDs = append(allTOIDs, filtered...)
 		}
