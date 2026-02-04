@@ -2822,62 +2822,113 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListTiming(contractID []byte,
 	plStart := time.Now()
 
 	if es.ParallelPostingReads {
-		// Optimized path: parallel reads + smallest-first intersection
-		plResults, parallelTime := es.queryPostingListsParallel(contractID, topics, startLedger, endLedger)
-		result.ParallelReadTime = parallelTime
+		// Optimized path: estimate counts → read smallest → guided reads for rest
+		//
+		// Phase 2: Estimate counts in parallel (reads only varint headers, very cheap)
+		estimates, estTime := es.estimatePostingListCounts(contractID, topics, startLedger, endLedger)
+		result.EstimationTime = estTime
 
-		// Check for errors and aggregate stats
-		for _, plr := range plResults {
-			if plr.err != nil {
-				return nil, nil, plr.err
-			}
-			result.BucketsScanned += plr.buckets
-			result.PostingListsRead++
-			result.PostingListBytes += plr.bytesRead
-			if plr.isContract {
-				result.TOIDsFromContract = len(plr.toids)
-			} else {
-				result.TOIDsFromTopics += len(plr.toids)
+		// Check for errors
+		for _, est := range estimates {
+			if est.err != nil {
+				return nil, nil, est.err
 			}
 		}
 
-		// Track smallest and largest list sizes
-		if len(plResults) > 0 {
-			result.SmallestListSize = len(plResults[0].toids)
-			result.LargestListSize = len(plResults[0].toids)
-			for _, plr := range plResults[1:] {
-				if len(plr.toids) < result.SmallestListSize {
-					result.SmallestListSize = len(plr.toids)
-				}
-				if len(plr.toids) > result.LargestListSize {
-					result.LargestListSize = len(plr.toids)
-				}
-			}
+		// Sort by estimated count (smallest first)
+		sortedIdx := make([]int, len(estimates))
+		for i := range sortedIdx {
+			sortedIdx[i] = i
 		}
-
-		// Intersect all results (smallest first for efficiency)
-		sortedResults := make([]postingListResult, len(plResults))
-		copy(sortedResults, plResults)
-		sort.Slice(sortedResults, func(i, j int) bool {
-			return len(sortedResults[i].toids) < len(sortedResults[j].toids)
+		sort.Slice(sortedIdx, func(a, b int) bool {
+			return estimates[sortedIdx[a]].count < estimates[sortedIdx[b]].count
 		})
 
-		intersectStart := time.Now()
-		for i, plr := range sortedResults {
-			if i == 0 {
-				resultTOIDs = plr.toids
-			} else {
-				resultTOIDs = index.IntersectTOIDLists(resultTOIDs, plr.toids)
-			}
+		// Record size metrics
+		if len(estimates) > 0 {
+			result.SmallestListSize = int(estimates[sortedIdx[0]].count)
+			result.LargestListSize = int(estimates[sortedIdx[len(sortedIdx)-1]].count)
+		}
 
-			if len(resultTOIDs) == 0 {
-				result.IntersectTime = time.Since(intersectStart)
+		// Early exit if smallest list is empty
+		if len(estimates) > 0 && estimates[sortedIdx[0]].count == 0 {
+			result.PostingListTime = time.Since(plStart)
+			result.TotalTime = time.Since(totalStart)
+			return result, nil, nil
+		}
+
+		// Read smallest list fully
+		smallIdx := sortedIdx[0]
+		smallTOIDs, buckets, bytesRead, err := es.queryPostingListWithStats(
+			estimates[smallIdx].cf, estimates[smallIdx].termKey,
+			startLedger, endLedger,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		result.BucketsScanned += buckets
+		result.PostingListsRead++
+		result.PostingListBytes += bytesRead
+		if estimates[smallIdx].isContract {
+			result.TOIDsFromContract = len(smallTOIDs)
+		} else {
+			result.TOIDsFromTopics += len(smallTOIDs)
+		}
+
+		resultTOIDs = smallTOIDs
+		if len(resultTOIDs) == 0 {
+			result.PostingListTime = time.Since(plStart)
+			result.TotalTime = time.Since(totalStart)
+			return result, nil, nil
+		}
+
+		// Phase 3: Read remaining lists using guided approach (skip irrelevant buckets)
+		guidedStart := time.Now()
+		guide := index.NewGuidedIntersector(resultTOIDs)
+
+		for _, idx := range sortedIdx[1:] {
+			est := estimates[idx]
+
+			// Skip if estimated count is 0
+			if est.count == 0 {
 				result.PostingListTime = time.Since(plStart) - result.IntersectTime
 				result.TotalTime = time.Since(totalStart)
 				return result, nil, nil
 			}
+
+			guidedResult := es.queryPostingListGuided(
+				est.cf, est.termKey, startLedger, endLedger, guide,
+			)
+			if guidedResult.err != nil {
+				return nil, nil, guidedResult.err
+			}
+
+			result.BucketsScanned += guidedResult.bucketsRead
+			result.SkippedBuckets += guidedResult.bucketsSkipped
+			result.PostingListsRead++
+			result.PostingListBytes += guidedResult.bytesRead
+			if est.isContract {
+				result.TOIDsFromContract = len(guidedResult.toids)
+			} else {
+				result.TOIDsFromTopics += len(guidedResult.toids)
+			}
+
+			// Intersect with running result
+			intersectStart := time.Now()
+			resultTOIDs = index.IntersectTOIDLists(resultTOIDs, guidedResult.toids)
+			result.IntersectTime += time.Since(intersectStart)
+
+			if len(resultTOIDs) == 0 {
+				result.GuidedIntersectTime = time.Since(guidedStart)
+				result.PostingListTime = time.Since(plStart) - result.IntersectTime
+				result.TotalTime = time.Since(totalStart)
+				return result, nil, nil
+			}
+
+			// Progressively narrow the guide for next list
+			guide = index.NewGuidedIntersector(resultTOIDs)
 		}
-		result.IntersectTime = time.Since(intersectStart)
+		result.GuidedIntersectTime = time.Since(guidedStart)
 	} else {
 		// Sequential path (original behavior)
 		var initialized bool
