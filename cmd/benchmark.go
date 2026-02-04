@@ -70,6 +70,8 @@ type QuerySpec struct {
 type BenchmarkResult struct {
 	Query          QuerySpec
 	IndexType      string
+	StartLedger    uint32 // Ledger range used for this query
+	EndLedger      uint32
 	Iterations     int
 	TotalTime      time.Duration
 	AvgTime        time.Duration
@@ -145,11 +147,19 @@ func runBenchmark(cfg *config.Config, args []string) {
 		os.Exit(1)
 	}
 
-	// Enforce max ledger range from config
-	maxEnd := data.StartLedger + uint32(cfg.Query.MaxLedgerRange)
-	if data.EndLedger > maxEnd {
-		fmt.Fprintf(os.Stderr, "Warning: range exceeds max_ledger_range (%d), capping end to %d\n", cfg.Query.MaxLedgerRange, maxEnd)
-		data.EndLedger = maxEnd
+	// Store original range for random sampling, cap individual queries to max_ledger_range
+	originalStartLedger := data.StartLedger
+	originalEndLedger := data.EndLedger
+	maxLedgerRange := uint32(cfg.Query.MaxLedgerRange)
+
+	// If the data range is smaller than max_ledger_range, just use it as-is
+	if originalEndLedger-originalStartLedger <= maxLedgerRange {
+		// Range fits, no random sampling needed
+		fmt.Fprintf(os.Stderr, "Data range (%d ledgers) fits within max_ledger_range (%d)\n",
+			originalEndLedger-originalStartLedger, maxLedgerRange)
+	} else {
+		fmt.Fprintf(os.Stderr, "Data range: %d-%d (%d ledgers), will sample random %d-ledger windows\n",
+			originalStartLedger, originalEndLedger, originalEndLedger-originalStartLedger, maxLedgerRange)
 	}
 
 	// Parse index types
@@ -193,13 +203,24 @@ func runBenchmark(cfg *config.Config, args []string) {
 		}
 		defer logWriter.Close()
 		// Write CSV header
-		fmt.Fprintln(logWriter, "timestamp,query_name,index_type,events_returned,events_scanned,index_matches,index_bytes,event_bytes,avg_ms,error")
+		fmt.Fprintln(logWriter, "timestamp,query_name,index_type,start_ledger,end_ledger,events_returned,events_scanned,index_matches,index_bytes,event_bytes,avg_ms,error")
 		logWriter.Sync()
 	}
 
 	// Create output writer if enabled (writes results incrementally)
 	var outputWriter *os.File
+	outputFileFormat := *outputFormat
 	if *outputFile != "none" && *outputFile != "" {
+		// Auto-detect format from file extension if format is default
+		if outputFileFormat == "table" {
+			if strings.HasSuffix(*outputFile, ".csv") {
+				outputFileFormat = "csv"
+			} else if strings.HasSuffix(*outputFile, ".json") || strings.HasSuffix(*outputFile, ".jsonl") {
+				outputFileFormat = "json"
+			} else {
+				outputFileFormat = "csv" // Default to CSV for file output
+			}
+		}
 		outputWriter, err = os.Create(*outputFile)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to create output file: %v\n", err)
@@ -207,10 +228,11 @@ func runBenchmark(cfg *config.Config, args []string) {
 		}
 		defer outputWriter.Close()
 		// Write CSV header for results
-		if *outputFormat == "csv" {
-			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,index_type,avg_ms,p99_ms,p99_idx_ms,p99_evt_ms,events_returned,events_scanned,index_matches,index_bytes,event_bytes,error")
+		if outputFileFormat == "csv" {
+			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,index_type,start_ledger,end_ledger,avg_ms,p99_ms,p99_idx_ms,p99_evt_ms,events_scanned,index_matches,index_bytes,event_bytes,events_returned,error")
 			outputWriter.Sync()
 		}
+		fmt.Fprintf(os.Stderr, "Output file: %s (format: %s)\n", *outputFile, outputFileFormat)
 	}
 
 	// Generate query combinations
@@ -218,7 +240,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 	fmt.Fprintf(os.Stderr, "Generated %d query combinations\n", len(queries))
 	fmt.Fprintf(os.Stderr, "Benchmarking with %d iterations per query (+%d warmup)\n", *iterations, *warmup)
 	fmt.Fprintf(os.Stderr, "Index types: %v\n", indexes)
-	fmt.Fprintf(os.Stderr, "Ledger range: %d - %d\n\n", data.StartLedger, data.EndLedger)
+	fmt.Fprintf(os.Stderr, "Ledger range: %d - %d (max per query: %d)\n\n", originalStartLedger, originalEndLedger, maxLedgerRange)
 
 	// Run benchmarks
 	var results []BenchmarkResult
@@ -226,20 +248,38 @@ func runBenchmark(cfg *config.Config, args []string) {
 	completed := 0
 
 	for _, q := range queries {
+		// Pick a random starting ledger for this query (same for all index types)
+		queryStart := originalStartLedger
+		queryEnd := originalEndLedger
+		dataRange := originalEndLedger - originalStartLedger
+		if dataRange > maxLedgerRange {
+			// Pick random start within the range that allows full maxLedgerRange window
+			maxStart := originalEndLedger - maxLedgerRange
+			queryStart = originalStartLedger + uint32(rand.Intn(int(maxStart-originalStartLedger+1)))
+			queryEnd = queryStart + maxLedgerRange
+		}
+
 		for _, idxType := range indexes {
 			completed++
-			fmt.Fprintf(os.Stderr, "\r[%d/%d] Running: %s (%s)...    ", completed, totalQueries, q.Name, idxType)
+			fmt.Fprintf(os.Stderr, "\r[%d/%d] Running: %s (%s) [%d-%d]...    ", completed, totalQueries, q.Name, idxType, queryStart, queryEnd)
 
-			result := runQueryBenchmark(eventStore, data, q, idxType, *iterations, *warmup, *limit, *timeout)
+			// Create a temporary data struct with the random range
+			queryData := &BenchmarkData{
+				StartLedger: queryStart,
+				EndLedger:   queryEnd,
+			}
+			result := runQueryBenchmark(eventStore, queryData, q, idxType, *iterations, *warmup, *limit, *timeout)
 			results = append(results, result)
 
 			// Log query result
 			if logWriter != nil {
 				errStr := result.Error
-				fmt.Fprintf(logWriter, "%s,%s,%s,%d,%d,%d,%d,%d,%.3f,%s\n",
+				fmt.Fprintf(logWriter, "%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%.3f,%s\n",
 					time.Now().Format(time.RFC3339),
 					result.Query.Name,
 					result.IndexType,
+					result.StartLedger,
+					result.EndLedger,
 					result.EventsReturned,
 					result.EventsScanned,
 					result.IndexMatches,
@@ -253,7 +293,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 
 			// Write result to output file incrementally
 			if outputWriter != nil {
-				writeResultIncremental(outputWriter, result, *outputFormat)
+				writeResultIncremental(outputWriter, result, outputFileFormat)
 				outputWriter.Sync() // Flush to disk immediately
 			}
 		}
@@ -511,16 +551,33 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 		}
 	}
 
-	// Limit combinations if needed
-	if len(queries) > maxCombinations {
-		// Shuffle and truncate
-		rand.Shuffle(len(queries), func(i, j int) {
-			queries[i], queries[j] = queries[j], queries[i]
-		})
-		queries = queries[:maxCombinations]
+	// Separate single-filter queries (always keep these) from multi-filter queries
+	var singleFilter []QuerySpec
+	var multiFilter []QuerySpec
+	for _, q := range queries {
+		isSingle := (q.ContractID != "" && len(q.Topics) == 0) || (q.ContractID == "" && len(q.Topics) == 1)
+		if isSingle {
+			singleFilter = append(singleFilter, q)
+		} else {
+			multiFilter = append(multiFilter, q)
+		}
 	}
 
-	return queries
+	// Always include all single-filter queries, then add multi-filter up to max
+	result := singleFilter
+	remaining := maxCombinations - len(singleFilter)
+	if remaining > 0 && len(multiFilter) > 0 {
+		// Shuffle multi-filter queries and take up to remaining
+		rand.Shuffle(len(multiFilter), func(i, j int) {
+			multiFilter[i], multiFilter[j] = multiFilter[j], multiFilter[i]
+		})
+		if len(multiFilter) > remaining {
+			multiFilter = multiFilter[:remaining]
+		}
+		result = append(result, multiFilter...)
+	}
+
+	return result
 }
 
 // =============================================================================
@@ -529,9 +586,11 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 
 func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData, spec QuerySpec, indexType string, iterations, warmup, limit int, timeout time.Duration) BenchmarkResult {
 	result := BenchmarkResult{
-		Query:      spec,
-		IndexType:  indexType,
-		Iterations: iterations,
+		Query:       spec,
+		IndexType:   indexType,
+		StartLedger: data.StartLedger,
+		EndLedger:   data.EndLedger,
+		Iterations:  iterations,
 	}
 
 	var timings []time.Duration
@@ -827,7 +886,7 @@ func printSummaryStats(results []BenchmarkResult, indexes []string) {
 
 func outputCSV(results []BenchmarkResult) {
 	// Header with separate topic columns and timing breakdown
-	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,index_type,avg_ms,p99_ms,p99_idx_ms,p99_evt_ms,events_returned,events_scanned,index_matches,index_bytes,event_bytes,error")
+	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,index_type,avg_ms,p99_ms,p99_idx_ms,p99_evt_ms,events_scanned,index_matches,index_bytes,event_bytes,events_returned,error")
 
 	for _, r := range results {
 		contractID := r.Query.ContractID
@@ -845,7 +904,7 @@ func outputCSV(results []BenchmarkResult) {
 			}
 		}
 
-		fmt.Printf("%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%s,%s,%s\n",
+		fmt.Printf("%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%s,%d,%s\n",
 			r.Query.Name,
 			contractID,
 			topics[0],
@@ -857,11 +916,11 @@ func outputCSV(results []BenchmarkResult) {
 			float64(r.P99Time.Microseconds())/1000.0,
 			float64(r.P99IndexTime.Microseconds())/1000.0,
 			float64(r.P99EventTime.Microseconds())/1000.0,
-			r.EventsReturned,
 			r.EventsScanned,
 			r.IndexMatches,
 			formatBytes(r.IndexBytes),
 			formatBytes(r.EventBytes),
+			r.EventsReturned,
 			r.Error,
 		)
 	}
@@ -931,6 +990,8 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			ContractID     string   `json:"contract_id,omitempty"`
 			Topics         []string `json:"topics,omitempty"`
 			IndexType      string   `json:"index_type"`
+			StartLedger    uint32   `json:"start_ledger"`
+			EndLedger      uint32   `json:"end_ledger"`
 			AvgMs          float64  `json:"avg_ms"`
 			MinMs          float64  `json:"min_ms"`
 			MaxMs          float64  `json:"max_ms"`
@@ -952,6 +1013,8 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			ContractID:     r.Query.ContractID,
 			Topics:         r.Query.Topics,
 			IndexType:      r.IndexType,
+			StartLedger:    r.StartLedger,
+			EndLedger:      r.EndLedger,
 			AvgMs:          float64(r.AvgTime.Microseconds()) / 1000.0,
 			MinMs:          float64(r.MinTime.Microseconds()) / 1000.0,
 			MaxMs:          float64(r.MaxTime.Microseconds()) / 1000.0,
@@ -985,7 +1048,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 				topics[i] = "-"
 			}
 		}
-		fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%s,%s,%s\n",
+		fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%s,%d,%s\n",
 			r.Query.Name,
 			contractID,
 			topics[0],
@@ -993,15 +1056,17 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			topics[2],
 			topics[3],
 			r.IndexType,
+			r.StartLedger,
+			r.EndLedger,
 			float64(r.AvgTime.Microseconds())/1000.0,
 			float64(r.P99Time.Microseconds())/1000.0,
 			float64(r.P99IndexTime.Microseconds())/1000.0,
 			float64(r.P99EventTime.Microseconds())/1000.0,
-			r.EventsReturned,
 			r.EventsScanned,
 			r.IndexMatches,
 			formatBytes(r.IndexBytes),
 			formatBytes(r.EventBytes),
+			r.EventsReturned,
 			r.Error,
 		)
 	}
