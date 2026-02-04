@@ -438,25 +438,25 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 	}
 
 	return &RocksDBEventStore{
-		db:              db,
-		dbPath:          dbPath,
-		wo:              wo,
-		ro:              grocksdb.NewDefaultReadOptions(),
-		indexes:         indexes,
-		eventFormat:     "xdr", // Default to XDR format
-		cfHandles:       cfHandles,
-		cfDefault:       cfHandles[0],
-		cfEvents:        cfHandles[1],
-		cfUnique:        cfHandles[2],
-		cfContractsPL:   cfHandles[3],
-		cfTopicsPL:      cfHandles[4],
-		cfContractsBM:   cfHandles[5],
-		cfTopicsBM:      cfHandles[6],
-		cfContractsBM64: cfHandles[7],
-		cfTopicsBM64:    cfHandles[8],
-		indexStore:      indexStore,
-		eventIndexStore: eventIndexStore,
-		baseOpts:        baseOpts,
+		db:               db,
+		dbPath:           dbPath,
+		wo:               wo,
+		ro:               grocksdb.NewDefaultReadOptions(),
+		indexes:          indexes,
+		eventFormat:      "xdr", // Default to XDR format
+		cfHandles:        cfHandles,
+		cfDefault:        cfHandles[0],
+		cfEvents:         cfHandles[1],
+		cfUnique:         cfHandles[2],
+		cfContractsPL:    cfHandles[3],
+		cfTopicsPL:       cfHandles[4],
+		cfContractsBM:    cfHandles[5],
+		cfTopicsBM:       cfHandles[6],
+		cfContractsBM64:  cfHandles[7],
+		cfTopicsBM64:     cfHandles[8],
+		indexStore:       indexStore,
+		eventIndexStore:  eventIndexStore,
+		baseOpts:         baseOpts,
 		cfOpts:           cfOpts,
 		bbtoList:         bbtoList,
 		mergeOp:          mergeOp,
@@ -2813,56 +2813,69 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListTiming(contractID []byte,
 		return es.queryPostingListStreaming(contractID, topics, startLedger, endLedger, limit, result, totalStart)
 	}
 
-	// Multi-filter or no limit - use original approach (need all TOIDs for intersection)
+	// Multi-filter or no limit - use parallel reads (Phase 1 optimization)
 	var resultTOIDs []uint64
-	var initialized bool
 
 	plStart := time.Now()
 
-	// Query contract ID posting list if specified
-	if hasContract {
-		toids, buckets, bytesRead, err := es.queryPostingListWithStats(es.cfContractsPL, index.ContractTermKey(contractID), startLedger, endLedger)
-		if err != nil {
-			return nil, nil, err
+	// Phase 1: Read all posting lists in parallel
+	plResults, parallelTime := es.queryPostingListsParallel(contractID, topics, startLedger, endLedger)
+	result.ParallelReadTime = parallelTime
+
+	// Check for errors and aggregate stats
+	for _, plr := range plResults {
+		if plr.err != nil {
+			return nil, nil, plr.err
 		}
-		result.BucketsScanned += buckets
+		result.BucketsScanned += plr.buckets
 		result.PostingListsRead++
-		result.PostingListBytes += bytesRead
-		result.TOIDsFromContract = len(toids)
-		resultTOIDs = toids
-		initialized = true
+		result.PostingListBytes += plr.bytesRead
+		if plr.isContract {
+			result.TOIDsFromContract = len(plr.toids)
+		} else {
+			result.TOIDsFromTopics += len(plr.toids)
+		}
 	}
 
-	// Query topic posting lists
-	for _, topicXDR := range topics {
-		if len(topicXDR) == 0 {
-			continue
+	// Track smallest and largest list sizes for Phase 2 metrics
+	if len(plResults) > 0 {
+		result.SmallestListSize = len(plResults[0].toids)
+		result.LargestListSize = len(plResults[0].toids)
+		for _, plr := range plResults[1:] {
+			if len(plr.toids) < result.SmallestListSize {
+				result.SmallestListSize = len(plr.toids)
+			}
+			if len(plr.toids) > result.LargestListSize {
+				result.LargestListSize = len(plr.toids)
+			}
 		}
+	}
 
-		toids, buckets, bytesRead, err := es.queryPostingListWithStats(es.cfTopicsPL, index.TopicTermKey(topicXDR), startLedger, endLedger)
-		if err != nil {
-			return nil, nil, err
-		}
-		result.BucketsScanned += buckets
-		result.PostingListsRead++
-		result.PostingListBytes += bytesRead
-		result.TOIDsFromTopics += len(toids)
+	// Intersect all results (smallest first for efficiency)
+	// Sort by size to process smallest list first
+	sortedResults := make([]postingListResult, len(plResults))
+	copy(sortedResults, plResults)
+	sort.Slice(sortedResults, func(i, j int) bool {
+		return len(sortedResults[i].toids) < len(sortedResults[j].toids)
+	})
 
-		if !initialized {
-			resultTOIDs = toids
-			initialized = true
+	intersectStart := time.Now()
+	for i, plr := range sortedResults {
+		if i == 0 {
+			resultTOIDs = plr.toids
 		} else {
-			intersectStart := time.Now()
-			resultTOIDs = index.IntersectTOIDLists(resultTOIDs, toids)
-			result.IntersectTime += time.Since(intersectStart)
+			resultTOIDs = index.IntersectTOIDLists(resultTOIDs, plr.toids)
 		}
 
+		// Early exit if intersection is empty
 		if len(resultTOIDs) == 0 {
-			result.PostingListTime = time.Since(plStart)
+			result.IntersectTime = time.Since(intersectStart)
+			result.PostingListTime = time.Since(plStart) - result.IntersectTime
 			result.TotalTime = time.Since(totalStart)
 			return result, nil, nil
 		}
 	}
+	result.IntersectTime = time.Since(intersectStart)
 
 	result.PostingListTime = time.Since(plStart) - result.IntersectTime
 	result.TOIDsAfterIntersect = len(resultTOIDs)
@@ -3057,6 +3070,349 @@ func (es *RocksDBEventStore) queryPostingListWithStats(cf *grocksdb.ColumnFamily
 	}
 
 	return allTOIDs, len(buckets), bytesRead, nil
+}
+
+// =============================================================================
+// Multi-Filter Optimization: Phase 1 - Parallel Posting List Reads
+// =============================================================================
+
+// postingListResult holds the result of reading a single posting list.
+type postingListResult struct {
+	toids      []uint64
+	buckets    int
+	bytesRead  int64
+	err        error
+	isContract bool // true for contract, false for topic
+}
+
+// queryPostingListsParallel reads all posting lists (contract + topics) in parallel.
+// Returns results in order: contract first (if present), then topics.
+func (es *RocksDBEventStore) queryPostingListsParallel(
+	contractID []byte,
+	topics [][]byte,
+	startLedger, endLedger uint32,
+) ([]postingListResult, time.Duration) {
+	start := time.Now()
+
+	// Count total lists to read
+	numLists := 0
+	if len(contractID) > 0 {
+		numLists++
+	}
+	for _, t := range topics {
+		if len(t) > 0 {
+			numLists++
+		}
+	}
+
+	if numLists == 0 {
+		return nil, 0
+	}
+
+	results := make([]postingListResult, numLists)
+	var wg sync.WaitGroup
+
+	idx := 0
+
+	// Launch contract query
+	if len(contractID) > 0 {
+		wg.Add(1)
+		go func(resultIdx int, cid []byte) {
+			defer wg.Done()
+			toids, buckets, bytesRead, err := es.queryPostingListWithStats(
+				es.cfContractsPL,
+				index.ContractTermKey(cid),
+				startLedger, endLedger,
+			)
+			results[resultIdx] = postingListResult{
+				toids:      toids,
+				buckets:    buckets,
+				bytesRead:  bytesRead,
+				err:        err,
+				isContract: true,
+			}
+		}(idx, contractID)
+		idx++
+	}
+
+	// Launch topic queries
+	for _, topicXDR := range topics {
+		if len(topicXDR) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(resultIdx int, topic []byte) {
+			defer wg.Done()
+			toids, buckets, bytesRead, err := es.queryPostingListWithStats(
+				es.cfTopicsPL,
+				index.TopicTermKey(topic),
+				startLedger, endLedger,
+			)
+			results[resultIdx] = postingListResult{
+				toids:      toids,
+				buckets:    buckets,
+				bytesRead:  bytesRead,
+				err:        err,
+				isContract: false,
+			}
+		}(idx, topicXDR)
+		idx++
+	}
+
+	wg.Wait()
+	return results, time.Since(start)
+}
+
+// =============================================================================
+// Multi-Filter Optimization: Phase 2 - Smallest-First Intersection with Count Estimation
+// =============================================================================
+
+// postingListCountEstimate holds the estimated count for a posting list.
+type postingListCountEstimate struct {
+	cf         *grocksdb.ColumnFamilyHandle
+	termKey    [32]byte
+	isContract bool
+	count      uint64 // estimated total count across all buckets
+	err        error
+}
+
+// estimatePostingListCounts reads only the count headers from all posting lists in parallel.
+// This is much faster than decoding full lists and helps determine which list to decode first.
+func (es *RocksDBEventStore) estimatePostingListCounts(
+	contractID []byte,
+	topics [][]byte,
+	startLedger, endLedger uint32,
+) ([]postingListCountEstimate, time.Duration) {
+	start := time.Now()
+
+	// Build list of posting lists to estimate
+	var estimates []postingListCountEstimate
+
+	if len(contractID) > 0 {
+		estimates = append(estimates, postingListCountEstimate{
+			cf:         es.cfContractsPL,
+			termKey:    index.ContractTermKey(contractID),
+			isContract: true,
+		})
+	}
+
+	for _, topicXDR := range topics {
+		if len(topicXDR) == 0 {
+			continue
+		}
+		estimates = append(estimates, postingListCountEstimate{
+			cf:         es.cfTopicsPL,
+			termKey:    index.TopicTermKey(topicXDR),
+			isContract: false,
+		})
+	}
+
+	if len(estimates) == 0 {
+		return nil, 0
+	}
+
+	buckets := index.GetBucketsForRange(startLedger, endLedger)
+
+	var wg sync.WaitGroup
+	for i := range estimates {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			var totalCount uint64
+
+			for _, bucketID := range buckets {
+				indexKey := index.EncodeIndexKeyWithBucket(estimates[idx].termKey, bucketID)
+
+				value, err := es.db.GetCF(es.ro, estimates[idx].cf, indexKey)
+				if err != nil {
+					estimates[idx].err = err
+					return
+				}
+
+				if value.Exists() {
+					data := value.Data()
+					count, _ := index.ReadTOIDCount(data)
+					totalCount += count
+				}
+				value.Free()
+			}
+
+			estimates[idx].count = totalCount
+		}(i)
+	}
+
+	wg.Wait()
+	return estimates, time.Since(start)
+}
+
+// =============================================================================
+// Multi-Filter Optimization: Phase 3 - Guided Intersection
+// =============================================================================
+
+// guidedPostingListResult holds the result of a guided posting list read.
+type guidedPostingListResult struct {
+	toids          []uint64
+	bytesRead      int64
+	bucketsRead    int
+	bucketsSkipped int
+	err            error
+}
+
+// queryPostingListGuided reads a posting list using a guide set to skip buckets.
+// Only reads buckets that have potential matches based on the guide set.
+func (es *RocksDBEventStore) queryPostingListGuided(
+	cf *grocksdb.ColumnFamilyHandle,
+	termKey [32]byte,
+	startLedger, endLedger uint32,
+	guide *index.GuidedIntersector,
+) guidedPostingListResult {
+	buckets := index.GetBucketsForRange(startLedger, endLedger)
+
+	var result guidedPostingListResult
+	var allTOIDs []uint64
+
+	for _, bucketID := range buckets {
+		// Phase 3 optimization: skip buckets with no guide TOIDs
+		if !guide.HasTOIDsInBucket(bucketID) {
+			result.bucketsSkipped++
+			continue
+		}
+
+		indexKey := index.EncodeIndexKeyWithBucket(termKey, bucketID)
+		value, err := es.db.GetCF(es.ro, cf, indexKey)
+		if err != nil {
+			result.err = err
+			return result
+		}
+
+		if value.Exists() {
+			data := value.Data()
+			result.bytesRead += int64(len(data))
+			result.bucketsRead++
+
+			// Decode and filter by ledger range
+			toids := index.DecodeTOIDListDeltaVarint(data)
+			filtered := index.FilterTOIDsByLedgerRange(toids, startLedger, endLedger)
+			allTOIDs = append(allTOIDs, filtered...)
+		}
+		value.Free()
+	}
+
+	// Intersect with guide set
+	result.toids = guide.IntersectSorted(allTOIDs)
+	return result
+}
+
+// queryPostingListsWithGuide reads posting lists, using the smallest as a guide for others.
+// This implements Phase 2 + Phase 3 optimization combined.
+func (es *RocksDBEventStore) queryPostingListsWithGuide(
+	contractID []byte,
+	topics [][]byte,
+	startLedger, endLedger uint32,
+) ([]uint64, *PostingListQueryResult, error) {
+	result := &PostingListQueryResult{}
+
+	// Phase 2: First estimate counts to find smallest list
+	estimates, estTime := es.estimatePostingListCounts(contractID, topics, startLedger, endLedger)
+	result.EstimationTime = estTime
+
+	if len(estimates) == 0 {
+		return nil, result, nil
+	}
+
+	// Check for estimation errors
+	for _, est := range estimates {
+		if est.err != nil {
+			return nil, nil, est.err
+		}
+	}
+
+	// Find smallest list
+	smallestIdx := 0
+	for i := 1; i < len(estimates); i++ {
+		if estimates[i].count < estimates[smallestIdx].count {
+			smallestIdx = i
+		}
+	}
+
+	// Record size metrics
+	result.SmallestListSize = int(estimates[smallestIdx].count)
+	result.LargestListSize = int(estimates[smallestIdx].count)
+	for _, est := range estimates {
+		if int(est.count) > result.LargestListSize {
+			result.LargestListSize = int(est.count)
+		}
+	}
+
+	// Early exit if smallest list is empty
+	if estimates[smallestIdx].count == 0 {
+		return nil, result, nil
+	}
+
+	// Read smallest list fully
+	smallestTOIDs, buckets, bytesRead, err := es.queryPostingListWithStats(
+		estimates[smallestIdx].cf,
+		estimates[smallestIdx].termKey,
+		startLedger, endLedger,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	result.BucketsScanned += buckets
+	result.PostingListsRead++
+	result.PostingListBytes += bytesRead
+	if estimates[smallestIdx].isContract {
+		result.TOIDsFromContract = len(smallestTOIDs)
+	} else {
+		result.TOIDsFromTopics = len(smallestTOIDs)
+	}
+
+	if len(smallestTOIDs) == 0 {
+		return nil, result, nil
+	}
+
+	// Create guide from smallest list
+	guide := index.NewGuidedIntersector(smallestTOIDs)
+	resultTOIDs := smallestTOIDs
+
+	// Phase 3: Read remaining lists using guided approach
+	guidedStart := time.Now()
+
+	for i, est := range estimates {
+		if i == smallestIdx {
+			continue // Already read
+		}
+
+		guidedResult := es.queryPostingListGuided(est.cf, est.termKey, startLedger, endLedger, guide)
+		if guidedResult.err != nil {
+			return nil, nil, guidedResult.err
+		}
+
+		result.BucketsScanned += guidedResult.bucketsRead
+		result.SkippedBuckets += guidedResult.bucketsSkipped
+		result.PostingListsRead++
+		result.PostingListBytes += guidedResult.bytesRead
+		if est.isContract {
+			result.TOIDsFromContract = len(guidedResult.toids)
+		} else {
+			result.TOIDsFromTopics += len(guidedResult.toids)
+		}
+
+		// Intersect with running result
+		resultTOIDs = index.IntersectTOIDLists(resultTOIDs, guidedResult.toids)
+
+		if len(resultTOIDs) == 0 {
+			result.GuidedIntersectTime = time.Since(guidedStart)
+			return nil, result, nil
+		}
+
+		// Update guide for next iteration (progressively smaller)
+		guide = index.NewGuidedIntersector(resultTOIDs)
+	}
+
+	result.GuidedIntersectTime = time.Since(guidedStart)
+	return resultTOIDs, result, nil
 }
 
 // fetchEventsByTOIDsWithStats fetches events with detailed stats.

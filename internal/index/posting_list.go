@@ -163,6 +163,20 @@ func EncodeTOIDListDeltaVarint(toids []uint64) []byte {
 	return buf
 }
 
+// ReadTOIDCount reads only the count from delta-varint encoded data without decoding TOIDs.
+// This is useful for estimating posting list sizes before deciding which to decode first.
+// Returns count and number of bytes consumed for the count header.
+func ReadTOIDCount(data []byte) (uint64, int) {
+	if len(data) == 0 {
+		return 0, 0
+	}
+	count, n := readVarint(data)
+	if n <= 0 {
+		return 0, 0
+	}
+	return count, n
+}
+
 // DecodeTOIDListDeltaVarint decodes delta-varint encoded TOIDs.
 func DecodeTOIDListDeltaVarint(data []byte) []uint64 {
 	if len(data) == 0 {
@@ -276,6 +290,98 @@ func (it *DeltaVarintIterator) Remaining() uint64 {
 		return 0
 	}
 	return it.count - it.index
+}
+
+// =============================================================================
+// Phase 3: Guided Intersection
+// =============================================================================
+
+// GuidedIntersector performs intersection using a guide set to skip non-matching TOIDs.
+// The guide set is the smallest posting list result. When decoding larger lists,
+// we can skip TOIDs that fall outside the range of guide set TOIDs.
+type GuidedIntersector struct {
+	guideSet     []uint64            // sorted guide set (smallest list)
+	guideIdx     int                 // current position in guide set
+	guideBuckets map[uint32]struct{} // bucket IDs that have guide set TOIDs
+}
+
+// NewGuidedIntersector creates a new guided intersector from the smallest list.
+func NewGuidedIntersector(guideSet []uint64) *GuidedIntersector {
+	gi := &GuidedIntersector{
+		guideSet:     guideSet,
+		guideBuckets: make(map[uint32]struct{}),
+	}
+
+	// Build set of buckets that have guide TOIDs
+	for _, toid := range guideSet {
+		ledger, _, _ := DecodeTOID(toid)
+		bucketID := BucketID(ledger)
+		gi.guideBuckets[bucketID] = struct{}{}
+	}
+
+	return gi
+}
+
+// HasTOIDsInBucket returns true if the guide set has TOIDs in the given bucket.
+// This allows skipping entire buckets when reading larger posting lists.
+func (gi *GuidedIntersector) HasTOIDsInBucket(bucketID uint32) bool {
+	_, ok := gi.guideBuckets[bucketID]
+	return ok
+}
+
+// BucketCount returns the number of buckets that have guide TOIDs.
+func (gi *GuidedIntersector) BucketCount() int {
+	return len(gi.guideBuckets)
+}
+
+// IntersectWithIterator intersects the guide set with TOIDs from an iterator.
+// Returns matching TOIDs and the number of TOIDs skipped.
+func (gi *GuidedIntersector) IntersectWithIterator(it *DeltaVarintIterator) ([]uint64, int) {
+	if len(gi.guideSet) == 0 || it == nil {
+		return nil, 0
+	}
+
+	var result []uint64
+	skipped := 0
+	gi.guideIdx = 0
+
+	for {
+		toid, ok := it.Next()
+		if !ok {
+			break
+		}
+
+		// Advance guide index to catch up
+		for gi.guideIdx < len(gi.guideSet) && gi.guideSet[gi.guideIdx] < toid {
+			gi.guideIdx++
+		}
+
+		if gi.guideIdx >= len(gi.guideSet) {
+			// No more guide TOIDs, remaining iterator TOIDs won't match
+			skipped += int(it.Remaining())
+			break
+		}
+
+		if gi.guideSet[gi.guideIdx] == toid {
+			result = append(result, toid)
+			gi.guideIdx++
+		} else {
+			skipped++
+		}
+	}
+
+	return result, skipped
+}
+
+// IntersectSorted intersects the guide set with a sorted TOID list.
+// More efficient than IntersectTOIDLists when guide set is much smaller.
+func (gi *GuidedIntersector) IntersectSorted(toids []uint64) []uint64 {
+	if len(gi.guideSet) == 0 || len(toids) == 0 {
+		return nil
+	}
+
+	// Use two-pointer intersection (same as IntersectTOIDLists)
+	return IntersectTOIDLists(gi.guideSet, toids)
 }
 
 // appendVarint appends a varint-encoded uint64 to buf.

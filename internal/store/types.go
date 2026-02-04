@@ -191,8 +191,8 @@ type BitmapStats struct {
 
 // LedgerTxStats holds statistics about transactions per ledger.
 type LedgerTxStats struct {
-	TotalLedgers      int64 `json:"total_ledgers"`
-	LedgersOver10kTx  int64 `json:"ledgers_over_10k_tx"`
+	TotalLedgers     int64 `json:"total_ledgers"`
+	LedgersOver10kTx int64 `json:"ledgers_over_10k_tx"`
 }
 
 // =============================================================================
@@ -351,6 +351,14 @@ type PostingListQueryResult struct {
 	DecodeTime      time.Duration // Time decoding events
 	FilterTime      time.Duration // Time filtering events by contract/topics
 	TotalTime       time.Duration // Total query time
+
+	// Multi-filter optimization stats (Phase 1-3)
+	ParallelReadTime    time.Duration // Time for parallel posting list reads (Phase 1)
+	EstimationTime      time.Duration // Time estimating posting list sizes (Phase 2)
+	GuidedIntersectTime time.Duration // Time for guided/streaming intersection (Phase 3)
+	SkippedBuckets      int           // Buckets skipped due to guided intersection (Phase 3)
+	SmallestListSize    int           // Size of smallest posting list (Phase 2)
+	LargestListSize     int           // Size of largest posting list (Phase 2)
 }
 
 // ToUnified converts PostingListQueryResult to UnifiedQueryResult
@@ -409,8 +417,8 @@ type IndexConfig struct {
 
 // BuildIndexOptions controls which indexes to build during rebuild.
 type BuildIndexOptions struct {
-	UniqueIndexes       bool // Build unique value counts (for stats)
-	BitmapIndexes       bool // Build bitmap indexes (ledger-level)
+	UniqueIndexes      bool // Build unique value counts (for stats)
+	BitmapIndexes      bool // Build bitmap indexes (ledger-level)
 	IndexFlushInterval int  // Ledgers between index flushes (0 = only at end)
 }
 
