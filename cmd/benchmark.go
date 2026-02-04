@@ -171,13 +171,13 @@ func runBenchmark(cfg *config.Config, args []string) {
 	// Parse index types
 	var indexes []string
 	if *indexTypes == "all" {
-		indexes = []string{"posting", "bitmap32", "bitmap64"}
+		indexes = []string{"posting", "posting-parallel", "bitmap32", "bitmap64"}
 	} else {
 		indexes = strings.Split(*indexTypes, ",")
 	}
 
 	// Validate index types
-	validIndexes := map[string]bool{"posting": true, "bitmap32": true, "bitmap64": true}
+	validIndexes := map[string]bool{"posting": true, "posting-parallel": true, "bitmap32": true, "bitmap64": true}
 	for _, idx := range indexes {
 		if !validIndexes[idx] {
 			fmt.Fprintf(os.Stderr, "Error: invalid index type: %s\n", idx)
@@ -767,7 +767,13 @@ type QueryResult struct {
 func executeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topics [][]byte, indexType string, limit int) *QueryResult {
 	switch indexType {
 	case "posting":
+		eventStore.ParallelPostingReads = false
 		return executePostingQueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
+	case "posting-parallel":
+		eventStore.ParallelPostingReads = true
+		result := executePostingQueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
+		eventStore.ParallelPostingReads = false
+		return result
 	case "bitmap32":
 		return executeBitmap32QueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
 	case "bitmap64":

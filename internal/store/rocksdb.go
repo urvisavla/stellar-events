@@ -276,8 +276,11 @@ type RocksDBEventStore struct {
 	// Keep merge operator alive to prevent GC (RocksDB holds a reference)
 	mergeOp grocksdb.MergeOperator
 
+	// Multi-filter optimization toggle (for A/B benchmarking)
+	ParallelPostingReads bool // When true, use parallel reads + smallest-first intersection
+
 	// In-memory posting list accumulation (for efficient batch writes)
-	postingsMu        sync.Mutex
+	postingsMu sync.Mutex
 	contractPostings  map[string][]byte // index key -> accumulated TOIDs
 	topicPostings     map[string][]byte // index key -> accumulated TOIDs
 	postingsLedgerCnt int               // ledgers accumulated since last flush
@@ -2813,69 +2816,115 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListTiming(contractID []byte,
 		return es.queryPostingListStreaming(contractID, topics, startLedger, endLedger, limit, result, totalStart)
 	}
 
-	// Multi-filter or no limit - use parallel reads (Phase 1 optimization)
+	// Multi-filter or no limit
 	var resultTOIDs []uint64
 
 	plStart := time.Now()
 
-	// Phase 1: Read all posting lists in parallel
-	plResults, parallelTime := es.queryPostingListsParallel(contractID, topics, startLedger, endLedger)
-	result.ParallelReadTime = parallelTime
+	if es.ParallelPostingReads {
+		// Optimized path: parallel reads + smallest-first intersection
+		plResults, parallelTime := es.queryPostingListsParallel(contractID, topics, startLedger, endLedger)
+		result.ParallelReadTime = parallelTime
 
-	// Check for errors and aggregate stats
-	for _, plr := range plResults {
-		if plr.err != nil {
-			return nil, nil, plr.err
-		}
-		result.BucketsScanned += plr.buckets
-		result.PostingListsRead++
-		result.PostingListBytes += plr.bytesRead
-		if plr.isContract {
-			result.TOIDsFromContract = len(plr.toids)
-		} else {
-			result.TOIDsFromTopics += len(plr.toids)
-		}
-	}
-
-	// Track smallest and largest list sizes for Phase 2 metrics
-	if len(plResults) > 0 {
-		result.SmallestListSize = len(plResults[0].toids)
-		result.LargestListSize = len(plResults[0].toids)
-		for _, plr := range plResults[1:] {
-			if len(plr.toids) < result.SmallestListSize {
-				result.SmallestListSize = len(plr.toids)
+		// Check for errors and aggregate stats
+		for _, plr := range plResults {
+			if plr.err != nil {
+				return nil, nil, plr.err
 			}
-			if len(plr.toids) > result.LargestListSize {
-				result.LargestListSize = len(plr.toids)
+			result.BucketsScanned += plr.buckets
+			result.PostingListsRead++
+			result.PostingListBytes += plr.bytesRead
+			if plr.isContract {
+				result.TOIDsFromContract = len(plr.toids)
+			} else {
+				result.TOIDsFromTopics += len(plr.toids)
 			}
 		}
-	}
 
-	// Intersect all results (smallest first for efficiency)
-	// Sort by size to process smallest list first
-	sortedResults := make([]postingListResult, len(plResults))
-	copy(sortedResults, plResults)
-	sort.Slice(sortedResults, func(i, j int) bool {
-		return len(sortedResults[i].toids) < len(sortedResults[j].toids)
-	})
-
-	intersectStart := time.Now()
-	for i, plr := range sortedResults {
-		if i == 0 {
-			resultTOIDs = plr.toids
-		} else {
-			resultTOIDs = index.IntersectTOIDLists(resultTOIDs, plr.toids)
+		// Track smallest and largest list sizes
+		if len(plResults) > 0 {
+			result.SmallestListSize = len(plResults[0].toids)
+			result.LargestListSize = len(plResults[0].toids)
+			for _, plr := range plResults[1:] {
+				if len(plr.toids) < result.SmallestListSize {
+					result.SmallestListSize = len(plr.toids)
+				}
+				if len(plr.toids) > result.LargestListSize {
+					result.LargestListSize = len(plr.toids)
+				}
+			}
 		}
 
-		// Early exit if intersection is empty
-		if len(resultTOIDs) == 0 {
-			result.IntersectTime = time.Since(intersectStart)
-			result.PostingListTime = time.Since(plStart) - result.IntersectTime
-			result.TotalTime = time.Since(totalStart)
-			return result, nil, nil
+		// Intersect all results (smallest first for efficiency)
+		sortedResults := make([]postingListResult, len(plResults))
+		copy(sortedResults, plResults)
+		sort.Slice(sortedResults, func(i, j int) bool {
+			return len(sortedResults[i].toids) < len(sortedResults[j].toids)
+		})
+
+		intersectStart := time.Now()
+		for i, plr := range sortedResults {
+			if i == 0 {
+				resultTOIDs = plr.toids
+			} else {
+				resultTOIDs = index.IntersectTOIDLists(resultTOIDs, plr.toids)
+			}
+
+			if len(resultTOIDs) == 0 {
+				result.IntersectTime = time.Since(intersectStart)
+				result.PostingListTime = time.Since(plStart) - result.IntersectTime
+				result.TotalTime = time.Since(totalStart)
+				return result, nil, nil
+			}
+		}
+		result.IntersectTime = time.Since(intersectStart)
+	} else {
+		// Sequential path (original behavior)
+		var initialized bool
+
+		if hasContract {
+			toids, buckets, bytesRead, err := es.queryPostingListWithStats(es.cfContractsPL, index.ContractTermKey(contractID), startLedger, endLedger)
+			if err != nil {
+				return nil, nil, err
+			}
+			result.BucketsScanned += buckets
+			result.PostingListsRead++
+			result.PostingListBytes += bytesRead
+			result.TOIDsFromContract = len(toids)
+			resultTOIDs = toids
+			initialized = true
+		}
+
+		for _, topicXDR := range topics {
+			if len(topicXDR) == 0 {
+				continue
+			}
+
+			toids, buckets, bytesRead, err := es.queryPostingListWithStats(es.cfTopicsPL, index.TopicTermKey(topicXDR), startLedger, endLedger)
+			if err != nil {
+				return nil, nil, err
+			}
+			result.BucketsScanned += buckets
+			result.PostingListsRead++
+			result.PostingListBytes += bytesRead
+			result.TOIDsFromTopics += len(toids)
+
+			if !initialized {
+				resultTOIDs = toids
+				initialized = true
+			} else {
+				intersectStart := time.Now()
+				resultTOIDs = index.IntersectTOIDLists(resultTOIDs, toids)
+				result.IntersectTime += time.Since(intersectStart)
+			}
+
+			if len(resultTOIDs) == 0 {
+				result.PostingListTime = time.Since(plStart)
+				result.TotalTime = time.Since(totalStart)
+				return result, nil, nil
+			}
 		}
 	}
-	result.IntersectTime = time.Since(intersectStart)
 
 	result.PostingListTime = time.Since(plStart) - result.IntersectTime
 	result.TOIDsAfterIntersect = len(resultTOIDs)
