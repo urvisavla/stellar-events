@@ -145,6 +145,13 @@ func runBenchmark(cfg *config.Config, args []string) {
 		os.Exit(1)
 	}
 
+	// Enforce max ledger range from config
+	maxEnd := data.StartLedger + uint32(cfg.Query.MaxLedgerRange)
+	if data.EndLedger > maxEnd {
+		fmt.Fprintf(os.Stderr, "Warning: range exceeds max_ledger_range (%d), capping end to %d\n", cfg.Query.MaxLedgerRange, maxEnd)
+		data.EndLedger = maxEnd
+	}
+
 	// Parse index types
 	var indexes []string
 	if *indexTypes == "all" {
@@ -187,6 +194,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		defer logWriter.Close()
 		// Write CSV header
 		fmt.Fprintln(logWriter, "timestamp,query_name,index_type,events_returned,events_scanned,index_matches,index_bytes,event_bytes,avg_ms,error")
+		logWriter.Sync()
 	}
 
 	// Create output writer if enabled (writes results incrementally)
@@ -201,6 +209,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		// Write CSV header for results
 		if *outputFormat == "csv" {
 			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,index_type,avg_ms,p99_ms,p99_idx_ms,p99_evt_ms,events_returned,events_scanned,index_matches,index_bytes,event_bytes,error")
+			outputWriter.Sync()
 		}
 	}
 
@@ -239,11 +248,13 @@ func runBenchmark(cfg *config.Config, args []string) {
 					float64(result.AvgTime.Microseconds())/1000.0,
 					errStr,
 				)
+				logWriter.Sync() // Flush to disk immediately
 			}
 
 			// Write result to output file incrementally
 			if outputWriter != nil {
 				writeResultIncremental(outputWriter, result, *outputFormat)
+				outputWriter.Sync() // Flush to disk immediately
 			}
 		}
 	}
@@ -549,23 +560,47 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 		topicBytes = append(topicBytes, decoded)
 	}
 
-	// Warmup runs
+	// Warmup runs (with timeout)
 	for i := 0; i < warmup; i++ {
-		_ = executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicBytes, indexType, limit)
+		resultChan := make(chan *QueryResult, 1)
+		go func() {
+			resultChan <- executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicBytes, indexType, limit)
+		}()
+		select {
+		case <-resultChan:
+			// Warmup complete
+		case <-time.After(timeout):
+			// Warmup timed out - wait for goroutine to finish to avoid race
+			<-resultChan
+		}
 	}
 
 	// Benchmark runs
 	for i := 0; i < iterations; i++ {
 		start := time.Now()
-		qr := executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicBytes, indexType, limit)
-		elapsed := time.Since(start)
 
+		resultChan := make(chan *QueryResult, 1)
+		go func() {
+			resultChan <- executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicBytes, indexType, limit)
+		}()
+
+		var qr *QueryResult
+		var timedOut bool
+		select {
+		case qr = <-resultChan:
+			// Query completed in time
+		case <-time.After(timeout):
+			timedOut = true
+			// Must wait for goroutine to finish to avoid RocksDB race conditions
+			qr = <-resultChan
+		}
+
+		elapsed := time.Since(start)
 		timings = append(timings, elapsed)
 
-		// Check if query exceeded timeout
-		if elapsed > timeout {
+		if timedOut {
 			result.Error = "timeout"
-			// Still record the results from this run
+			// Still record results from this slow query
 			if qr != nil && qr.Error == nil {
 				result.EventsReturned = qr.EventsReturned
 				result.EventsScanned = qr.EventsScanned
@@ -574,7 +609,7 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 				result.IndexBytes = qr.IndexBytes
 				result.EventBytes = qr.EventBytes
 			}
-			// Stop further iterations since this query is too slow
+			// Stop further iterations - this query is too slow
 			break
 		} else if qr != nil {
 			if qr.Error != nil {

@@ -116,6 +116,13 @@ func runQuery(cfg *config.Config, args []string) {
 		os.Exit(2)
 	}
 
+	// Enforce max ledger range from config
+	maxEnd := startLedger + uint64(cfg.Query.MaxLedgerRange)
+	if endLedger > maxEnd {
+		fmt.Fprintf(os.Stderr, "Warning: range exceeds max_ledger_range (%d), capping end to %d\n", cfg.Query.MaxLedgerRange, maxEnd)
+		endLedger = maxEnd
+	}
+
 	// Apply config defaults for limit
 	queryLimit := *limit
 	if queryLimit <= 0 {
