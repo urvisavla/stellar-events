@@ -113,6 +113,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 	seed := fs.Int64("seed", 0, "Random seed for combination selection (0 = use time)")
 	limit := fs.Int("limit", 1000, "Max events to fetch per query")
 	timeout := fs.Duration("timeout", 30*time.Second, "Timeout per query (e.g., 10s, 1m)")
+	fixedRange := fs.Bool("fixed-range", false, "Use fixed ledger range for all queries (no random sampling)")
 	logFile := fs.String("log", "benchmark.log", "Log file for query details (use 'none' to disable)")
 	outputFile := fs.String("output", "", "Output file for results (writes incrementally; use 'none' to disable)")
 
@@ -252,16 +253,33 @@ func runBenchmark(cfg *config.Config, args []string) {
 	totalQueries := len(queries) * len(indexes)
 	completed := 0
 
-	for _, q := range queries {
-		// Pick a random starting ledger for this query (same for all index types)
-		queryStart := originalStartLedger
-		queryEnd := originalEndLedger
+	// Pre-compute fixed range if requested
+	var fixedStart, fixedEnd uint32
+	if *fixedRange {
+		fixedStart = originalStartLedger
+		fixedEnd = originalEndLedger
 		dataRange := originalEndLedger - originalStartLedger
 		if dataRange > maxLedgerRange {
-			// Pick random start within the range that allows full maxLedgerRange window
-			maxStart := originalEndLedger - maxLedgerRange
-			queryStart = originalStartLedger + uint32(rand.Intn(int(maxStart-originalStartLedger+1)))
-			queryEnd = queryStart + maxLedgerRange
+			fixedEnd = originalStartLedger + maxLedgerRange
+		}
+		fmt.Fprintf(os.Stderr, "Fixed range mode: all queries use [%d-%d]\n", fixedStart, fixedEnd)
+	}
+
+	for _, q := range queries {
+		// Pick ledger range for this query (same for all index types within a query)
+		queryStart := originalStartLedger
+		queryEnd := originalEndLedger
+		if *fixedRange {
+			queryStart = fixedStart
+			queryEnd = fixedEnd
+		} else {
+			dataRange := originalEndLedger - originalStartLedger
+			if dataRange > maxLedgerRange {
+				// Pick random start within the range that allows full maxLedgerRange window
+				maxStart := originalEndLedger - maxLedgerRange
+				queryStart = originalStartLedger + uint32(rand.Intn(int(maxStart-originalStartLedger+1)))
+				queryEnd = queryStart + maxLedgerRange
+			}
 		}
 
 		for _, idxType := range indexes {
