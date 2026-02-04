@@ -2875,9 +2875,9 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListTiming(contractID []byte,
 	}
 	result.UniqueLedgers = len(ledgerSet)
 
-	// Fetch events with filtering
+	// Fetch events with filtering (non-positional topic matching for posting list queries)
 	fetchStart := time.Now()
-	events, bytesRead, scanned, decodeTime, filterTime, err := es.fetchEventsByTOIDsWithStats(resultTOIDs, limit, contractID, topics)
+	events, bytesRead, scanned, decodeTime, filterTime, err := es.fetchEventsByTOIDsWithStats(resultTOIDs, limit, contractID, topics, true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -3004,9 +3004,9 @@ func (es *RocksDBEventStore) queryPostingListStreaming(contractID []byte, topics
 			ledgerSet[ledger] = struct{}{}
 		}
 
-		// Fetch events for this bucket's TOIDs with filtering
+		// Fetch events for this bucket's TOIDs with filtering (non-positional topic matching)
 		fetchStart := time.Now()
-		events, bytesRead, scanned, decTime, filtTime, err := es.fetchEventsByTOIDsWithStats(filtered, remaining, contractID, topics)
+		events, bytesRead, scanned, decTime, filtTime, err := es.fetchEventsByTOIDsWithStats(filtered, remaining, contractID, topics, true)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -3061,7 +3061,8 @@ func (es *RocksDBEventStore) queryPostingListWithStats(cf *grocksdb.ColumnFamily
 
 // fetchEventsByTOIDsWithStats fetches events with detailed stats.
 // Filters events by contractID and topics if provided.
-func (es *RocksDBEventStore) fetchEventsByTOIDsWithStats(toids []uint64, limit int, contractID []byte, topics [][]byte) ([]*query.Event, int64, int, time.Duration, time.Duration, error) {
+// If nonPositionalTopics is true, uses non-positional topic matching (topic can be at any position).
+func (es *RocksDBEventStore) fetchEventsByTOIDsWithStats(toids []uint64, limit int, contractID []byte, topics [][]byte, nonPositionalTopics bool) ([]*query.Event, int64, int, time.Duration, time.Duration, error) {
 	events := make([]*query.Event, 0, len(toids))
 	var bytesRead int64
 	var scanned int
@@ -3107,8 +3108,16 @@ func (es *RocksDBEventStore) fetchEventsByTOIDsWithStats(toids []uint64, limit i
 					if len(contractID) > 0 && !header.MatchesContractID(contractID) {
 						matches = false
 					}
-					if matches && !header.MatchesTopics(topics) {
-						matches = false
+					if matches && len(topics) > 0 {
+						if nonPositionalTopics {
+							if !header.MatchesTopicsNonPositional(topics) {
+								matches = false
+							}
+						} else {
+							if !header.MatchesTopics(topics) {
+								matches = false
+							}
+						}
 					}
 					filterTime += time.Since(filterStart)
 					if !matches {
@@ -3324,7 +3333,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap64(contractID []byte, topics [
 			result.EventBytesRead += int64(len(valueData))
 			result.EventsScanned++
 
-			// Filter using binary header for fast rejection
+			// Filter using binary header for fast rejection (non-positional topic matching for bitmap64)
 			filterStart := time.Now()
 			if es.eventFormat == "binary" && (len(contractID) > 0 || len(topics) > 0) {
 				header := ParseBinaryHeader(valueData)
@@ -3333,7 +3342,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap64(contractID []byte, topics [
 					if len(contractID) > 0 && !header.MatchesContractID(contractID) {
 						matches = false
 					}
-					if matches && !header.MatchesTopics(topics) {
+					if matches && len(topics) > 0 && !header.MatchesTopicsNonPositional(topics) {
 						matches = false
 					}
 					filterTime += time.Since(filterStart)

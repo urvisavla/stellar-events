@@ -260,7 +260,8 @@ func (h *BinaryEventHeader) MatchesContractID(contractID []byte) bool {
 	return true
 }
 
-// MatchesTopics checks if the event matches the given topic filters.
+// MatchesTopics checks if the event matches the given topic filters (positional).
+// filter[0] must match topics[0], filter[1] must match topics[1], etc.
 // Empty filter entries are wildcards.
 func (h *BinaryEventHeader) MatchesTopics(topicFilters [][]byte) bool {
 	topics := h.GetTopics()
@@ -280,6 +281,41 @@ func (h *BinaryEventHeader) MatchesTopics(topicFilters [][]byte) bool {
 			if filter[j] != topics[i][j] {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+// MatchesTopicsNonPositional checks if all filter topics appear somewhere in the event's topics.
+// Each filter must match at least one topic at any position (AND logic).
+// This is used for posting list and bitmap64 queries with --topics flag.
+func (h *BinaryEventHeader) MatchesTopicsNonPositional(topicFilters [][]byte) bool {
+	topics := h.GetTopics()
+
+	for _, filter := range topicFilters {
+		if len(filter) == 0 {
+			continue // Wildcard
+		}
+
+		found := false
+		for _, topic := range topics {
+			if len(filter) == len(topic) {
+				match := true
+				for j := 0; j < len(filter); j++ {
+					if filter[j] != topic[j] {
+						match = false
+						break
+					}
+				}
+				if match {
+					found = true
+					break
+				}
+			}
+		}
+
+		if !found {
+			return false
 		}
 	}
 	return true
