@@ -2,6 +2,7 @@ package index
 
 import (
 	"encoding/binary"
+	"time"
 
 	"github.com/RoaringBitmap/roaring/roaring64"
 )
@@ -20,6 +21,8 @@ type EventSegmentLoader interface {
 	LoadEventSegment(prefix byte, keyValue []byte, segmentID uint32) (*roaring64.Bitmap, error)
 	// LoadEventSegmentWithStats loads a segment and returns bytes read.
 	LoadEventSegmentWithStats(prefix byte, keyValue []byte, segmentID uint32) (*roaring64.Bitmap, int64, error)
+	// LoadEventSegmentWithTiming loads a segment and returns bytes read, read time, and decode time.
+	LoadEventSegmentWithTiming(prefix byte, keyValue []byte, segmentID uint32) (*roaring64.Bitmap, int64, time.Duration, time.Duration, error)
 }
 
 // EventBitmapIndex manages segmented Roaring64 bitmap indexes for TOID-level granularity.
@@ -87,6 +90,10 @@ func (bi *EventBitmapIndex) QueryIndex(prefix byte, keyValue []byte, startLedger
 	startSegment := SegmentID(startLedger)
 	endSegment := SegmentID(endLedger)
 
+	// Filter by ledger range using TOID boundaries (loop-invariant)
+	startKey := EncodeTOID(startLedger, 0, 0)
+	endKey := EncodeTOID(endLedger, 0xFFFFF, 0xFFF)
+
 	for segID := startSegment; segID <= endSegment; segID++ {
 		bitmap, err := bi.getSegment(prefix, keyValue, segID)
 		if err != nil {
@@ -97,18 +104,16 @@ func (bi *EventBitmapIndex) QueryIndex(prefix byte, keyValue []byte, startLedger
 			continue
 		}
 
-		// Filter by ledger range using TOID boundaries
-		// Bitmap64 stores TOIDs (operation-level), not event keys
-		startKey := EncodeTOID(startLedger, 0, 0)
-		endKey := EncodeTOID(endLedger, 0xFFFFF, 0xFFF)
+		result.Or(bitmap)
+	}
 
-		// Filter to range using iterator
-		iter := bitmap.Iterator()
-		for iter.HasNext() {
-			eventKey := iter.Next()
-			if eventKey >= startKey && eventKey <= endKey {
-				result.Add(eventKey)
-			}
+	// Trim to ledger range using native bitmap operations
+	if !result.IsEmpty() {
+		if startKey > 0 {
+			result.RemoveRange(0, startKey)
+		}
+		if maxVal := result.Maximum(); endKey < maxVal {
+			result.RemoveRange(endKey+1, maxVal+1)
 		}
 	}
 
@@ -142,22 +147,29 @@ func (bi *EventBitmapIndex) QueryTopicEvents(topicValue []byte, startLedger, end
 	return bi.QueryIndex(PrefixEventTopic, topicValue, startLedger, endLedger)
 }
 
-// QueryIndexWithStats returns event keys and tracks bytes read from storage.
-func (bi *EventBitmapIndex) QueryIndexWithStats(prefix byte, keyValue []byte, startLedger, endLedger uint32) (*roaring64.Bitmap, int64, int, error) {
+// QueryIndexWithStats returns event keys and tracks bytes read, read time, and decode time from storage.
+func (bi *EventBitmapIndex) QueryIndexWithStats(prefix byte, keyValue []byte, startLedger, endLedger uint32) (*roaring64.Bitmap, int64, int, time.Duration, time.Duration, error) {
 	result := roaring64.New()
 	var bytesRead int64
 	var segmentsRead int
+	var totalReadTime, totalDecodeTime time.Duration
 
 	startSegment := SegmentID(startLedger)
 	endSegment := SegmentID(endLedger)
 
+	// Filter by ledger range using TOID boundaries (loop-invariant)
+	startKey := EncodeTOID(startLedger, 0, 0)
+	endKey := EncodeTOID(endLedger, 0xFFFFF, 0xFFF)
+
 	for segID := startSegment; segID <= endSegment; segID++ {
-		bitmap, segBytes, err := bi.getSegmentWithStats(prefix, keyValue, segID)
+		bitmap, segBytes, readTime, decodeTime, err := bi.getSegmentWithStats(prefix, keyValue, segID)
 		if err != nil {
-			return nil, bytesRead, segmentsRead, err
+			return nil, bytesRead, segmentsRead, totalReadTime, totalDecodeTime, err
 		}
 
 		bytesRead += segBytes
+		totalReadTime += readTime
+		totalDecodeTime += decodeTime
 		if segBytes > 0 {
 			segmentsRead++
 		}
@@ -166,48 +178,46 @@ func (bi *EventBitmapIndex) QueryIndexWithStats(prefix byte, keyValue []byte, st
 			continue
 		}
 
-		// Filter by ledger range using TOID boundaries
-		// Bitmap64 stores TOIDs (operation-level), not event keys
-		startKey := EncodeTOID(startLedger, 0, 0)
-		endKey := EncodeTOID(endLedger, 0xFFFFF, 0xFFF)
+		result.Or(bitmap)
+	}
 
-		// Filter to range using iterator
-		iter := bitmap.Iterator()
-		for iter.HasNext() {
-			eventKey := iter.Next()
-			if eventKey >= startKey && eventKey <= endKey {
-				result.Add(eventKey)
-			}
+	// Trim to ledger range using native bitmap operations
+	if !result.IsEmpty() {
+		if startKey > 0 {
+			result.RemoveRange(0, startKey)
+		}
+		if maxVal := result.Maximum(); endKey < maxVal {
+			result.RemoveRange(endKey+1, maxVal+1)
 		}
 	}
 
-	return result, bytesRead, segmentsRead, nil
+	return result, bytesRead, segmentsRead, totalReadTime, totalDecodeTime, nil
 }
 
 // getSegmentWithStats retrieves a segment and tracks bytes read.
-func (bi *EventBitmapIndex) getSegmentWithStats(prefix byte, keyValue []byte, segmentID uint32) (*roaring64.Bitmap, int64, error) {
+func (bi *EventBitmapIndex) getSegmentWithStats(prefix byte, keyValue []byte, segmentID uint32) (*roaring64.Bitmap, int64, time.Duration, time.Duration, error) {
 	key := makeKey(prefix, keyValue, segmentID)
 
 	// Check hot cache first - no disk read
 	if bitmap, exists := bi.hotSegments[key]; exists {
-		return bitmap, 0, nil
+		return bitmap, 0, 0, 0, nil
 	}
 
 	// Load from storage if loader is available
 	if bi.loader != nil {
-		return bi.loader.LoadEventSegmentWithStats(prefix, keyValue, segmentID)
+		return bi.loader.LoadEventSegmentWithTiming(prefix, keyValue, segmentID)
 	}
 
-	return nil, 0, nil
+	return nil, 0, 0, 0, nil
 }
 
 // QueryContractEventsWithStats queries event keys for a contract ID with byte tracking.
-func (bi *EventBitmapIndex) QueryContractEventsWithStats(contractID []byte, startLedger, endLedger uint32) (*roaring64.Bitmap, int64, int, error) {
+func (bi *EventBitmapIndex) QueryContractEventsWithStats(contractID []byte, startLedger, endLedger uint32) (*roaring64.Bitmap, int64, int, time.Duration, time.Duration, error) {
 	return bi.QueryIndexWithStats(PrefixEventContract, contractID, startLedger, endLedger)
 }
 
 // QueryTopicEventsWithStats queries event keys for a topic with byte tracking.
-func (bi *EventBitmapIndex) QueryTopicEventsWithStats(topicValue []byte, startLedger, endLedger uint32) (*roaring64.Bitmap, int64, int, error) {
+func (bi *EventBitmapIndex) QueryTopicEventsWithStats(topicValue []byte, startLedger, endLedger uint32) (*roaring64.Bitmap, int64, int, time.Duration, time.Duration, error) {
 	return bi.QueryIndexWithStats(PrefixEventTopic, topicValue, startLedger, endLedger)
 }
 

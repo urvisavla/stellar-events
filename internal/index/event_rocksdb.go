@@ -2,8 +2,7 @@ package index
 
 import (
 	"fmt"
-	"sort"
-	"sync"
+	"time"
 
 	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/linxGnu/grocksdb"
@@ -80,29 +79,45 @@ func (s *EventRocksDBStore) LoadEventSegmentWithStats(prefix byte, keyValue []by
 	return s.loadBitmapFromCFWithStats(cf, dbKey)
 }
 
+// LoadEventSegmentWithTiming loads a segment and returns bytes read, read time, and decode time.
+func (s *EventRocksDBStore) LoadEventSegmentWithTiming(prefix byte, keyValue []byte, segmentID uint32) (*roaring64.Bitmap, int64, time.Duration, time.Duration, error) {
+	dbKey := MakeEventKey(prefix, keyValue, segmentID)
+	cf := s.getCF(prefix)
+	return s.loadBitmapFromCFWithTiming(cf, dbKey)
+}
+
 func (s *EventRocksDBStore) loadBitmapFromCF(cf *grocksdb.ColumnFamilyHandle, key []byte) (*roaring64.Bitmap, error) {
 	bitmap, _, err := s.loadBitmapFromCFWithStats(cf, key)
 	return bitmap, err
 }
 
 func (s *EventRocksDBStore) loadBitmapFromCFWithStats(cf *grocksdb.ColumnFamilyHandle, key []byte) (*roaring64.Bitmap, int64, error) {
+	bitmap, bytesRead, _, _, err := s.loadBitmapFromCFWithTiming(cf, key)
+	return bitmap, bytesRead, err
+}
+
+func (s *EventRocksDBStore) loadBitmapFromCFWithTiming(cf *grocksdb.ColumnFamilyHandle, key []byte) (*roaring64.Bitmap, int64, time.Duration, time.Duration, error) {
+	readStart := time.Now()
 	data, err := s.db.GetCF(s.ro, cf, key)
+	readTime := time.Since(readStart)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to get event bitmap: %w", err)
+		return nil, 0, readTime, 0, fmt.Errorf("failed to get event bitmap: %w", err)
 	}
 	defer data.Free()
 
 	if data.Size() == 0 {
-		return nil, 0, nil
+		return nil, 0, readTime, 0, nil
 	}
 
 	bytesRead := int64(data.Size())
+	decodeStart := time.Now()
 	bitmap := roaring64.New()
 	if err := bitmap.UnmarshalBinary(data.Data()); err != nil {
-		return nil, bytesRead, fmt.Errorf("failed to unmarshal event bitmap: %w", err)
+		return nil, bytesRead, readTime, time.Since(decodeStart), fmt.Errorf("failed to unmarshal event bitmap: %w", err)
 	}
+	decodeTime := time.Since(decodeStart)
 
-	return bitmap, bytesRead, nil
+	return bitmap, bytesRead, readTime, decodeTime, nil
 }
 
 // AddContractEvent adds an event to the contract index.
@@ -119,9 +134,11 @@ func (s *EventRocksDBStore) AddTopicEvent(topic []byte, ledger uint32, tx, op, e
 
 // EventQueryResult holds the result of an event key query including stats.
 type EventQueryResult struct {
-	Bitmap    *roaring64.Bitmap
-	BytesRead int64
-	Segments  int
+	Bitmap     *roaring64.Bitmap
+	BytesRead  int64
+	Segments   int
+	ReadTime   time.Duration // Time spent reading from storage (I/O)
+	DecodeTime time.Duration // Time spent decoding bitmaps (CPU)
 }
 
 // QueryEventKeys returns a Roaring64 bitmap of event keys matching the filter criteria.
@@ -143,12 +160,14 @@ func (s *EventRocksDBStore) QueryEventKeysWithStats(contractID []byte, topics []
 
 	// Query contract index if specified
 	if len(contractID) > 0 {
-		bm, bytesRead, segments, err := s.bitmap.QueryContractEventsWithStats(contractID, startLedger, endLedger)
+		bm, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryContractEventsWithStats(contractID, startLedger, endLedger)
 		if err != nil {
 			return nil, fmt.Errorf("contract event index query failed: %w", err)
 		}
 		result.BytesRead += bytesRead
 		result.Segments += segments
+		result.ReadTime += readTime
+		result.DecodeTime += decodeTime
 		if bm != nil {
 			bitmaps = append(bitmaps, bm)
 		}
@@ -159,12 +178,14 @@ func (s *EventRocksDBStore) QueryEventKeysWithStats(contractID []byte, topics []
 		if len(topic) == 0 {
 			continue
 		}
-		bm, bytesRead, segments, err := s.bitmap.QueryTopicEventsWithStats(topic, startLedger, endLedger)
+		bm, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryTopicEventsWithStats(topic, startLedger, endLedger)
 		if err != nil {
 			return nil, fmt.Errorf("topic event index query failed: %w", err)
 		}
 		result.BytesRead += bytesRead
 		result.Segments += segments
+		result.ReadTime += readTime
+		result.DecodeTime += decodeTime
 		if bm != nil {
 			bitmaps = append(bitmaps, bm)
 		}
@@ -176,107 +197,6 @@ func (s *EventRocksDBStore) QueryEventKeysWithStats(contractID []byte, topics []
 
 	// Intersect all bitmaps using FastAnd
 	result.Bitmap = roaring64.FastAnd(bitmaps...)
-	return result, nil
-}
-
-// QueryEventKeysParallel reads all bitmaps in parallel, then intersects smallest-first with early exit.
-func (s *EventRocksDBStore) QueryEventKeysParallel(contractID []byte, topics [][]byte, startLedger, endLedger uint32) (*EventQueryResult, error) {
-	result := &EventQueryResult{
-		Bitmap: roaring64.New(),
-	}
-
-	// Count lists to read
-	type querySpec struct {
-		prefix   byte
-		keyValue []byte
-	}
-	var specs []querySpec
-
-	if len(contractID) > 0 {
-		specs = append(specs, querySpec{PrefixEventContract, contractID})
-	}
-	for _, topic := range topics {
-		if len(topic) == 0 {
-			continue
-		}
-		specs = append(specs, querySpec{PrefixEventTopic, topic})
-	}
-
-	if len(specs) == 0 {
-		return result, nil
-	}
-
-	// Single filter — no parallelism needed
-	if len(specs) == 1 {
-		return s.QueryEventKeysWithStats(contractID, topics, startLedger, endLedger)
-	}
-
-	// Read all bitmaps in parallel
-	type bmResult struct {
-		bitmap    *roaring64.Bitmap
-		bytesRead int64
-		segments  int
-		err       error
-	}
-
-	results := make([]bmResult, len(specs))
-	var wg sync.WaitGroup
-
-	for i, spec := range specs {
-		wg.Add(1)
-		go func(idx int, s2 querySpec) {
-			defer wg.Done()
-			bm, bytesRead, segments, err := s.bitmap.QueryIndexWithStats(s2.prefix, s2.keyValue, startLedger, endLedger)
-			results[idx] = bmResult{bitmap: bm, bytesRead: bytesRead, segments: segments, err: err}
-		}(i, spec)
-	}
-	wg.Wait()
-
-	// Check errors, aggregate stats
-	for _, r := range results {
-		if r.err != nil {
-			return nil, r.err
-		}
-		result.BytesRead += r.bytesRead
-		result.Segments += r.segments
-	}
-
-	// Collect non-nil bitmaps
-	type indexedBitmap struct {
-		bm   *roaring64.Bitmap
-		card uint64
-	}
-	var bitmaps []indexedBitmap
-	for _, r := range results {
-		if r.bitmap != nil {
-			bitmaps = append(bitmaps, indexedBitmap{bm: r.bitmap, card: r.bitmap.GetCardinality()})
-		}
-	}
-
-	if len(bitmaps) == 0 {
-		return result, nil
-	}
-
-	// Sort smallest first
-	sort.Slice(bitmaps, func(i, j int) bool {
-		return bitmaps[i].card < bitmaps[j].card
-	})
-
-	// Early exit if smallest is empty
-	if bitmaps[0].card == 0 {
-		return result, nil
-	}
-
-	// Progressive intersection with early exit
-	acc := bitmaps[0].bm
-	for _, ib := range bitmaps[1:] {
-		acc.And(ib.bm)
-		if acc.IsEmpty() {
-			return result, nil
-		}
-	}
-
-	result.Bitmap = acc
 	return result, nil
 }
 

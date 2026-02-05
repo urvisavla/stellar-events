@@ -294,10 +294,12 @@ type Bitmap64QueryResult struct {
 	EventBytesRead int64 // Bytes read from event storage
 
 	// Timing breakdown
-	IndexLookupTime time.Duration // Time querying bitmap index
-	EventFetchTime  time.Duration // Time fetching events
-	DecodeTime      time.Duration // Time decoding events
-	TotalTime       time.Duration // Total query time
+	IndexLookupTime  time.Duration // Time querying bitmap index
+	IndexReadTime    time.Duration // Time reading bitmap segments from storage (I/O)
+	IndexDecodeTime  time.Duration // Time decoding bitmap segments (CPU)
+	EventFetchTime   time.Duration // Time fetching events
+	DecodeTime       time.Duration // Time decoding events
+	TotalTime        time.Duration // Total query time
 }
 
 // ToUnified converts Bitmap64QueryResult to UnifiedQueryResult
@@ -351,6 +353,10 @@ type PostingListQueryResult struct {
 	DecodeTime      time.Duration // Time decoding events
 	FilterTime      time.Duration // Time filtering events by contract/topics
 	TotalTime       time.Duration // Total query time
+
+	// I/O vs CPU breakdown for posting list reads
+	PostingListReadTime   time.Duration // I/O: time in RocksDB GetCF
+	PostingListDecodeTime time.Duration // CPU: time in DecodeTOIDListDeltaVarint
 
 	// Multi-filter optimization stats (Phase 1-3)
 	ParallelReadTime    time.Duration // Time for parallel posting list reads (Phase 1)

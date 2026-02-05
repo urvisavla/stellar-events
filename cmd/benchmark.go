@@ -68,31 +68,35 @@ type QuerySpec struct {
 
 // BenchmarkResult holds timing results for a query
 type BenchmarkResult struct {
-	Query          QuerySpec
-	IndexType      string
-	StartLedger    uint32 // Ledger range used for this query
-	EndLedger      uint32
-	Iterations     int
-	TotalTime      time.Duration
-	AvgTime        time.Duration
-	MinTime        time.Duration
-	MaxTime        time.Duration
-	P50Time        time.Duration
-	P99Time        time.Duration
-	P99IndexTime   time.Duration // P99 time for index lookup
-	P99EventTime   time.Duration // P99 time for event fetch
-	EventsReturned int
-	EventsScanned  int
-	LedgersFound   int
-	IndexMatches   int
-	IndexBytes     int64
-	EventBytes     int64
-	Error          string
+	// Query identification
+	Query       QuerySpec
+	IndexType   string
+	StartLedger uint32 // Ledger range used for this query
+	EndLedger   uint32
 
-	// Multi-filter optimization stats (posting list only)
-	SmallestListSize int // Size of smallest posting list
-	LargestListSize  int // Size of largest posting list
-	SkippedBuckets   int // Buckets skipped due to guided intersection
+	// Test config
+	Iterations int
+
+	// Timing (p50/p99 only)
+	P50Time            time.Duration
+	P99Time            time.Duration
+	P99IndexTime       time.Duration // P99 time for index lookup
+	P99EventTime       time.Duration // P99 time for event fetch
+	P99IndexReadTime   time.Duration // P99 time reading index from storage (I/O)
+	P99IndexDecodeTime time.Duration // P99 time decoding index (CPU)
+
+	// Index stats
+	IndexMatches     int   // TOIDs or ledgers matched by index
+	IndexBytes       int64 // Bytes read from index
+	SmallestListSize int   // Size of smallest posting list (posting list only)
+	LargestListSize  int   // Size of largest posting list (posting list only)
+
+	// Event stats
+	EventsReturned int   // Events returned after filtering
+	EventsScanned  int   // Events scanned from storage
+	EventBytes     int64 // Bytes read from event storage
+
+	Error string
 }
 
 // =============================================================================
@@ -171,13 +175,13 @@ func runBenchmark(cfg *config.Config, args []string) {
 	// Parse index types
 	var indexes []string
 	if *indexTypes == "all" {
-		indexes = []string{"posting", "posting-parallel", "bitmap32", "bitmap64", "bitmap64-parallel"}
+		indexes = []string{"posting", "posting-parallel", "bitmap32", "bitmap64"}
 	} else {
 		indexes = strings.Split(*indexTypes, ",")
 	}
 
 	// Validate index types
-	validIndexes := map[string]bool{"posting": true, "posting-parallel": true, "bitmap32": true, "bitmap64": true, "bitmap64-parallel": true}
+	validIndexes := map[string]bool{"posting": true, "posting-parallel": true, "bitmap32": true, "bitmap64": true}
 	for _, idx := range indexes {
 		if !validIndexes[idx] {
 			fmt.Fprintf(os.Stderr, "Error: invalid index type: %s\n", idx)
@@ -209,7 +213,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		}
 		defer logWriter.Close()
 		// Write CSV header
-		fmt.Fprintln(logWriter, "timestamp,query_name,index_type,start_ledger,end_ledger,events_returned,events_scanned,index_matches,index_bytes,event_bytes,avg_ms,error")
+		fmt.Fprintln(logWriter, "timestamp,query_name,index_type,start_ledger,end_ledger,events_returned,events_scanned,index_matches,index_bytes,event_bytes,p99_total_ms,error")
 		logWriter.Sync()
 	}
 
@@ -235,7 +239,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		defer outputWriter.Close()
 		// Write CSV header for results
 		if outputFileFormat == "csv" {
-			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,index_type,start_ledger,end_ledger,avg_ms,p99_ms,p99_idx_ms,p99_evt_ms,events_scanned,index_matches,index_bytes,event_bytes,events_returned,error")
+			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,index_type,start_ledger,end_ledger,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,events_returned,events_scanned,event_bytes,iterations,error")
 			outputWriter.Sync()
 		}
 		fmt.Fprintf(os.Stderr, "Output file: %s (format: %s)\n", *outputFile, outputFileFormat)
@@ -308,7 +312,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 					result.IndexMatches,
 					result.IndexBytes,
 					result.EventBytes,
-					float64(result.AvgTime.Microseconds())/1000.0,
+					float64(result.P99Time.Microseconds())/1000.0,
 					errStr,
 				)
 				logWriter.Sync() // Flush to disk immediately
@@ -618,9 +622,11 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 
 	// Track all timing data together per iteration so p99 values are correlated
 	type iterationTiming struct {
-		total time.Duration
-		index time.Duration
-		event time.Duration
+		total       time.Duration
+		index       time.Duration
+		event       time.Duration
+		indexRead   time.Duration
+		indexDecode time.Duration
 	}
 	var timings []iterationTiming
 
@@ -687,16 +693,8 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 			result.Error = "timeout"
 			// Still record results from this slow query
 			if qr != nil && qr.Error == nil {
-				result.EventsReturned = qr.EventsReturned
-				result.EventsScanned = qr.EventsScanned
-				result.LedgersFound = qr.LedgersFound
-				result.IndexMatches = qr.IndexMatches
-				result.IndexBytes = qr.IndexBytes
-				result.EventBytes = qr.EventBytes
-				result.SmallestListSize = qr.SmallestListSize
-				result.LargestListSize = qr.LargestListSize
-				result.SkippedBuckets = qr.SkippedBuckets
-				timings = append(timings, iterationTiming{total: elapsed, index: qr.IndexTime, event: qr.EventFetchTime})
+				populateQueryStats(&result, qr)
+				timings = append(timings, iterationTiming{total: elapsed, index: qr.IndexTime, event: qr.EventFetchTime, indexRead: qr.IndexReadTime, indexDecode: qr.IndexDecodeTime})
 			} else {
 				timings = append(timings, iterationTiming{total: elapsed})
 			}
@@ -707,33 +705,16 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 				result.Error = qr.Error.Error()
 				timings = append(timings, iterationTiming{total: elapsed})
 			} else {
-				result.EventsReturned = qr.EventsReturned
-				result.EventsScanned = qr.EventsScanned
-				result.LedgersFound = qr.LedgersFound
-				result.IndexMatches = qr.IndexMatches
-				result.IndexBytes = qr.IndexBytes
-				result.EventBytes = qr.EventBytes
-				result.SmallestListSize = qr.SmallestListSize
-				result.LargestListSize = qr.LargestListSize
-				result.SkippedBuckets = qr.SkippedBuckets
-				timings = append(timings, iterationTiming{total: elapsed, index: qr.IndexTime, event: qr.EventFetchTime})
+				populateQueryStats(&result, qr)
+				timings = append(timings, iterationTiming{total: elapsed, index: qr.IndexTime, event: qr.EventFetchTime, indexRead: qr.IndexReadTime, indexDecode: qr.IndexDecodeTime})
 			}
 		}
 	}
 
-	// Calculate statistics - sort by total time so p99 index/event come from same iteration
+	// Calculate statistics - sort by total time so p50/p99 index/event come from same iteration
 	if len(timings) > 0 {
 		sort.Slice(timings, func(i, j int) bool { return timings[i].total < timings[j].total })
 
-		var total time.Duration
-		for _, t := range timings {
-			total += t.total
-		}
-
-		result.TotalTime = total
-		result.AvgTime = total / time.Duration(len(timings))
-		result.MinTime = timings[0].total
-		result.MaxTime = timings[len(timings)-1].total
 		result.P50Time = timings[len(timings)/2].total
 
 		// P99 values all come from the same iteration
@@ -741,27 +722,46 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 		result.P99Time = timings[p99Idx].total
 		result.P99IndexTime = timings[p99Idx].index
 		result.P99EventTime = timings[p99Idx].event
+		result.P99IndexReadTime = timings[p99Idx].indexRead
+		result.P99IndexDecodeTime = timings[p99Idx].indexDecode
 	}
 
 	return result
 }
 
+// populateQueryStats copies stats from a QueryResult into a BenchmarkResult.
+func populateQueryStats(result *BenchmarkResult, qr *QueryResult) {
+	result.EventsReturned = qr.EventsReturned
+	result.EventsScanned = qr.EventsScanned
+	result.IndexMatches = qr.IndexMatches
+	result.IndexBytes = qr.IndexBytes
+	result.EventBytes = qr.EventBytes
+	result.SmallestListSize = qr.SmallestListSize
+	result.LargestListSize = qr.LargestListSize
+}
+
 // QueryResult holds basic query stats for benchmarking
 type QueryResult struct {
+	// Event stats
 	EventsReturned int
 	EventsScanned  int
-	LedgersFound   int
-	IndexBytes     int64
-	EventBytes     int64
-	IndexMatches   int           // TOIDs or ledgers matched by index before fetching events
-	IndexTime      time.Duration // Time spent reading index
-	EventFetchTime time.Duration // Time spent fetching events
-	Error          error
 
-	// Multi-filter optimization stats (posting list only)
-	SmallestListSize int // Size of smallest posting list
-	LargestListSize  int // Size of largest posting list
-	SkippedBuckets   int // Buckets skipped due to guided intersection
+	// Index stats
+	IndexMatches     int   // TOIDs or ledgers matched by index
+	IndexBytes       int64 // Bytes read from index
+	SmallestListSize int   // Size of smallest posting list (posting list only)
+	LargestListSize  int   // Size of largest posting list (posting list only)
+
+	// Event I/O
+	EventBytes int64 // Bytes read from event storage
+
+	// Timing
+	IndexTime       time.Duration // Time spent reading index
+	EventFetchTime  time.Duration // Time spent fetching events
+	IndexReadTime   time.Duration // Time spent reading index from storage (I/O)
+	IndexDecodeTime time.Duration // Time spent decoding index (CPU)
+
+	Error error
 }
 
 func executeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topics [][]byte, indexType string, limit int) *QueryResult {
@@ -777,13 +777,7 @@ func executeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, end
 	case "bitmap32":
 		return executeBitmap32QueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
 	case "bitmap64":
-		eventStore.ParallelBitmap64 = false
 		return executeBitmap64QueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
-	case "bitmap64-parallel":
-		eventStore.ParallelBitmap64 = true
-		result := executeBitmap64QueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
-		eventStore.ParallelBitmap64 = false
-		return result
 	}
 	return nil
 }
@@ -797,15 +791,15 @@ func executePostingQueryBenchmark(eventStore *store.RocksDBEventStore, startLedg
 	return &QueryResult{
 		EventsReturned:   len(events),
 		EventsScanned:    stats.EventsScanned,
-		LedgersFound:     stats.UniqueLedgers,
 		IndexBytes:       stats.PostingListBytes,
 		EventBytes:       stats.EventBytesRead,
 		IndexMatches:     stats.TOIDsAfterIntersect,
 		IndexTime:        stats.PostingListTime + stats.IntersectTime,
 		EventFetchTime:   stats.EventFetchTime + stats.DecodeTime + stats.FilterTime,
+		IndexReadTime:    stats.PostingListReadTime,
+		IndexDecodeTime:  stats.PostingListDecodeTime,
 		SmallestListSize: stats.SmallestListSize,
 		LargestListSize:  stats.LargestListSize,
-		SkippedBuckets:   stats.SkippedBuckets,
 	}
 }
 
@@ -818,7 +812,6 @@ func executeBitmap32QueryBenchmark(eventStore *store.RocksDBEventStore, startLed
 	return &QueryResult{
 		EventsReturned: len(events),
 		EventsScanned:  stats.EventsScanned,
-		LedgersFound:   stats.MatchingLedgers,
 		IndexBytes:     stats.IndexBytesRead,
 		EventBytes:     stats.EventBytesRead,
 		IndexMatches:   stats.MatchingLedgers,
@@ -834,14 +827,15 @@ func executeBitmap64QueryBenchmark(eventStore *store.RocksDBEventStore, startLed
 	}
 
 	return &QueryResult{
-		EventsReturned: len(events),
-		EventsScanned:  stats.EventsScanned,
-		LedgersFound:   stats.MatchingTOIDs, // TOIDs are operation-level granularity
-		IndexBytes:     stats.IndexBytesRead,
-		EventBytes:     stats.EventBytesRead,
-		IndexMatches:   stats.MatchingTOIDs,
-		IndexTime:      stats.IndexLookupTime,
-		EventFetchTime: stats.EventFetchTime,
+		EventsReturned:  len(events),
+		EventsScanned:   stats.EventsScanned,
+		IndexBytes:      stats.IndexBytesRead,
+		EventBytes:      stats.EventBytesRead,
+		IndexMatches:    stats.MatchingTOIDs,
+		IndexTime:       stats.IndexLookupTime,
+		EventFetchTime:  stats.EventFetchTime,
+		IndexReadTime:   stats.IndexReadTime,
+		IndexDecodeTime: stats.IndexDecodeTime,
 	}
 }
 
@@ -869,7 +863,7 @@ func outputTable(results []BenchmarkResult, indexes []string) {
 	// Print header
 	fmt.Printf("\n%-40s", "Query")
 	for _, idx := range indexes {
-		fmt.Printf(" | %12s", idx)
+		fmt.Printf(" | %8s p99", idx)
 	}
 	fmt.Printf(" | %6s/%6s | %8s | %8s | %8s\n", "EvtRet", "Scaned", "IdxMatch", "IdxBytes", "EvtBytes")
 
@@ -891,7 +885,7 @@ func outputTable(results []BenchmarkResult, indexes []string) {
 				if r.Error != "" {
 					fmt.Printf(" | %12s", "ERROR")
 				} else {
-					fmt.Printf(" | %12s", formatBenchmarkDuration(r.AvgTime))
+					fmt.Printf(" | %12s", formatBenchmarkDuration(r.P99Time))
 				}
 				eventsReturned = r.EventsReturned
 				eventsScanned = r.EventsScanned
@@ -913,30 +907,26 @@ func printSummaryStats(results []BenchmarkResult, indexes []string) {
 	fmt.Println()
 	fmt.Println("=== Summary Statistics ===")
 	for _, idx := range indexes {
-		var total, count int64
-		var min, max time.Duration = time.Hour, 0
+		var p50s, p99s []time.Duration
 		for _, r := range results {
 			if r.IndexType == idx && r.Error == "" {
-				total += r.AvgTime.Nanoseconds()
-				count++
-				if r.MinTime < min {
-					min = r.MinTime
-				}
-				if r.MaxTime > max {
-					max = r.MaxTime
-				}
+				p50s = append(p50s, r.P50Time)
+				p99s = append(p99s, r.P99Time)
 			}
 		}
-		if count > 0 {
-			avg := time.Duration(total / count)
-			fmt.Printf("  %s: avg=%s, min=%s, max=%s (n=%d)\n", idx, formatBenchmarkDuration(avg), formatBenchmarkDuration(min), formatBenchmarkDuration(max), count)
+		if len(p50s) > 0 {
+			sort.Slice(p50s, func(i, j int) bool { return p50s[i] < p50s[j] })
+			sort.Slice(p99s, func(i, j int) bool { return p99s[i] < p99s[j] })
+			medP50 := p50s[len(p50s)/2]
+			medP99 := p99s[len(p99s)/2]
+			fmt.Printf("  %s: median_p50=%s, median_p99=%s (n=%d)\n", idx, formatBenchmarkDuration(medP50), formatBenchmarkDuration(medP99), len(p50s))
 		}
 	}
 }
 
 func outputCSV(results []BenchmarkResult) {
-	// Header with separate topic columns and timing breakdown
-	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,index_type,avg_ms,p99_ms,p99_idx_ms,p99_evt_ms,events_scanned,index_matches,index_bytes,event_bytes,events_returned,smallest_list,largest_list,skipped_buckets,error")
+	// Header: query | timing | index | event | test
+	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,index_type,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,events_returned,events_scanned,event_bytes,iterations,error")
 
 	for _, r := range results {
 		contractID := r.Query.ContractID
@@ -944,7 +934,6 @@ func outputCSV(results []BenchmarkResult) {
 			contractID = "-"
 		}
 
-		// Separate topics into columns
 		topics := make([]string, 4)
 		for i := 0; i < 4; i++ {
 			if i < len(r.Query.Topics) {
@@ -954,26 +943,25 @@ func outputCSV(results []BenchmarkResult) {
 			}
 		}
 
-		fmt.Printf("%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%s,%d,%d,%d,%d,%s\n",
+		fmt.Printf("%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%s,%d,%d,%.3f,%d,%d,%s,%d,%s\n",
 			r.Query.Name,
 			contractID,
-			topics[0],
-			topics[1],
-			topics[2],
-			topics[3],
+			topics[0], topics[1], topics[2], topics[3],
 			r.IndexType,
-			float64(r.AvgTime.Microseconds())/1000.0,
+			float64(r.P50Time.Microseconds())/1000.0,
 			float64(r.P99Time.Microseconds())/1000.0,
 			float64(r.P99IndexTime.Microseconds())/1000.0,
-			float64(r.P99EventTime.Microseconds())/1000.0,
-			r.EventsScanned,
+			float64(r.P99IndexReadTime.Microseconds())/1000.0,
+			float64(r.P99IndexDecodeTime.Microseconds())/1000.0,
 			r.IndexMatches,
 			formatBytes(r.IndexBytes),
-			formatBytes(r.EventBytes),
-			r.EventsReturned,
 			r.SmallestListSize,
 			r.LargestListSize,
-			r.SkippedBuckets,
+			float64(r.P99EventTime.Microseconds())/1000.0,
+			r.EventsReturned,
+			r.EventsScanned,
+			formatBytes(r.EventBytes),
+			r.Iterations,
 			r.Error,
 		)
 	}
@@ -981,29 +969,34 @@ func outputCSV(results []BenchmarkResult) {
 
 func outputJSON(results []BenchmarkResult) {
 	type jsonResult struct {
-		QueryName        string   `json:"query_name"`
-		ContractID       string   `json:"contract_id,omitempty"`
-		Topics           []string `json:"topics,omitempty"`
-		IndexType        string   `json:"index_type"`
-		AvgMs            float64  `json:"avg_ms"`
-		MinMs            float64  `json:"min_ms"`
-		MaxMs            float64  `json:"max_ms"`
-		P50Ms            float64  `json:"p50_ms"`
-		P99Ms            float64  `json:"p99_ms"`
-		P99IndexMs       float64  `json:"p99_index_ms"`
-		P99EventMs       float64  `json:"p99_event_ms"`
-		EventsReturned   int      `json:"events_returned"`
-		EventsScanned    int      `json:"events_scanned"`
-		IndexMatches     int      `json:"index_matches"`
-		IndexBytes       int64    `json:"index_bytes"`
-		IndexBytesHR     string   `json:"index_bytes_human"`
-		EventBytes       int64    `json:"event_bytes"`
-		EventBytesHR     string   `json:"event_bytes_human"`
-		Iterations       int      `json:"iterations"`
-		SmallestListSize int      `json:"smallest_list_size,omitempty"`
-		LargestListSize  int      `json:"largest_list_size,omitempty"`
-		SkippedBuckets   int      `json:"skipped_buckets,omitempty"`
-		Error            string   `json:"error,omitempty"`
+		// Query identification
+		QueryName  string   `json:"query_name"`
+		ContractID string   `json:"contract_id,omitempty"`
+		Topics     []string `json:"topics,omitempty"`
+		IndexType  string   `json:"index_type"`
+
+		// Timing
+		P50Ms float64 `json:"p50_total_ms"`
+		P99Ms float64 `json:"p99_total_ms"`
+
+		// Index stats
+		P99IndexMs       float64 `json:"p99_idx_ms"`
+		IdxReadMs        float64 `json:"idx_read_ms"`
+		IdxDecodeMs      float64 `json:"idx_decode_ms"`
+		IndexMatches     int     `json:"index_matches"`
+		IndexBytes       string  `json:"index_bytes"`
+		SmallestListSize int     `json:"smallest_list_size,omitempty"`
+		LargestListSize  int     `json:"largest_list_size,omitempty"`
+
+		// Event stats
+		P99EventMs     float64 `json:"p99_evt_ms"`
+		EventsReturned int     `json:"events_returned"`
+		EventsScanned  int     `json:"events_scanned"`
+		EventBytes     string  `json:"event_bytes"`
+
+		// Test config
+		Iterations int    `json:"iterations"`
+		Error      string `json:"error,omitempty"`
 	}
 
 	var jsonResults []jsonResult
@@ -1013,24 +1006,20 @@ func outputJSON(results []BenchmarkResult) {
 			ContractID:       r.Query.ContractID,
 			Topics:           r.Query.Topics,
 			IndexType:        r.IndexType,
-			AvgMs:            float64(r.AvgTime.Microseconds()) / 1000.0,
-			MinMs:            float64(r.MinTime.Microseconds()) / 1000.0,
-			MaxMs:            float64(r.MaxTime.Microseconds()) / 1000.0,
 			P50Ms:            float64(r.P50Time.Microseconds()) / 1000.0,
 			P99Ms:            float64(r.P99Time.Microseconds()) / 1000.0,
 			P99IndexMs:       float64(r.P99IndexTime.Microseconds()) / 1000.0,
+			IdxReadMs:        float64(r.P99IndexReadTime.Microseconds()) / 1000.0,
+			IdxDecodeMs:      float64(r.P99IndexDecodeTime.Microseconds()) / 1000.0,
+			IndexMatches:     r.IndexMatches,
+			IndexBytes:       formatBytes(r.IndexBytes),
+			SmallestListSize: r.SmallestListSize,
+			LargestListSize:  r.LargestListSize,
 			P99EventMs:       float64(r.P99EventTime.Microseconds()) / 1000.0,
 			EventsReturned:   r.EventsReturned,
 			EventsScanned:    r.EventsScanned,
-			IndexMatches:     r.IndexMatches,
-			IndexBytes:       r.IndexBytes,
-			IndexBytesHR:     formatBytes(r.IndexBytes),
-			EventBytes:       r.EventBytes,
-			EventBytesHR:     formatBytes(r.EventBytes),
+			EventBytes:       formatBytes(r.EventBytes),
 			Iterations:       r.Iterations,
-			SmallestListSize: r.SmallestListSize,
-			LargestListSize:  r.LargestListSize,
-			SkippedBuckets:   r.SkippedBuckets,
 			Error:            r.Error,
 		}
 		jsonResults = append(jsonResults, jr)
@@ -1045,31 +1034,36 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 	case "json":
 		// Write as JSON Lines (one JSON object per line)
 		jr := struct {
-			QueryName        string   `json:"query_name"`
-			ContractID       string   `json:"contract_id,omitempty"`
-			Topics           []string `json:"topics,omitempty"`
-			IndexType        string   `json:"index_type"`
-			StartLedger      uint32   `json:"start_ledger"`
-			EndLedger        uint32   `json:"end_ledger"`
-			AvgMs            float64  `json:"avg_ms"`
-			MinMs            float64  `json:"min_ms"`
-			MaxMs            float64  `json:"max_ms"`
-			P50Ms            float64  `json:"p50_ms"`
-			P99Ms            float64  `json:"p99_ms"`
-			P99IndexMs       float64  `json:"p99_index_ms"`
-			P99EventMs       float64  `json:"p99_event_ms"`
-			EventsReturned   int      `json:"events_returned"`
-			EventsScanned    int      `json:"events_scanned"`
-			IndexMatches     int      `json:"index_matches"`
-			IndexBytes       int64    `json:"index_bytes"`
-			IndexBytesHR     string   `json:"index_bytes_human"`
-			EventBytes       int64    `json:"event_bytes"`
-			EventBytesHR     string   `json:"event_bytes_human"`
-			Iterations       int      `json:"iterations"`
-			SmallestListSize int      `json:"smallest_list_size,omitempty"`
-			LargestListSize  int      `json:"largest_list_size,omitempty"`
-			SkippedBuckets   int      `json:"skipped_buckets,omitempty"`
-			Error            string   `json:"error,omitempty"`
+			// Query identification
+			QueryName   string   `json:"query_name"`
+			ContractID  string   `json:"contract_id,omitempty"`
+			Topics      []string `json:"topics,omitempty"`
+			IndexType   string   `json:"index_type"`
+			StartLedger uint32   `json:"start_ledger"`
+			EndLedger   uint32   `json:"end_ledger"`
+
+			// Timing
+			P50Ms float64 `json:"p50_total_ms"`
+			P99Ms float64 `json:"p99_total_ms"`
+
+			// Index stats
+			P99IndexMs       float64 `json:"p99_idx_ms"`
+			IdxReadMs        float64 `json:"idx_read_ms"`
+			IdxDecodeMs      float64 `json:"idx_decode_ms"`
+			IndexMatches     int     `json:"index_matches"`
+			IndexBytes       string  `json:"index_bytes"`
+			SmallestListSize int     `json:"smallest_list_size,omitempty"`
+			LargestListSize  int     `json:"largest_list_size,omitempty"`
+
+			// Event stats
+			P99EventMs     float64 `json:"p99_evt_ms"`
+			EventsReturned int     `json:"events_returned"`
+			EventsScanned  int     `json:"events_scanned"`
+			EventBytes     string  `json:"event_bytes"`
+
+			// Test config
+			Iterations int    `json:"iterations"`
+			Error      string `json:"error,omitempty"`
 		}{
 			QueryName:        r.Query.Name,
 			ContractID:       r.Query.ContractID,
@@ -1077,24 +1071,20 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			IndexType:        r.IndexType,
 			StartLedger:      r.StartLedger,
 			EndLedger:        r.EndLedger,
-			AvgMs:            float64(r.AvgTime.Microseconds()) / 1000.0,
-			MinMs:            float64(r.MinTime.Microseconds()) / 1000.0,
-			MaxMs:            float64(r.MaxTime.Microseconds()) / 1000.0,
 			P50Ms:            float64(r.P50Time.Microseconds()) / 1000.0,
 			P99Ms:            float64(r.P99Time.Microseconds()) / 1000.0,
 			P99IndexMs:       float64(r.P99IndexTime.Microseconds()) / 1000.0,
+			IdxReadMs:        float64(r.P99IndexReadTime.Microseconds()) / 1000.0,
+			IdxDecodeMs:      float64(r.P99IndexDecodeTime.Microseconds()) / 1000.0,
+			IndexMatches:     r.IndexMatches,
+			IndexBytes:       formatBytes(r.IndexBytes),
+			SmallestListSize: r.SmallestListSize,
+			LargestListSize:  r.LargestListSize,
 			P99EventMs:       float64(r.P99EventTime.Microseconds()) / 1000.0,
 			EventsReturned:   r.EventsReturned,
 			EventsScanned:    r.EventsScanned,
-			IndexMatches:     r.IndexMatches,
-			IndexBytes:       r.IndexBytes,
-			IndexBytesHR:     formatBytes(r.IndexBytes),
-			EventBytes:       r.EventBytes,
-			EventBytesHR:     formatBytes(r.EventBytes),
+			EventBytes:       formatBytes(r.EventBytes),
 			Iterations:       r.Iterations,
-			SmallestListSize: r.SmallestListSize,
-			LargestListSize:  r.LargestListSize,
-			SkippedBuckets:   r.SkippedBuckets,
 			Error:            r.Error,
 		}
 		line, _ := json.Marshal(jr)
@@ -1113,28 +1103,27 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 				topics[i] = "-"
 			}
 		}
-		fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%s,%d,%d,%d,%d,%s\n",
+		fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%s,%d,%d,%.3f,%d,%d,%s,%d,%s\n",
 			r.Query.Name,
 			contractID,
-			topics[0],
-			topics[1],
-			topics[2],
-			topics[3],
+			topics[0], topics[1], topics[2], topics[3],
 			r.IndexType,
 			r.StartLedger,
 			r.EndLedger,
-			float64(r.AvgTime.Microseconds())/1000.0,
+			float64(r.P50Time.Microseconds())/1000.0,
 			float64(r.P99Time.Microseconds())/1000.0,
 			float64(r.P99IndexTime.Microseconds())/1000.0,
-			float64(r.P99EventTime.Microseconds())/1000.0,
-			r.EventsScanned,
+			float64(r.P99IndexReadTime.Microseconds())/1000.0,
+			float64(r.P99IndexDecodeTime.Microseconds())/1000.0,
 			r.IndexMatches,
 			formatBytes(r.IndexBytes),
-			formatBytes(r.EventBytes),
-			r.EventsReturned,
 			r.SmallestListSize,
 			r.LargestListSize,
-			r.SkippedBuckets,
+			float64(r.P99EventTime.Microseconds())/1000.0,
+			r.EventsReturned,
+			r.EventsScanned,
+			formatBytes(r.EventBytes),
+			r.Iterations,
 			r.Error,
 		)
 	}
