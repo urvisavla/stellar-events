@@ -2,6 +2,8 @@ package index
 
 import (
 	"fmt"
+	"sort"
+	"sync"
 
 	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/linxGnu/grocksdb"
@@ -117,9 +119,9 @@ func (s *EventRocksDBStore) AddTopicEvent(topic []byte, ledger uint32, tx, op, e
 
 // EventQueryResult holds the result of an event key query including stats.
 type EventQueryResult struct {
-	Bitmap     *roaring64.Bitmap
-	BytesRead  int64
-	Segments   int
+	Bitmap    *roaring64.Bitmap
+	BytesRead int64
+	Segments  int
 }
 
 // QueryEventKeys returns a Roaring64 bitmap of event keys matching the filter criteria.
@@ -174,6 +176,107 @@ func (s *EventRocksDBStore) QueryEventKeysWithStats(contractID []byte, topics []
 
 	// Intersect all bitmaps using FastAnd
 	result.Bitmap = roaring64.FastAnd(bitmaps...)
+	return result, nil
+}
+
+// QueryEventKeysParallel reads all bitmaps in parallel, then intersects smallest-first with early exit.
+func (s *EventRocksDBStore) QueryEventKeysParallel(contractID []byte, topics [][]byte, startLedger, endLedger uint32) (*EventQueryResult, error) {
+	result := &EventQueryResult{
+		Bitmap: roaring64.New(),
+	}
+
+	// Count lists to read
+	type querySpec struct {
+		prefix   byte
+		keyValue []byte
+	}
+	var specs []querySpec
+
+	if len(contractID) > 0 {
+		specs = append(specs, querySpec{PrefixEventContract, contractID})
+	}
+	for _, topic := range topics {
+		if len(topic) == 0 {
+			continue
+		}
+		specs = append(specs, querySpec{PrefixEventTopic, topic})
+	}
+
+	if len(specs) == 0 {
+		return result, nil
+	}
+
+	// Single filter — no parallelism needed
+	if len(specs) == 1 {
+		return s.QueryEventKeysWithStats(contractID, topics, startLedger, endLedger)
+	}
+
+	// Read all bitmaps in parallel
+	type bmResult struct {
+		bitmap    *roaring64.Bitmap
+		bytesRead int64
+		segments  int
+		err       error
+	}
+
+	results := make([]bmResult, len(specs))
+	var wg sync.WaitGroup
+
+	for i, spec := range specs {
+		wg.Add(1)
+		go func(idx int, s2 querySpec) {
+			defer wg.Done()
+			bm, bytesRead, segments, err := s.bitmap.QueryIndexWithStats(s2.prefix, s2.keyValue, startLedger, endLedger)
+			results[idx] = bmResult{bitmap: bm, bytesRead: bytesRead, segments: segments, err: err}
+		}(i, spec)
+	}
+	wg.Wait()
+
+	// Check errors, aggregate stats
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err
+		}
+		result.BytesRead += r.bytesRead
+		result.Segments += r.segments
+	}
+
+	// Collect non-nil bitmaps
+	type indexedBitmap struct {
+		bm   *roaring64.Bitmap
+		card uint64
+	}
+	var bitmaps []indexedBitmap
+	for _, r := range results {
+		if r.bitmap != nil {
+			bitmaps = append(bitmaps, indexedBitmap{bm: r.bitmap, card: r.bitmap.GetCardinality()})
+		}
+	}
+
+	if len(bitmaps) == 0 {
+		return result, nil
+	}
+
+	// Sort smallest first
+	sort.Slice(bitmaps, func(i, j int) bool {
+		return bitmaps[i].card < bitmaps[j].card
+	})
+
+	// Early exit if smallest is empty
+	if bitmaps[0].card == 0 {
+		return result, nil
+	}
+
+	// Progressive intersection with early exit
+	acc := bitmaps[0].bm
+	for _, ib := range bitmaps[1:] {
+		acc.And(ib.bm)
+		if acc.IsEmpty() {
+			return result, nil
+		}
+	}
+
+	result.Bitmap = acc
 	return result, nil
 }
 

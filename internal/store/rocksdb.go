@@ -276,8 +276,9 @@ type RocksDBEventStore struct {
 	// Keep merge operator alive to prevent GC (RocksDB holds a reference)
 	mergeOp grocksdb.MergeOperator
 
-	// Multi-filter optimization toggle (for A/B benchmarking)
+	// Multi-filter optimization toggles (for A/B benchmarking)
 	ParallelPostingReads bool // When true, use parallel reads + smallest-first intersection
+	ParallelBitmap64     bool // When true, use parallel bitmap64 reads + smallest-first intersection
 
 	// In-memory posting list accumulation (for efficient batch writes)
 	postingsMu sync.Mutex
@@ -3739,7 +3740,13 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap64(contractID []byte, topics [
 
 	// Query the 64-bit bitmap index (non-positional topic matching)
 	indexStart := time.Now()
-	queryResult, err := es.eventIndexStore.QueryEventKeysWithStats(contractID, topics, startLedger, endLedger)
+	var queryResult *index.EventQueryResult
+	var err error
+	if es.ParallelBitmap64 {
+		queryResult, err = es.eventIndexStore.QueryEventKeysParallel(contractID, topics, startLedger, endLedger)
+	} else {
+		queryResult, err = es.eventIndexStore.QueryEventKeysWithStats(contractID, topics, startLedger, endLedger)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("64-bit bitmap query failed: %w", err)
 	}
