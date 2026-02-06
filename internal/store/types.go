@@ -32,9 +32,10 @@ type IngestEvent struct {
 // StoreOptions configures what indexes to update when storing events.
 type StoreOptions struct {
 	UniqueIndexes      bool // Maintain unique value indexes with counts
-	BitmapIndexes      bool // Maintain 32-bit roaring bitmap indexes (ledger-level)
-	Bitmap64Indexes    bool // Maintain 64-bit roaring bitmap indexes (event-level)
-	PostingListIndexes bool // Maintain posting list indexes for contracts and topics
+	BitmapIndexes      bool // Maintain 32-bit roaring bitmap indexes (ledger-level, V1)
+	Bitmap64Indexes    bool // Maintain 64-bit roaring bitmap indexes (event-level, V1)
+	PostingListIndexes bool // Maintain posting list indexes for contracts and topics (V1)
+	V2Indexes          bool // Maintain V2 indexes: bitmap32-event + posting-v2 (uses 6-byte event keys)
 
 	// ExcludeTopic0 is a set of topic0 values (as strings) to skip during ingestion.
 	// Events with matching topic0 will not be stored.
@@ -322,6 +323,55 @@ func (r *Bitmap64QueryResult) ToUnified() *UnifiedQueryResult {
 }
 
 // =============================================================================
+// Bitmap32 Event-Level Query Result (FromBuffer decode)
+// =============================================================================
+
+// Bitmap32EventQueryResult holds detailed results from a bitmap32 event-level query.
+// Uses sequential event IDs + FromBuffer for near-zero-cost decode.
+type Bitmap32EventQueryResult struct {
+	// Ledger range
+	LedgerRange      uint32 // endLedger - startLedger + 1
+	MatchingLocalIDs int    // Local IDs matching index query
+
+	// Index stats
+	SegmentsScanned int   // Number of segments scanned
+	IndexBytesRead  int64 // Bytes read from bitmap index
+
+	// Event fetch stats
+	EventsScanned  int   // Events scanned from storage
+	EventsReturned int   // Events returned after filtering
+	EventBytesRead int64 // Bytes read from event storage
+
+	// Timing breakdown
+	IndexLookupTime time.Duration // Time querying bitmap index
+	IndexReadTime   time.Duration // Time reading bitmap segments from storage (I/O)
+	IndexDecodeTime time.Duration // Time decoding bitmap segments (CPU - near zero with FromBuffer)
+	EventFetchTime  time.Duration // Time fetching events
+	DecodeTime      time.Duration // Time decoding events
+	FilterTime      time.Duration // Time filtering events
+	TotalTime       time.Duration // Total query time
+}
+
+// ToUnified converts Bitmap32EventQueryResult to UnifiedQueryResult
+func (r *Bitmap32EventQueryResult) ToUnified() *UnifiedQueryResult {
+	return &UnifiedQueryResult{
+		IndexType:       "bitmap32-event",
+		LedgerRange:     r.LedgerRange,
+		IndexMatches:    r.MatchingLocalIDs,
+		MatchUnitName:   "local IDs",
+		EventsScanned:   r.EventsScanned,
+		EventsReturned:  r.EventsReturned,
+		IndexBytesRead:  r.IndexBytesRead,
+		EventBytesRead:  r.EventBytesRead,
+		IndexLookupTime: r.IndexLookupTime,
+		EventFetchTime:  r.EventFetchTime,
+		DecodeTime:      r.DecodeTime,
+		FilterTime:      r.FilterTime,
+		TotalTime:       r.TotalTime,
+	}
+}
+
+// =============================================================================
 // Posting List Query Result
 // =============================================================================
 
@@ -379,6 +429,58 @@ func (r *PostingListQueryResult) ToUnified() *UnifiedQueryResult {
 		IndexBytesRead:  r.PostingListBytes,
 		EventBytesRead:  r.EventBytesRead,
 		IndexLookupTime: r.PostingListTime + r.IntersectTime, // Include intersect time in index lookup
+		EventFetchTime:  r.EventFetchTime,
+		DecodeTime:      r.DecodeTime,
+		FilterTime:      r.FilterTime,
+		TotalTime:       r.TotalTime,
+	}
+}
+
+// =============================================================================
+// Posting List V2 Query Result (32-bit Local IDs)
+// =============================================================================
+
+// PostingListV2QueryResult holds detailed results from a V2 posting list query.
+// V2 uses 32-bit local IDs (same format as bitmap32) instead of 64-bit TOIDs.
+type PostingListV2QueryResult struct {
+	// Ledger range
+	LedgerRange uint32 // endLedger - startLedger + 1
+
+	// Posting list stats
+	BucketsScanned         int   // Number of bucket ranges scanned
+	PostingListsRead       int   // Number of posting list keys read
+	PostingListBytes       int64 // Total bytes read from posting lists
+	LocalIDsInPostingList  int   // Total local IDs in posting lists
+	LocalIDsAfterIntersect int   // Local IDs after intersection
+
+	// Event fetch stats
+	EventsScanned  int   // Events scanned from storage
+	EventsReturned int   // Events returned after filtering
+	EventBytesRead int64 // Bytes read from event storage
+
+	// Timing breakdown
+	PostingListTime       time.Duration // Time reading posting lists (total)
+	PostingListReadTime   time.Duration // I/O: time in RocksDB GetCF
+	PostingListDecodeTime time.Duration // CPU: time in DecodeLocalIDListDeltaVarint
+	IntersectTime         time.Duration // Time intersecting local ID lists
+	EventFetchTime        time.Duration // Time fetching events
+	DecodeTime            time.Duration // Time decoding events
+	FilterTime            time.Duration // Time filtering events
+	TotalTime             time.Duration // Total query time
+}
+
+// ToUnified converts PostingListV2QueryResult to UnifiedQueryResult
+func (r *PostingListV2QueryResult) ToUnified() *UnifiedQueryResult {
+	return &UnifiedQueryResult{
+		IndexType:       "posting-v2",
+		LedgerRange:     r.LedgerRange,
+		IndexMatches:    r.LocalIDsAfterIntersect,
+		MatchUnitName:   "local IDs",
+		EventsScanned:   r.EventsScanned,
+		EventsReturned:  r.EventsReturned,
+		IndexBytesRead:  r.PostingListBytes,
+		EventBytesRead:  r.EventBytesRead,
+		IndexLookupTime: r.PostingListTime + r.IntersectTime,
 		EventFetchTime:  r.EventFetchTime,
 		DecodeTime:      r.DecodeTime,
 		FilterTime:      r.FilterTime,

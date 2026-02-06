@@ -380,3 +380,10 @@ func DecodeBinaryToQueryEvent(data []byte, ledger uint32, tx, op uint32, eventId
 
 	return event, nil
 }
+
+// DecodeBinaryToQueryEventV2 converts binary format to query.Event using V2 key format.
+// With V2 keys, TransactionIndex and OperationIndex are not available (set to 0).
+// EventIndex is set to the eventSeq from the V2 key.
+func DecodeBinaryToQueryEventV2(data []byte, ledger uint32, eventSeq uint16) (*query.Event, error) {
+	return DecodeBinaryToQueryEvent(data, ledger, 0, 0, eventSeq)
+}

@@ -87,10 +87,14 @@ type IngestionConfig struct {
 	ComputeStats    bool `toml:"compute_stats"`    // Compute event stats after ingestion (default: false)
 
 	// Index maintenance during ingestion
-	BitmapIndexes      bool `toml:"bitmap_indexes"`        // Maintain 32-bit bitmap indexes (ledger-level, default: true)
-	Bitmap64Indexes    bool `toml:"bitmap64_indexes"`      // Maintain 64-bit bitmap indexes (event-level, default: false)
-	PostingListIndexes bool `toml:"posting_list_indexes"`  // Maintain posting list indexes (default: false)
-	UniqueIndexes      bool `toml:"unique_indexes"`        // Maintain unique value counts (default: false)
+	// V1 indexes (use 10-byte TOID-based event keys)
+	BitmapIndexes      bool `toml:"bitmap_indexes"`       // Maintain 32-bit bitmap indexes (ledger-level, default: true)
+	Bitmap64Indexes    bool `toml:"bitmap64_indexes"`     // Maintain 64-bit bitmap indexes (event-level, default: false)
+	PostingListIndexes bool `toml:"posting_list_indexes"` // Maintain posting list indexes (default: false)
+	UniqueIndexes      bool `toml:"unique_indexes"`       // Maintain unique value counts (default: false)
+
+	// V2 indexes (use 6-byte sequential event keys) - mutually exclusive with V1 indexes
+	V2Indexes bool `toml:"v2_indexes"` // Maintain V2 indexes: bitmap32-event + posting-v2 (default: false)
 
 	// Index flush interval (applies to both bitmap and posting list indexes)
 	IndexFlushInterval int `toml:"index_flush_interval"` // Ledgers between index flushes (default: 10000)
@@ -169,6 +173,7 @@ func DefaultConfig() *Config {
 			Bitmap64Indexes:    false, // Disabled by default (larger index)
 			PostingListIndexes: false,
 			UniqueIndexes:      false,
+			V2Indexes:          false, // Disabled by default (mutually exclusive with V1)
 			IndexFlushInterval: 10000, // Flush indexes every 10K ledgers
 			Workers:            0,     // 0 = NumCPU
 			BatchSize:          100,
@@ -226,6 +231,14 @@ func (c *Config) Validate() error {
 	// Validate event format
 	if c.Storage.EventFormat != "" && c.Storage.EventFormat != "xdr" && c.Storage.EventFormat != "binary" {
 		return fmt.Errorf("storage.event_format must be 'xdr' or 'binary', got '%s'", c.Storage.EventFormat)
+	}
+
+	// V1 and V2 indexes are mutually exclusive (different event key formats)
+	if c.Ingestion.V2Indexes {
+		v1Enabled := c.Ingestion.BitmapIndexes || c.Ingestion.Bitmap64Indexes || c.Ingestion.PostingListIndexes
+		if v1Enabled {
+			return fmt.Errorf("v2_indexes cannot be enabled with V1 indexes (bitmap_indexes, bitmap64_indexes, posting_list_indexes); they use incompatible event key formats")
+		}
 	}
 
 	return nil

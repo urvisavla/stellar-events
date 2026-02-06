@@ -36,6 +36,14 @@ const (
 	// 64-bit bitmap indexes (event-level)
 	CFContractsBM64 = "contracts_bm64" // Contract ID event bitmap index
 	CFTopicsBM64    = "topics_bm64"    // Topic event bitmap index
+
+	// 32-bit bitmap indexes (event-level, FromBuffer decode)
+	CFContractsBM32 = "contracts_bm32" // Contract ID bitmap32 index
+	CFTopicsBM32    = "topics_bm32"    // Topic bitmap32 index
+
+	// V2 posting list indexes (32-bit local IDs)
+	CFContractsPLV2 = "contracts_plv2" // Contract ID V2 posting lists
+	CFTopicsPLV2    = "topics_plv2"    // Topic V2 posting lists
 )
 
 // Unique index type prefixes within CFUnique
@@ -138,6 +146,54 @@ func (m *postingListMergeOperator) PartialMerge(key, leftOperand, rightOperand [
 
 	merged := index.UnionTOIDLists(left, right)
 	return index.EncodeTOIDListDeltaVarint(merged), true
+}
+
+// postingListV2MergeOperator implements a merge operator for delta-varint encoded local ID lists.
+// Same as postingListMergeOperator but decodes/encodes uint32 local IDs.
+type postingListV2MergeOperator struct{}
+
+func (m *postingListV2MergeOperator) Name() string {
+	return "posting-list-v2-delta-varint"
+}
+
+func (m *postingListV2MergeOperator) FullMerge(key, existingValue []byte, operands [][]byte) ([]byte, bool) {
+	var result []uint32
+	if len(existingValue) > 0 {
+		result = index.DecodeLocalIDListDeltaVarint(existingValue)
+	}
+
+	for _, operand := range operands {
+		if len(operand) == 0 {
+			continue
+		}
+		newIDs := index.DecodeLocalIDListDeltaVarint(operand)
+		if len(result) == 0 {
+			result = newIDs
+		} else {
+			result = index.UnionLocalIDLists(result, newIDs)
+		}
+	}
+
+	if len(result) == 0 {
+		return nil, true
+	}
+
+	return index.EncodeLocalIDListDeltaVarint(result), true
+}
+
+func (m *postingListV2MergeOperator) PartialMerge(key, leftOperand, rightOperand []byte) ([]byte, bool) {
+	left := index.DecodeLocalIDListDeltaVarint(leftOperand)
+	right := index.DecodeLocalIDListDeltaVarint(rightOperand)
+
+	if len(left) == 0 {
+		return rightOperand, true
+	}
+	if len(right) == 0 {
+		return leftOperand, true
+	}
+
+	merged := index.UnionLocalIDLists(left, right)
+	return index.EncodeLocalIDListDeltaVarint(merged), true
 }
 
 // eventKey generates a 10-byte binary key for events using TOID format.
@@ -262,11 +318,25 @@ type RocksDBEventStore struct {
 	cfContractsBM64 *grocksdb.ColumnFamilyHandle // Contract ID event bitmap
 	cfTopicsBM64    *grocksdb.ColumnFamilyHandle // Topic event bitmap
 
+	// 32-bit bitmap index CFs (event-level, FromBuffer decode)
+	cfContractsBM32 *grocksdb.ColumnFamilyHandle // Contract ID bitmap32 index
+	cfTopicsBM32    *grocksdb.ColumnFamilyHandle // Topic bitmap32 index
+
+	// V2 posting list index CFs (32-bit local IDs)
+	cfContractsPLV2 *grocksdb.ColumnFamilyHandle // Contract ID V2 posting lists
+	cfTopicsPLV2    *grocksdb.ColumnFamilyHandle // Topic V2 posting lists
+
 	// Index store (manages bitmap indexes with RocksDB persistence)
 	indexStore *index.RocksDBStore
 
 	// Event-level bitmap index (64-bit, for exact event matching)
 	eventIndexStore *index.EventRocksDBStore
+
+	// Event-level bitmap32 index (32-bit, FromBuffer decode)
+	eventIndex32Store *index.EventRocksDB32Store
+
+	// true when bitmap32 mode is active (use V2 event keys)
+	useEventKeyV2 bool
 
 	// Options that need to be destroyed on Close
 	baseOpts *grocksdb.Options
@@ -284,6 +354,10 @@ type RocksDBEventStore struct {
 	contractPostings  map[string][]byte // index key -> accumulated TOIDs
 	topicPostings     map[string][]byte // index key -> accumulated TOIDs
 	postingsLedgerCnt int               // ledgers accumulated since last flush
+
+	// V2 posting list accumulation (32-bit local IDs)
+	contractPostingsV2 map[string][]byte // index key -> accumulated 4-byte local IDs
+	topicPostingsV2    map[string][]byte // index key -> accumulated 4-byte local IDs
 }
 
 // NewEventStore creates a new event store with RocksDB backend
@@ -366,23 +440,51 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 	contractsBM64Opts, contractsBM64BBTO := createBitmapCFOpts()
 	topicsBM64Opts, topicsBM64BBTO := createBitmapCFOpts()
 
+	// 32-bit bitmap CFs (event-level, FromBuffer decode)
+	contractsBM32Opts, contractsBM32BBTO := createBitmapCFOpts()
+	topicsBM32Opts, topicsBM32BBTO := createBitmapCFOpts()
+
+	// Helper to create V2 posting list CF options (with V2 merge operator)
+	createPostingListV2CFOpts := func() (*grocksdb.Options, *grocksdb.BlockBasedTableOptions) {
+		opts := grocksdb.NewDefaultOptions()
+		applyRocksDBOptions(opts, rocksOpts)
+		opts.SetMergeOperator(&postingListV2MergeOperator{})
+		bbto := grocksdb.NewDefaultBlockBasedTableOptions()
+		bbto.SetBlockSize(16 * 1024)
+		if rocksOpts != nil && rocksOpts.BloomFilterBitsPerKey > 0 {
+			bbto.SetFilterPolicy(grocksdb.NewBloomFilter(float64(rocksOpts.BloomFilterBitsPerKey)))
+		}
+		opts.SetBlockBasedTableFactory(bbto)
+		return opts, bbto
+	}
+
+	// V2 posting list CFs (32-bit local IDs)
+	contractsPLV2Opts, contractsPLV2BBTO := createPostingListV2CFOpts()
+	topicsPLV2Opts, topicsPLV2BBTO := createPostingListV2CFOpts()
+
 	cfNames := []string{
 		CFDefault, CFEvents, CFUnique,
 		CFContractsPL, CFTopicsPL,
 		CFContractsBM, CFTopicsBM,
 		CFContractsBM64, CFTopicsBM64,
+		CFContractsBM32, CFTopicsBM32,
+		CFContractsPLV2, CFTopicsPLV2,
 	}
 	cfOpts := []*grocksdb.Options{
 		defaultOpts, eventsOpts, uniqueOpts,
 		contractsPLOpts, topicsPLOpts,
 		contractsBMOpts, topicsBMOpts,
 		contractsBM64Opts, topicsBM64Opts,
+		contractsBM32Opts, topicsBM32Opts,
+		contractsPLV2Opts, topicsPLV2Opts,
 	}
 	bbtoList := []*grocksdb.BlockBasedTableOptions{
 		eventsBBTO, uniqueBBTO,
 		contractsPLBBTO, topicsPLBBTO,
 		contractsBMBBTO, topicsBMBBTO,
 		contractsBM64BBTO, topicsBM64BBTO,
+		contractsBM32BBTO, topicsBM32BBTO,
+		contractsPLV2BBTO, topicsPLV2BBTO,
 	}
 
 	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(baseOpts, dbPath, cfNames, cfOpts)
@@ -440,6 +542,24 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 		return nil, fmt.Errorf("failed to create event index store: %w", err)
 	}
 
+	// Create event-level bitmap32 index store (32-bit, FromBuffer decode)
+	// cfHandles[9] = contracts_bm32, cfHandles[10] = topics_bm32
+	eventIndex32Store, err := index.NewEventRocksDB32Store(db, cfHandles[9], cfHandles[10])
+	if err != nil {
+		eventIndexStore.Close()
+		indexStore.Close()
+		db.Close()
+		for _, opt := range cfOpts {
+			opt.Destroy()
+		}
+		for _, bbto := range bbtoList {
+			bbto.Destroy()
+		}
+		baseOpts.Destroy()
+		wo.Destroy()
+		return nil, fmt.Errorf("failed to create event bitmap32 index store: %w", err)
+	}
+
 	return &RocksDBEventStore{
 		db:               db,
 		dbPath:           dbPath,
@@ -457,14 +577,21 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 		cfTopicsBM:       cfHandles[6],
 		cfContractsBM64:  cfHandles[7],
 		cfTopicsBM64:     cfHandles[8],
+		cfContractsBM32:  cfHandles[9],
+		cfTopicsBM32:     cfHandles[10],
+		cfContractsPLV2:  cfHandles[11],
+		cfTopicsPLV2:     cfHandles[12],
 		indexStore:       indexStore,
 		eventIndexStore:  eventIndexStore,
+		eventIndex32Store: eventIndex32Store,
 		baseOpts:         baseOpts,
 		cfOpts:           cfOpts,
 		bbtoList:         bbtoList,
 		mergeOp:          mergeOp,
-		contractPostings: make(map[string][]byte),
-		topicPostings:    make(map[string][]byte),
+		contractPostings:   make(map[string][]byte),
+		topicPostings:      make(map[string][]byte),
+		contractPostingsV2: make(map[string][]byte),
+		topicPostingsV2:    make(map[string][]byte),
 	}, nil
 }
 
@@ -549,6 +676,9 @@ func (es *RocksDBEventStore) Close() {
 	if es.eventIndexStore != nil {
 		es.eventIndexStore.Close()
 	}
+	if es.eventIndex32Store != nil {
+		es.eventIndex32Store.Close()
+	}
 
 	// Destroy read/write options first
 	es.wo.Destroy()
@@ -585,15 +715,25 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 	// Get bitmap indexes once outside the loop (avoid per-event method call overhead)
 	var bitmapIdx *index.BitmapIndex
 	var eventBitmapIdx *index.EventBitmapIndex
+	var eventBitmap32Idx *index.EventBitmap32Index
 	if opts.BitmapIndexes && es.indexStore != nil {
 		bitmapIdx = es.indexStore.GetBitmapIndex()
 	}
 	if opts.Bitmap64Indexes && es.eventIndexStore != nil {
 		eventBitmapIdx = es.eventIndexStore.GetEventBitmapIndex()
 	}
+	if opts.V2Indexes && es.eventIndex32Store != nil {
+		eventBitmap32Idx = es.eventIndex32Store.GetEventBitmap32Index()
+	}
+
+	// Track event sequence counters per ledger for bitmap32 V2 keys
+	var eventSeqCounters map[uint32]uint16
+	if opts.V2Indexes {
+		eventSeqCounters = make(map[uint32]uint16)
+	}
 
 	// Lock posting list maps if we'll be updating them
-	if opts.PostingListIndexes {
+	if opts.PostingListIndexes || opts.V2Indexes {
 		es.postingsMu.Lock()
 		defer es.postingsMu.Unlock()
 	}
@@ -612,7 +752,16 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 			}
 		}
 
-		key := eventKey(event)
+		// Use V2 key format when bitmap32 mode is active
+		var key []byte
+		var eventSeq uint16
+		if opts.V2Indexes {
+			eventSeq = eventSeqCounters[event.LedgerSequence]
+			key = index.EncodeEventKeyV2(event.LedgerSequence, eventSeq)
+			eventSeqCounters[event.LedgerSequence] = eventSeq + 1
+		} else {
+			key = eventKey(event)
+		}
 
 		// Encode event based on configured format
 		var value []byte
@@ -654,6 +803,19 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 			}
 		}
 
+		// Update 32-bit event-level bitmap indexes (FromBuffer decode)
+		if eventBitmap32Idx != nil {
+			// Index contract ID -> local ID (32-bit)
+			if len(event.ContractID) > 0 {
+				eventBitmap32Idx.AddContractEvent(event.ContractID, event.LedgerSequence, eventSeq)
+			}
+
+			// Index topics -> local ID (32-bit, non-positional)
+			for _, topicBytes := range event.Topics {
+				eventBitmap32Idx.AddTopicEvent(topicBytes, event.LedgerSequence, eventSeq)
+			}
+		}
+
 		// Accumulate posting list TOIDs in memory (flushed periodically)
 		if opts.PostingListIndexes {
 			// Compute TOID for this event
@@ -673,6 +835,26 @@ func (es *RocksDBEventStore) StoreEvents(events []*IngestEvent, opts *StoreOptio
 				termKey := index.TopicTermKey(topicBytes)
 				indexKey := string(index.EncodeIndexKey(termKey, event.LedgerSequence))
 				es.topicPostings[indexKey] = append(es.topicPostings[indexKey], toidBytes...)
+			}
+		}
+
+		// Accumulate V2 posting list local IDs when bitmap32 mode is active
+		if opts.V2Indexes {
+			bucketStart := index.BucketID(event.LedgerSequence) * index.BucketSize
+			localID := index.EncodeLocalIDForBucket(event.LedgerSequence, eventSeq, bucketStart)
+			localIDBytes := make([]byte, 4)
+			binary.BigEndian.PutUint32(localIDBytes, localID)
+
+			if len(event.ContractID) > 0 {
+				termKey := index.ContractTermKey(event.ContractID)
+				indexKey := string(index.EncodeIndexKey(termKey, event.LedgerSequence))
+				es.contractPostingsV2[indexKey] = append(es.contractPostingsV2[indexKey], localIDBytes...)
+			}
+
+			for _, topicBytes := range event.Topics {
+				termKey := index.TopicTermKey(topicBytes)
+				indexKey := string(index.EncodeIndexKey(termKey, event.LedgerSequence))
+				es.topicPostingsV2[indexKey] = append(es.topicPostingsV2[indexKey], localIDBytes...)
 			}
 		}
 
@@ -742,6 +924,12 @@ func (es *RocksDBEventStore) FlushBitmapIndexes() error {
 			return fmt.Errorf("failed to flush event-level bitmap: %w", err)
 		}
 	}
+	// Flush 32-bit event-level bitmap (FromBuffer)
+	if es.eventIndex32Store != nil {
+		if err := es.eventIndex32Store.Flush(); err != nil {
+			return fmt.Errorf("failed to flush event-level bitmap32: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -794,6 +982,76 @@ func (es *RocksDBEventStore) FlushPostingListIndexes() (int, int, error) {
 	es.postingsLedgerCnt = 0
 
 	return contractKeys, topicKeys, nil
+}
+
+// FlushPostingListV2Indexes flushes accumulated V2 posting list entries (32-bit local IDs) to disk.
+// Returns the number of contract and topic keys flushed.
+func (es *RocksDBEventStore) FlushPostingListV2Indexes() (int, int, error) {
+	es.postingsMu.Lock()
+	defer es.postingsMu.Unlock()
+
+	if len(es.contractPostingsV2) == 0 && len(es.topicPostingsV2) == 0 {
+		return 0, 0, nil
+	}
+
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+
+	contractKeys := 0
+	topicKeys := 0
+
+	// Write all accumulated contract postings V2 (convert raw local IDs to delta-varint)
+	for keyStr, rawLocalIDs := range es.contractPostingsV2 {
+		localIDs := decodeRawLocalIDs(rawLocalIDs)
+		localIDs = deduplicateLocalIDs(localIDs)
+		encoded := index.EncodeLocalIDListDeltaVarint(localIDs)
+		batch.MergeCF(es.cfContractsPLV2, []byte(keyStr), encoded)
+		contractKeys++
+	}
+
+	// Write all accumulated topic postings V2 (convert raw local IDs to delta-varint)
+	for keyStr, rawLocalIDs := range es.topicPostingsV2 {
+		localIDs := decodeRawLocalIDs(rawLocalIDs)
+		localIDs = deduplicateLocalIDs(localIDs)
+		encoded := index.EncodeLocalIDListDeltaVarint(localIDs)
+		batch.MergeCF(es.cfTopicsPLV2, []byte(keyStr), encoded)
+		topicKeys++
+	}
+
+	if err := es.db.Write(es.wo, batch); err != nil {
+		return 0, 0, fmt.Errorf("failed to flush V2 posting list indexes: %w", err)
+	}
+
+	// Clear the maps
+	es.contractPostingsV2 = make(map[string][]byte)
+	es.topicPostingsV2 = make(map[string][]byte)
+
+	return contractKeys, topicKeys, nil
+}
+
+// decodeRawLocalIDs decodes raw 4-byte big-endian local IDs to a uint32 slice.
+func decodeRawLocalIDs(data []byte) []uint32 {
+	count := len(data) / 4
+	ids := make([]uint32, count)
+	for i := 0; i < count; i++ {
+		ids[i] = binary.BigEndian.Uint32(data[i*4:])
+	}
+	return ids
+}
+
+// deduplicateLocalIDs removes consecutive duplicate local IDs from a sorted slice.
+func deduplicateLocalIDs(ids []uint32) []uint32 {
+	if len(ids) <= 1 {
+		return ids
+	}
+	writeIdx := 1
+	for readIdx := 1; readIdx < len(ids); readIdx++ {
+		if ids[readIdx] != ids[readIdx-1] {
+			ids[writeIdx] = ids[readIdx]
+			writeIdx++
+		}
+	}
+	return ids[:writeIdx]
 }
 
 // deduplicateTOIDs removes consecutive duplicate TOIDs from a sorted slice.
@@ -1223,6 +1481,7 @@ func (es *RocksDBEventStore) GetStorageSnapshot() (*StorageSnapshot, error) {
 		CFContractsPL, CFTopicsPL,
 		CFContractsBM, CFTopicsBM,
 		CFContractsBM64, CFTopicsBM64,
+		CFContractsBM32, CFTopicsBM32,
 	}
 
 	// Helper to parse uint64 from RocksDB property string
@@ -3686,6 +3945,427 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap(contractID []byte, topics [][
 }
 
 // =============================================================================
+// V2 Posting List Query (32-bit Local IDs)
+// =============================================================================
+
+// postingListV2Result holds the result of reading a single V2 posting list.
+type postingListV2Result struct {
+	localIDs   []uint32
+	buckets    int
+	bytesRead  int64
+	readTime   time.Duration
+	decodeTime time.Duration
+	err        error
+	isContract bool
+}
+
+// QueryEventsWithPostingListV2Timing queries events using V2 posting lists (32-bit local IDs).
+// Uses point gets with V2 event keys instead of TOID-based range scans.
+// Supports parallel reads, guided intersection (smallest-first), and streaming for single-filter queries.
+// Requires data ingested with V2Indexes: true (V2 event keys in cfEvents).
+func (es *RocksDBEventStore) QueryEventsWithPostingListV2Timing(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int) (*PostingListV2QueryResult, []*query.Event, error) {
+	totalStart := time.Now()
+	result := &PostingListV2QueryResult{
+		LedgerRange: endLedger - startLedger + 1,
+	}
+
+	hasContract := len(contractID) > 0
+	hasTopics := len(topics) > 0
+	multiFilter := hasContract && hasTopics
+
+	if !hasContract && !hasTopics {
+		result.TotalTime = time.Since(totalStart)
+		return result, nil, nil
+	}
+
+	// For single filter queries with limit, use streaming approach
+	if !multiFilter && limit > 0 {
+		return es.queryPostingListV2Streaming(contractID, topics, startLedger, endLedger, limit, result, totalStart)
+	}
+
+	// Multi-filter: use parallel reads + guided intersection
+	buckets := index.GetBucketsForRange(startLedger, endLedger)
+
+	plStart := time.Now()
+
+	// Parallel read all posting lists
+	plResults := es.queryPostingListsV2Parallel(contractID, topics, buckets, startLedger, endLedger)
+
+	// Check for errors and aggregate stats
+	for _, plr := range plResults {
+		if plr.err != nil {
+			return nil, nil, plr.err
+		}
+		result.BucketsScanned += plr.buckets
+		result.PostingListsRead++
+		result.PostingListBytes += plr.bytesRead
+		result.PostingListReadTime += plr.readTime
+		result.PostingListDecodeTime += plr.decodeTime
+		result.LocalIDsInPostingList += len(plr.localIDs)
+	}
+
+	// Sort by size ascending (smallest first for efficient intersection)
+	sort.Slice(plResults, func(a, b int) bool {
+		return len(plResults[a].localIDs) < len(plResults[b].localIDs)
+	})
+
+	// Intersect progressively (guided by smallest list)
+	var resultLocalIDs []uint32
+	for i, plr := range plResults {
+		if i == 0 {
+			resultLocalIDs = plr.localIDs
+		} else {
+			intersectStart := time.Now()
+			resultLocalIDs = index.IntersectLocalIDLists(resultLocalIDs, plr.localIDs)
+			result.IntersectTime += time.Since(intersectStart)
+		}
+		if len(resultLocalIDs) == 0 {
+			result.PostingListTime = time.Since(plStart) - result.IntersectTime
+			result.TotalTime = time.Since(totalStart)
+			return result, nil, nil
+		}
+	}
+
+	result.PostingListTime = time.Since(plStart) - result.IntersectTime
+	result.LocalIDsAfterIntersect = len(resultLocalIDs)
+
+	// Fetch events using point gets
+	events, fetchTime, decodeTime, filterTime, bytesRead, scanned := es.fetchEventsByLocalIDsV2(
+		resultLocalIDs, buckets, startLedger, endLedger, limit, contractID, topics)
+
+	result.EventFetchTime = fetchTime
+	result.DecodeTime = decodeTime
+	result.FilterTime = filterTime
+	result.EventBytesRead = bytesRead
+	result.EventsScanned = scanned
+	result.EventsReturned = len(events)
+	result.TotalTime = time.Since(totalStart)
+
+	return result, events, nil
+}
+
+// queryPostingListsV2Parallel reads all V2 posting lists in parallel.
+func (es *RocksDBEventStore) queryPostingListsV2Parallel(contractID []byte, topics [][]byte, buckets []uint32, startLedger, endLedger uint32) []postingListV2Result {
+	// Count how many posting lists to read
+	numLists := 0
+	if len(contractID) > 0 {
+		numLists++
+	}
+	for _, t := range topics {
+		if len(t) > 0 {
+			numLists++
+		}
+	}
+
+	results := make([]postingListV2Result, numLists)
+	var wg sync.WaitGroup
+
+	idx := 0
+
+	// Read contract posting list
+	if len(contractID) > 0 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			termKey := index.ContractTermKey(contractID)
+			ids, bucketsRead, bytesRead, readT, decodeT, err := es.queryPostingListV2WithStats(es.cfContractsPLV2, termKey, buckets, startLedger, endLedger)
+			results[i] = postingListV2Result{
+				localIDs:   ids,
+				buckets:    bucketsRead,
+				bytesRead:  bytesRead,
+				readTime:   readT,
+				decodeTime: decodeT,
+				err:        err,
+				isContract: true,
+			}
+		}(idx)
+		idx++
+	}
+
+	// Read topic posting lists
+	for _, topicXDR := range topics {
+		if len(topicXDR) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, topic []byte) {
+			defer wg.Done()
+			termKey := index.TopicTermKey(topic)
+			ids, bucketsRead, bytesRead, readT, decodeT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
+			results[i] = postingListV2Result{
+				localIDs:   ids,
+				buckets:    bucketsRead,
+				bytesRead:  bytesRead,
+				readTime:   readT,
+				decodeTime: decodeT,
+				err:        err,
+				isContract: false,
+			}
+		}(idx, topicXDR)
+		idx++
+	}
+
+	wg.Wait()
+	return results
+}
+
+// queryPostingListV2Streaming reads posting lists bucket-by-bucket and fetches events incrementally.
+// Stops early when limit is reached.
+func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int, result *PostingListV2QueryResult, totalStart time.Time) (*PostingListV2QueryResult, []*query.Event, error) {
+	buckets := index.GetBucketsForRange(startLedger, endLedger)
+
+	// Determine which CF and term key to use
+	var cf *grocksdb.ColumnFamilyHandle
+	var termKey [32]byte
+
+	if len(contractID) > 0 {
+		cf = es.cfContractsPLV2
+		termKey = index.ContractTermKey(contractID)
+	} else if len(topics) > 0 && len(topics[0]) > 0 {
+		cf = es.cfTopicsPLV2
+		termKey = index.TopicTermKey(topics[0])
+	} else {
+		result.TotalTime = time.Since(totalStart)
+		return result, nil, nil
+	}
+
+	var allEvents []*query.Event
+	var plTime, plReadTime, plDecodeTime time.Duration
+	var fetchTime, decodeTime, filterTime time.Duration
+
+	for _, bucketID := range buckets {
+		if len(allEvents) >= limit {
+			break
+		}
+
+		bucketStart := bucketID * index.BucketSize
+
+		// Read this bucket's posting list
+		plStart := time.Now()
+		indexKey := index.EncodeIndexKeyWithBucket(termKey, bucketID)
+
+		t0 := time.Now()
+		value, err := es.db.GetCF(es.ro, cf, indexKey)
+		plReadTime += time.Since(t0)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read V2 posting list: %w", err)
+		}
+
+		if !value.Exists() {
+			value.Free()
+			result.BucketsScanned++
+			continue
+		}
+
+		data := value.Data()
+		result.PostingListBytes += int64(len(data))
+		result.BucketsScanned++
+		result.PostingListsRead++
+
+		// Copy data since we need to free value
+		dataCopy := make([]byte, len(data))
+		copy(dataCopy, data)
+		value.Free()
+
+		// Decode local IDs
+		t1 := time.Now()
+		localIDs := index.DecodeLocalIDListDeltaVarint(dataCopy)
+		plDecodeTime += time.Since(t1)
+
+		// Filter by ledger range
+		filtered := index.FilterLocalIDsByLedgerRange(localIDs, bucketStart, startLedger, endLedger)
+		result.LocalIDsInPostingList += len(filtered)
+		result.LocalIDsAfterIntersect += len(filtered)
+		plTime += time.Since(plStart)
+
+		// Fetch events for this bucket's local IDs
+		remaining := limit - len(allEvents)
+		events, ft, dt, flt, bytesRead, scanned := es.fetchEventsByLocalIDsV2ForBucket(
+			filtered, bucketStart, remaining, contractID, topics)
+
+		fetchTime += ft
+		decodeTime += dt
+		filterTime += flt
+		result.EventBytesRead += bytesRead
+		result.EventsScanned += scanned
+
+		allEvents = append(allEvents, events...)
+	}
+
+	result.PostingListTime = plTime
+	result.PostingListReadTime = plReadTime
+	result.PostingListDecodeTime = plDecodeTime
+	result.EventFetchTime = fetchTime
+	result.DecodeTime = decodeTime
+	result.FilterTime = filterTime
+	result.EventsReturned = len(allEvents)
+	result.TotalTime = time.Since(totalStart)
+
+	return result, allEvents, nil
+}
+
+// fetchEventsByLocalIDsV2 fetches events by local IDs using point gets with V2 keys.
+func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets []uint32, startLedger, endLedger uint32, limit int, contractID []byte, topics [][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
+	fetchStart := time.Now()
+	var decodeTime, filterTime time.Duration
+	var bytesRead int64
+	var scanned int
+	events := make([]*query.Event, 0, min(limit, len(localIDs)))
+
+	// Group local IDs by bucket
+	localIDsByBucket := make(map[uint32][]uint32)
+	for _, localID := range localIDs {
+		ledgerOffset := localID >> 16
+		// Find which bucket this belongs to
+		for _, bucketID := range buckets {
+			bucketStart := bucketID * index.BucketSize
+			ledger := bucketStart + ledgerOffset
+			_, bucketEnd := index.BucketLedgerRange(bucketID)
+			if ledger >= startLedger && ledger <= endLedger && ledger <= bucketEnd && ledgerOffset < index.BucketSize {
+				localIDsByBucket[bucketID] = append(localIDsByBucket[bucketID], localID)
+				break
+			}
+		}
+	}
+
+	// Process buckets in order
+	for _, bucketID := range buckets {
+		if limit > 0 && len(events) >= limit {
+			break
+		}
+
+		bucketLocalIDs := localIDsByBucket[bucketID]
+		if len(bucketLocalIDs) == 0 {
+			continue
+		}
+
+		bucketStart := bucketID * index.BucketSize
+		remaining := limit - len(events)
+		if limit <= 0 {
+			remaining = len(bucketLocalIDs)
+		}
+
+		evts, _, dt, flt, br, sc := es.fetchEventsByLocalIDsV2ForBucket(
+			bucketLocalIDs, bucketStart, remaining, contractID, topics)
+
+		decodeTime += dt
+		filterTime += flt
+		bytesRead += br
+		scanned += sc
+		events = append(events, evts...)
+	}
+
+	return events, time.Since(fetchStart) - decodeTime - filterTime, decodeTime, filterTime, bytesRead, scanned
+}
+
+// fetchEventsByLocalIDsV2ForBucket fetches events for local IDs within a single bucket.
+func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32, bucketStart uint32, limit int, contractID []byte, topics [][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
+	fetchStart := time.Now()
+	var decodeTime, filterTime time.Duration
+	var bytesRead int64
+	var scanned int
+	events := make([]*query.Event, 0, min(limit, len(localIDs)))
+
+	for _, localID := range localIDs {
+		if limit > 0 && len(events) >= limit {
+			break
+		}
+
+		ledger, eventSeq := index.DecodeLocalIDForBucket(localID, bucketStart)
+		v2Key := index.EncodeEventKeyV2(ledger, eventSeq)
+
+		data, err := es.db.GetCF(es.ro, es.cfEvents, v2Key)
+		if err != nil {
+			continue
+		}
+		if data.Size() == 0 {
+			data.Free()
+			continue
+		}
+
+		valueData := data.Data()
+		valueCopy := make([]byte, len(valueData))
+		copy(valueCopy, valueData)
+		data.Free()
+
+		bytesRead += int64(len(valueCopy))
+		scanned++
+
+		// Filter using binary header
+		filterStart := time.Now()
+		if es.eventFormat == "binary" && (len(contractID) > 0 || len(topics) > 0) {
+			header := ParseBinaryHeader(valueCopy)
+			if header != nil {
+				matches := true
+				if len(contractID) > 0 && !header.MatchesContractID(contractID) {
+					matches = false
+				}
+				if matches && len(topics) > 0 && !header.MatchesTopicsNonPositional(topics) {
+					matches = false
+				}
+				filterTime += time.Since(filterStart)
+				if !matches {
+					continue
+				}
+			}
+		} else {
+			filterTime += time.Since(filterStart)
+		}
+
+		// Decode to query.Event
+		decStart := time.Now()
+		var event *query.Event
+		if es.eventFormat == "binary" {
+			event, err = DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
+		} else {
+			event, err = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
+		}
+		decodeTime += time.Since(decStart)
+
+		if err != nil {
+			continue
+		}
+
+		events = append(events, event)
+	}
+
+	return events, time.Since(fetchStart) - decodeTime - filterTime, decodeTime, filterTime, bytesRead, scanned
+}
+
+// queryPostingListV2WithStats reads V2 posting lists (32-bit local IDs) and returns stats.
+func (es *RocksDBEventStore) queryPostingListV2WithStats(cf *grocksdb.ColumnFamilyHandle, termKey [32]byte, buckets []uint32, startLedger, endLedger uint32) ([]uint32, int, int64, time.Duration, time.Duration, error) {
+	var allLocalIDs []uint32
+	var bytesRead int64
+	var readTime, decodeTime time.Duration
+
+	for _, bucketID := range buckets {
+		indexKey := index.EncodeIndexKeyWithBucket(termKey, bucketID)
+
+		t0 := time.Now()
+		value, err := es.db.GetCF(es.ro, cf, indexKey)
+		readTime += time.Since(t0)
+		if err != nil {
+			return nil, 0, 0, 0, 0, fmt.Errorf("failed to read V2 posting list: %w", err)
+		}
+
+		if value.Exists() {
+			data := value.Data()
+			bytesRead += int64(len(data))
+			t1 := time.Now()
+			localIDs := index.DecodeLocalIDListDeltaVarint(data)
+			decodeTime += time.Since(t1)
+
+			bucketStart := bucketID * index.BucketSize
+			filtered := index.FilterLocalIDsByLedgerRange(localIDs, bucketStart, startLedger, endLedger)
+			allLocalIDs = append(allLocalIDs, filtered...)
+		}
+		value.Free()
+	}
+
+	return allLocalIDs, len(buckets), bytesRead, readTime, decodeTime, nil
+}
+
+// =============================================================================
 // 64-bit Bitmap Query (Event-Level Granularity)
 // =============================================================================
 
@@ -3807,6 +4487,147 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap64(contractID []byte, topics [
 // GetEventIndexStore returns the 64-bit event bitmap index store.
 func (es *RocksDBEventStore) GetEventIndexStore() *index.EventRocksDBStore {
 	return es.eventIndexStore
+}
+
+// GetEventIndex32Store returns the 32-bit event bitmap index store (FromBuffer decode).
+func (es *RocksDBEventStore) GetEventIndex32Store() *index.EventRocksDB32Store {
+	return es.eventIndex32Store
+}
+
+// SetUseEventKeyV2 enables V2 event key format for reads.
+// This should be set after ingesting with V2Indexes=true.
+func (es *RocksDBEventStore) SetUseEventKeyV2(enabled bool) {
+	es.useEventKeyV2 = enabled
+}
+
+// =============================================================================
+// Bitmap32 Event-Level Queries (FromBuffer decode)
+// =============================================================================
+
+// QueryEventsWithBitmap32EventIndex queries events using the 32-bit event-level bitmap index.
+// Uses sequential event IDs + FromBuffer for near-zero-cost index decode.
+func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+	totalStart := time.Now()
+	result := &Bitmap32EventQueryResult{
+		LedgerRange: endLedger - startLedger + 1,
+	}
+
+	if es.eventIndex32Store == nil {
+		return nil, nil, fmt.Errorf("bitmap32 event index not available")
+	}
+
+	// Query the bitmap32 index (non-positional topic matching)
+	indexStart := time.Now()
+	queryResult, err := es.eventIndex32Store.QueryEventKeysWithStats(contractID, topics, startLedger, endLedger)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bitmap32 event query failed: %w", err)
+	}
+	result.IndexLookupTime = time.Since(indexStart)
+	result.MatchingLocalIDs = int(queryResult.TotalCount)
+	result.IndexBytesRead = queryResult.BytesRead
+	result.SegmentsScanned = queryResult.Segments
+	result.IndexReadTime = queryResult.ReadTime
+	result.IndexDecodeTime = queryResult.DecodeTime
+
+	if queryResult.TotalCount == 0 {
+		result.TotalTime = time.Since(totalStart)
+		return result, nil, nil
+	}
+
+	// Fetch events by local IDs from each segment
+	fetchStart := time.Now()
+	var decodeTime, filterTime time.Duration
+	events := make([]*query.Event, 0, min(limit, result.MatchingLocalIDs))
+
+	// Sort segment IDs for ordered output
+	segIDs := make([]uint32, 0, len(queryResult.PerSegment))
+	for segID := range queryResult.PerSegment {
+		segIDs = append(segIDs, segID)
+	}
+	sort.Slice(segIDs, func(i, j int) bool { return segIDs[i] < segIDs[j] })
+
+	for _, segID := range segIDs {
+		localIDs := queryResult.PerSegment[segID]
+		segmentStart := segID * index.SegmentSize
+
+		iter := localIDs.Iterator()
+		for iter.HasNext() && (limit <= 0 || len(events) < limit) {
+			localID := iter.Next()
+
+			// Convert local ID to V2 key
+			v2Key := index.LocalIDToEventKeyV2(segmentStart, localID)
+
+			// Point-get from cfEvents
+			data, err := es.db.GetCF(es.ro, es.cfEvents, v2Key)
+			if err != nil {
+				continue
+			}
+			if data.Size() == 0 {
+				data.Free()
+				continue
+			}
+
+			valueData := data.Data()
+			valueCopy := make([]byte, len(valueData))
+			copy(valueCopy, valueData)
+			data.Free()
+
+			result.EventBytesRead += int64(len(valueCopy))
+			result.EventsScanned++
+
+			// Filter using binary header for fast rejection (non-positional topic matching)
+			filterStart := time.Now()
+			if es.eventFormat == "binary" && (len(contractID) > 0 || len(topics) > 0) {
+				header := ParseBinaryHeader(valueCopy)
+				if header != nil {
+					matches := true
+					if len(contractID) > 0 && !header.MatchesContractID(contractID) {
+						matches = false
+					}
+					if matches && len(topics) > 0 && !header.MatchesTopicsNonPositional(topics) {
+						matches = false
+					}
+					filterTime += time.Since(filterStart)
+					if !matches {
+						continue
+					}
+				}
+			} else {
+				filterTime += time.Since(filterStart)
+			}
+
+			// Decode to query.Event
+			ledgerOffset, eventSeq := index.DecodeBitmap32LocalID(localID)
+			ledger := segmentStart + uint32(ledgerOffset)
+
+			decStart := time.Now()
+			var event *query.Event
+			if es.eventFormat == "binary" {
+				event, err = DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
+			} else {
+				event, err = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
+			}
+			decodeTime += time.Since(decStart)
+
+			if err != nil {
+				continue
+			}
+
+			events = append(events, event)
+		}
+
+		if limit > 0 && len(events) >= limit {
+			break
+		}
+	}
+
+	result.EventFetchTime = time.Since(fetchStart) - decodeTime - filterTime
+	result.DecodeTime = decodeTime
+	result.FilterTime = filterTime
+	result.EventsReturned = len(events)
+	result.TotalTime = time.Since(totalStart)
+
+	return result, events, nil
 }
 
 // =============================================================================

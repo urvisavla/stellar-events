@@ -95,3 +95,55 @@ func DecodeBitmapKey(key uint64) (ledger uint32, tx, op, evt uint16) {
 	l, t, o := DecodeTOID(key)
 	return l, uint16(t), uint16(o), 0
 }
+
+// =============================================================================
+// V2 Event Key Functions (Sequential Event IDs)
+// =============================================================================
+// V2 key format: [ledger:4][event_seq:2] = 6 bytes
+// Used with bitmap32 indexes for near-zero-cost deserialization via FromBuffer.
+// event_seq is assigned sequentially per ledger during ingestion (0, 1, 2, ...).
+
+// EncodeEventKeyV2 creates a 6-byte RocksDB key from ledger and event sequence.
+// Format: [ledger:4][event_seq:2] (big-endian)
+func EncodeEventKeyV2(ledger uint32, eventSeq uint16) []byte {
+	key := make([]byte, 6)
+	binary.BigEndian.PutUint32(key[0:4], ledger)
+	binary.BigEndian.PutUint16(key[4:6], eventSeq)
+	return key
+}
+
+// DecodeEventKeyV2 extracts ledger and event sequence from a 6-byte V2 key.
+func DecodeEventKeyV2(key []byte) (ledger uint32, eventSeq uint16) {
+	if len(key) < 6 {
+		return 0, 0
+	}
+	ledger = binary.BigEndian.Uint32(key[0:4])
+	eventSeq = binary.BigEndian.Uint16(key[4:6])
+	return
+}
+
+// =============================================================================
+// Bitmap32 Local ID Functions
+// =============================================================================
+// Local ID within a segment: (ledger_offset << 16) | event_seq = 32 bits
+// ledger_offset = ledger - segment_start (0–9999, fits in 14 bits of uint16)
+// event_seq = 0–65535 (16 bits)
+
+// EncodeBitmap32LocalID encodes a ledger offset and event sequence into a 32-bit local ID.
+func EncodeBitmap32LocalID(ledgerOffset uint16, eventSeq uint16) uint32 {
+	return (uint32(ledgerOffset) << 16) | uint32(eventSeq)
+}
+
+// DecodeBitmap32LocalID decodes a 32-bit local ID into ledger offset and event sequence.
+func DecodeBitmap32LocalID(localID uint32) (ledgerOffset uint16, eventSeq uint16) {
+	ledgerOffset = uint16(localID >> 16)
+	eventSeq = uint16(localID & 0xFFFF)
+	return
+}
+
+// LocalIDToEventKeyV2 converts a bitmap32 local ID and segment start to a V2 event key.
+func LocalIDToEventKeyV2(segmentStart uint32, localID uint32) []byte {
+	ledgerOffset, eventSeq := DecodeBitmap32LocalID(localID)
+	ledger := segmentStart + uint32(ledgerOffset)
+	return EncodeEventKeyV2(ledger, eventSeq)
+}

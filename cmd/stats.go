@@ -149,6 +149,8 @@ func printStorageStats(snapshot *store.StorageSnapshot) {
 		"contracts_pl", "topics_pl",
 		"contracts_bm", "topics_bm",
 		"contracts_bm64", "topics_bm64",
+		"contracts_bm32", "topics_bm32",
+		"contracts_plv2", "topics_plv2",
 	}
 	for _, name := range cfOrder {
 		cf, ok := snapshot.ColumnFamilies[name]

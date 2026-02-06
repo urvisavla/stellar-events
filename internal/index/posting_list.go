@@ -526,6 +526,161 @@ func MergeTOIDLists(existing, new []byte) []byte {
 	return result
 }
 
+// =============================================================================
+// V2 Posting List Functions (32-bit Local IDs)
+// =============================================================================
+//
+// V2 posting lists store compact 32-bit local IDs instead of 64-bit TOIDs.
+// Local ID format: (ledger_offset << 16) | event_seq (same as bitmap32)
+// This enables point gets instead of range scans when fetching events.
+
+// EncodeLocalIDForBucket computes the 32-bit local ID for a posting list bucket.
+// Same format as bitmap32: (ledger_offset << 16) | event_seq
+func EncodeLocalIDForBucket(ledger uint32, eventSeq uint16, bucketStart uint32) uint32 {
+	ledgerOffset := uint16(ledger - bucketStart)
+	return (uint32(ledgerOffset) << 16) | uint32(eventSeq)
+}
+
+// DecodeLocalIDForBucket extracts ledger and eventSeq from a local ID and bucket start.
+func DecodeLocalIDForBucket(localID uint32, bucketStart uint32) (ledger uint32, eventSeq uint16) {
+	ledgerOffset := uint16(localID >> 16)
+	eventSeq = uint16(localID & 0xFFFF)
+	ledger = bucketStart + uint32(ledgerOffset)
+	return
+}
+
+// FilterLocalIDsByLedgerRange filters local IDs to only include those within the ledger range.
+func FilterLocalIDsByLedgerRange(localIDs []uint32, bucketStart, startLedger, endLedger uint32) []uint32 {
+	if len(localIDs) == 0 {
+		return nil
+	}
+
+	// Compute local ID boundaries
+	var startOffset, endOffset uint32
+	if startLedger > bucketStart {
+		startOffset = startLedger - bucketStart
+	}
+	endOffset = endLedger - bucketStart
+	_, bucketEnd := BucketLedgerRange(BucketID(bucketStart))
+	if endLedger > bucketEnd {
+		endOffset = bucketEnd - bucketStart
+	}
+
+	startLocalID := startOffset << 16 // min local ID for start ledger
+	endLocalID := (endOffset << 16) | 0xFFFF // max local ID for end ledger
+
+	var result []uint32
+	for _, id := range localIDs {
+		if id >= startLocalID && id <= endLocalID {
+			result = append(result, id)
+		}
+	}
+	return result
+}
+
+// IntersectLocalIDLists returns the intersection of two sorted local ID lists.
+func IntersectLocalIDLists(a, b []uint32) []uint32 {
+	if len(a) == 0 || len(b) == 0 {
+		return nil
+	}
+
+	var result []uint32
+	i, j := 0, 0
+
+	for i < len(a) && j < len(b) {
+		if a[i] == b[j] {
+			result = append(result, a[i])
+			i++
+			j++
+		} else if a[i] < b[j] {
+			i++
+		} else {
+			j++
+		}
+	}
+
+	return result
+}
+
+// UnionLocalIDLists returns the union of two sorted local ID lists.
+func UnionLocalIDLists(a, b []uint32) []uint32 {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+
+	result := make([]uint32, 0, len(a)+len(b))
+	i, j := 0, 0
+
+	for i < len(a) && j < len(b) {
+		if a[i] == b[j] {
+			result = append(result, a[i])
+			i++
+			j++
+		} else if a[i] < b[j] {
+			result = append(result, a[i])
+			i++
+		} else {
+			result = append(result, b[j])
+			j++
+		}
+	}
+
+	result = append(result, a[i:]...)
+	result = append(result, b[j:]...)
+
+	return result
+}
+
+// EncodeLocalIDListDeltaVarint encodes local IDs using delta-varint compression.
+// Local IDs are cast to uint64 internally for code reuse with varint encoding.
+// IDs must be sorted in ascending order.
+func EncodeLocalIDListDeltaVarint(ids []uint32) []byte {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	// Convert to uint64 for encoding
+	toids := make([]uint64, len(ids))
+	for i, id := range ids {
+		toids[i] = uint64(id)
+	}
+	return EncodeTOIDListDeltaVarint(toids)
+}
+
+// DecodeLocalIDListDeltaVarint decodes delta-varint encoded local IDs.
+func DecodeLocalIDListDeltaVarint(data []byte) []uint32 {
+	toids := DecodeTOIDListDeltaVarint(data)
+	if len(toids) == 0 {
+		return nil
+	}
+
+	ids := make([]uint32, len(toids))
+	for i, t := range toids {
+		ids[i] = uint32(t)
+	}
+	return ids
+}
+
+// MergeLocalIDListsDeltaVarint merges two delta-varint encoded local ID lists.
+// Both inputs must be sorted. Output is sorted delta-varint encoded.
+func MergeLocalIDListsDeltaVarint(existing, new []byte) []byte {
+	existingIDs := DecodeLocalIDListDeltaVarint(existing)
+	newIDs := DecodeLocalIDListDeltaVarint(new)
+
+	if len(existingIDs) == 0 {
+		return new
+	}
+	if len(newIDs) == 0 {
+		return existing
+	}
+
+	merged := UnionLocalIDLists(existingIDs, newIDs)
+	return EncodeLocalIDListDeltaVarint(merged)
+}
+
 // GetBucketsForRange returns all bucket IDs that cover the given ledger range.
 func GetBucketsForRange(startLedger, endLedger uint32) []uint32 {
 	startBucket := BucketID(startLedger)

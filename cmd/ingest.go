@@ -132,6 +132,7 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		MaintainBitmapIdx:      cfg.Ingestion.BitmapIndexes,
 		MaintainBitmap64Idx:    cfg.Ingestion.Bitmap64Indexes,
 		MaintainPostingListIdx: cfg.Ingestion.PostingListIndexes,
+		MaintainV2Idx:          cfg.Ingestion.V2Indexes,
 		IndexFlushInterval:     cfg.Ingestion.IndexFlushInterval,
 		ExcludeTopic0:          excludeTopic0,
 		ExcludeDiagnostic:      cfg.Ingestion.ExcludeDiagnostic,
@@ -329,6 +330,8 @@ func printStorageSnapshot(sb *strings.Builder, snapshot *store.StorageSnapshot) 
 		"contracts_pl", "topics_pl",
 		"contracts_bm", "topics_bm",
 		"contracts_bm64", "topics_bm64",
+		"contracts_bm32", "topics_bm32",
+		"contracts_plv2", "topics_plv2",
 	}
 	for _, name := range cfOrder {
 		cf, ok := snapshot.ColumnFamilies[name]
@@ -364,6 +367,8 @@ func printCompactionSummary(sb *strings.Builder, cs *store.CompactionSummary) {
 		"contracts_pl", "topics_pl",
 		"contracts_bm", "topics_bm",
 		"contracts_bm64", "topics_bm64",
+		"contracts_bm32", "topics_bm32",
+		"contracts_plv2", "topics_plv2",
 	}
 	for _, name := range cfOrder {
 		cf, ok := cs.PerCF[name]
