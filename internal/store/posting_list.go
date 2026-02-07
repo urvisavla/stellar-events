@@ -615,34 +615,59 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets 
 }
 
 // fetchEventsByLocalIDsV2ForBucket fetches events for local IDs within a single bucket.
+// Uses BatchedMultiGetCF for batched I/O. Falls back to individual GetCF for small batches.
 func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32, bucketStart uint32, limit int, contractID []byte, topics [][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
+	if len(localIDs) == 0 {
+		return nil, 0, 0, 0, 0, 0
+	}
+
 	fetchStart := time.Now()
 	var decodeTime, filterTime time.Duration
 	var bytesRead int64
 	var scanned int
-	events := make([]*query.Event, 0, min(limit, len(localIDs)))
 
-	for _, localID := range localIDs {
+	// Cap fetch count at limit to avoid fetching more keys than needed
+	fetchCount := len(localIDs)
+	if limit > 0 && fetchCount > limit {
+		fetchCount = limit
+	}
+	events := make([]*query.Event, 0, fetchCount)
+
+	// Pre-compute all keys and metadata
+	type evtMeta struct {
+		ledger   uint32
+		eventSeq uint16
+	}
+	keys := make([][]byte, fetchCount)
+	metas := make([]evtMeta, fetchCount)
+	for i := 0; i < fetchCount; i++ {
+		ledger, eventSeq := event.DecodeLocalIDForBucket(localIDs[i], bucketStart)
+		keys[i] = event.EncodeKeyV2(ledger, eventSeq)
+		metas[i] = evtMeta{ledger: ledger, eventSeq: eventSeq}
+	}
+
+	// Batch fetch using the optimized batched API.
+	// Keys from posting lists are already sorted (delta-varint preserves order).
+	values, err := es.db.BatchedMultiGetCF(es.ro, es.cfEvents, true, keys...)
+	if err != nil {
+		return events, time.Since(fetchStart), 0, 0, 0, 0
+	}
+	defer values.Destroy()
+
+	for i, val := range values {
 		if limit > 0 && len(events) >= limit {
 			break
 		}
-
-		ledger, eventSeq := event.DecodeLocalIDForBucket(localID, bucketStart)
-		v2Key := event.EncodeKeyV2(ledger, eventSeq)
-
-		data, err := es.db.GetCF(es.ro, es.cfEvents, v2Key)
-		if err != nil {
+		if !val.Exists() {
 			continue
 		}
-		if data.Size() == 0 {
-			data.Free()
+		data := val.Data()
+		if len(data) == 0 {
 			continue
 		}
 
-		valueData := data.Data()
-		valueCopy := make([]byte, len(valueData))
-		copy(valueCopy, valueData)
-		data.Free()
+		valueCopy := make([]byte, len(data))
+		copy(valueCopy, data)
 
 		bytesRead += int64(len(valueCopy))
 		scanned++
@@ -671,14 +696,15 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32,
 		// Decode to query.Event
 		decStart := time.Now()
 		var ev *query.Event
+		var decErr error
 		if es.eventFormat == "binary" {
-			ev, err = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
+			ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, metas[i].ledger, metas[i].eventSeq)
 		} else {
-			ev, err = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
+			ev, decErr = parseRawXDRToQueryEvent(valueCopy, metas[i].ledger, 0, 0, metas[i].eventSeq)
 		}
 		decodeTime += time.Since(decStart)
 
-		if err != nil {
+		if decErr != nil {
 			continue
 		}
 

@@ -2000,7 +2000,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 		return result, nil, nil
 	}
 
-	// Fetch events by local IDs from each segment
+	// Fetch events using BatchedMultiGetCF across all segments
 	fetchStart := time.Now()
 	var decodeTime, filterTime time.Duration
 	events := make([]*query.Event, 0, min(limit, result.MatchingLocalIDs))
@@ -2012,78 +2012,101 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 	}
 	sort.Slice(segIDs, func(i, j int) bool { return segIDs[i] < segIDs[j] })
 
+	// Collect keys and metadata, capped at limit
+	type bitmapEvtMeta struct {
+		segmentStart uint32
+		localID      uint32
+	}
+	fetchCap := result.MatchingLocalIDs
+	if limit > 0 && fetchCap > limit {
+		fetchCap = limit
+	}
+	allKeys := make([][]byte, 0, fetchCap)
+	allMetas := make([]bitmapEvtMeta, 0, fetchCap)
+
 	for _, segID := range segIDs {
-		localIDs := queryResult.PerSegment[segID]
+		if len(allKeys) >= fetchCap {
+			break
+		}
+		bitmap := queryResult.PerSegment[segID]
 		segmentStart := segID * BucketSize
 
-		iter := localIDs.Iterator()
-		for iter.HasNext() && (limit <= 0 || len(events) < limit) {
+		iter := bitmap.Iterator()
+		for iter.HasNext() {
+			if len(allKeys) >= fetchCap {
+				break
+			}
 			localID := iter.Next()
-
-			// Convert local ID to V2 key
-			v2Key := event.LocalIDToKeyV2(segmentStart, localID)
-
-			// Point-get from cfEvents
-			data, err := es.db.GetCF(es.ro, es.cfEvents, v2Key)
-			if err != nil {
-				continue
-			}
-			if data.Size() == 0 {
-				data.Free()
-				continue
-			}
-
-			valueData := data.Data()
-			valueCopy := make([]byte, len(valueData))
-			copy(valueCopy, valueData)
-			data.Free()
-
-			result.EventBytesRead += int64(len(valueCopy))
-			result.EventsScanned++
-
-			// Filter using binary header for fast rejection (non-positional topic matching)
-			filterStart := time.Now()
-			if es.eventFormat == "binary" && (len(contractID) > 0 || len(topics) > 0) {
-				header := event.ParseBinaryHeader(valueCopy)
-				if header != nil {
-					matches := true
-					if len(contractID) > 0 && !header.MatchesContractID(contractID) {
-						matches = false
-					}
-					if matches && len(topics) > 0 && !header.MatchesTopicsNonPositional(topics) {
-						matches = false
-					}
-					filterTime += time.Since(filterStart)
-					if !matches {
-						continue
-					}
-				}
-			} else {
-				filterTime += time.Since(filterStart)
-			}
-
-			// Decode to query.Event
-			ledgerOffset, eventSeq := event.DecodeBitmap32LocalID(localID)
-			ledger := segmentStart + uint32(ledgerOffset)
-
-			decStart := time.Now()
-			var ev *query.Event
-			if es.eventFormat == "binary" {
-				ev, err = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
-			} else {
-				ev, err = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
-			}
-			decodeTime += time.Since(decStart)
-
-			if err != nil {
-				continue
-			}
-
-			events = append(events, ev)
+			allKeys = append(allKeys, event.LocalIDToKeyV2(segmentStart, localID))
+			allMetas = append(allMetas, bitmapEvtMeta{segmentStart: segmentStart, localID: localID})
 		}
+	}
 
-		if limit > 0 && len(events) >= limit {
-			break
+	if len(allKeys) > 0 {
+		// Keys are sorted by segment then local ID (both big-endian encoded).
+		values, err := es.db.BatchedMultiGetCF(es.ro, es.cfEvents, true, allKeys...)
+		if err == nil {
+			defer values.Destroy()
+
+			for i, val := range values {
+				if limit > 0 && len(events) >= limit {
+					break
+				}
+				if !val.Exists() {
+					continue
+				}
+				data := val.Data()
+				if len(data) == 0 {
+					continue
+				}
+
+				valueCopy := make([]byte, len(data))
+				copy(valueCopy, data)
+
+				result.EventBytesRead += int64(len(valueCopy))
+				result.EventsScanned++
+
+				// Filter using binary header for fast rejection
+				filterStart := time.Now()
+				if es.eventFormat == "binary" && (len(contractID) > 0 || len(topics) > 0) {
+					header := event.ParseBinaryHeader(valueCopy)
+					if header != nil {
+						matches := true
+						if len(contractID) > 0 && !header.MatchesContractID(contractID) {
+							matches = false
+						}
+						if matches && len(topics) > 0 && !header.MatchesTopicsNonPositional(topics) {
+							matches = false
+						}
+						filterTime += time.Since(filterStart)
+						if !matches {
+							continue
+						}
+					}
+				} else {
+					filterTime += time.Since(filterStart)
+				}
+
+				// Decode to query.Event
+				ledgerOffset, eventSeq := event.DecodeBitmap32LocalID(allMetas[i].localID)
+				ledger := allMetas[i].segmentStart + uint32(ledgerOffset)
+
+				decStart := time.Now()
+				var ev *query.Event
+				var decErr error
+				if es.eventFormat == "binary" {
+					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
+				} else {
+					ev, decErr = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
+				}
+				decodeTime += time.Since(decStart)
+
+				if decErr != nil {
+					continue
+				}
+
+				events = append(events, ev)
+			}
 		}
 	}
 
