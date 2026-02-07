@@ -7,23 +7,20 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/urvisavla/stellar-events/internal/reader"
+	"github.com/urvisavla/stellar-events/internal/event"
 	"github.com/urvisavla/stellar-events/internal/store"
 )
 
 // PipelineConfig configures the parallel ingestion pipeline
 type PipelineConfig struct {
-	Workers             int    // Number of parallel workers
-	BatchSize           int    // Ledgers to batch before writing
-	QueueSize           int    // Channel buffer size
-	DataDir             string // Ledger data directory
-	NetworkPassphrase   string // Network passphrase for XDR parsing
-	MaintainUniqueIdx      bool // Maintain unique indexes during ingestion
-	MaintainBitmapIdx      bool // Maintain 32-bit bitmap indexes during ingestion (V1)
-	MaintainBitmap64Idx    bool // Maintain 64-bit bitmap indexes during ingestion (V1)
-	MaintainPostingListIdx bool // Maintain posting list indexes during ingestion (V1)
-	MaintainV2Idx          bool // Maintain V2 indexes: bitmap32-event + posting-v2 (mutually exclusive with V1)
-	IndexFlushInterval     int  // Ledgers between index flushes (0 = only at end)
+	Workers            int    // Number of parallel workers
+	BatchSize          int    // Ledgers to batch before writing
+	QueueSize          int    // Channel buffer size
+	DataDir            string // Ledger data directory
+	NetworkPassphrase  string // Network passphrase for XDR parsing
+	MaintainUniqueIdx  bool   // Maintain unique indexes during ingestion
+	MaintainV2Idx      bool   // Maintain V2 indexes: bitmap32-event + posting-v2
+	IndexFlushInterval int    // Ledgers between index flushes (0 = only at end)
 
 	// ExcludeTopic0 is a set of topic0 values to skip during ingestion.
 	// Keys are the raw topic0 bytes as strings.
@@ -47,7 +44,7 @@ type PipelineStats struct {
 // LedgerResult represents the result of processing a single ledger
 type LedgerResult struct {
 	Sequence       uint32
-	Events         []*store.IngestEvent
+	Events         []*event.IngestEvent
 	RawBytes       int64
 	Stats          *LedgerStats
 	DiskReadTime   time.Duration // Time reading from disk
@@ -148,7 +145,7 @@ func (p *Pipeline) worker(id int) {
 	defer p.wg.Done()
 
 	// Each worker has its own ledger reader (with its own zstd decoder)
-	ledgerReader, err := reader.NewLedgerReader(p.config.DataDir)
+	ledgerReader, err := NewLedgerReader(p.config.DataDir)
 	if err != nil {
 		// Send error result
 		p.results <- &LedgerResult{Error: fmt.Errorf("worker %d: failed to create reader: %w", id, err)}
@@ -168,7 +165,7 @@ func (p *Pipeline) worker(id int) {
 }
 
 // processLedger reads and parses a single ledger
-func (p *Pipeline) processLedger(ledgerReader *reader.LedgerReader, seq uint32) *LedgerResult {
+func (p *Pipeline) processLedger(ledgerReader *LedgerReader, seq uint32) *LedgerResult {
 	result := &LedgerResult{
 		Sequence: seq,
 		Stats:    NewLedgerStats(),
@@ -217,7 +214,7 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 	aggStats := NewLedgerStats()
 
 	// Event batch for writing
-	var eventBatch []*store.IngestEvent
+	var eventBatch []*event.IngestEvent
 	var batchRawBytes int64
 	batchStartSeq := startLedger
 
@@ -271,13 +268,10 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 			if (batchFull || atEnd) && len(eventBatch) > 0 {
 				writeStart := time.Now()
 				_, err := p.store.StoreEvents(eventBatch, &store.StoreOptions{
-					UniqueIndexes:      p.config.MaintainUniqueIdx,
-					BitmapIndexes:      p.config.MaintainBitmapIdx,
-					Bitmap64Indexes:    p.config.MaintainBitmap64Idx,
-					PostingListIndexes: p.config.MaintainPostingListIdx,
-					V2Indexes:          p.config.MaintainV2Idx,
-					ExcludeTopic0:      p.config.ExcludeTopic0,
-					ExcludeDiagnostic:  p.config.ExcludeDiagnostic,
+					UniqueIndexes:     p.config.MaintainUniqueIdx,
+					V2Indexes:         p.config.MaintainV2Idx,
+					ExcludeTopic0:     p.config.ExcludeTopic0,
+					ExcludeDiagnostic: p.config.ExcludeDiagnostic,
 				})
 				atomic.AddInt64(&p.stats.WriteTimeNs, time.Since(writeStart).Nanoseconds())
 
@@ -296,18 +290,10 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 				batchStartSeq = nextSeq
 
 				// Periodic bitmap flush to prevent hot segment memory growth
-				if (p.config.MaintainBitmapIdx || p.config.MaintainBitmap64Idx || p.config.MaintainV2Idx) && p.config.IndexFlushInterval > 0 &&
+				if p.config.MaintainV2Idx && p.config.IndexFlushInterval > 0 &&
 					ledgersProcessed%p.config.IndexFlushInterval == 0 {
 					if err := p.store.FlushBitmapIndexes(); err != nil {
 						return fmt.Errorf("failed to flush bitmap indexes: %w", err)
-					}
-				}
-
-				// Periodic posting list flush to prevent memory growth
-				if p.config.MaintainPostingListIdx && p.config.IndexFlushInterval > 0 &&
-					ledgersProcessed%p.config.IndexFlushInterval == 0 {
-					if _, _, err := p.store.FlushPostingListIndexes(); err != nil {
-						return fmt.Errorf("failed to flush posting list indexes: %w", err)
 					}
 				}
 
@@ -327,17 +313,10 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 		}
 	}
 
-	// Flush bitmap indexes if enabled (32-bit ledger, 64-bit event, or 32-bit event)
-	if p.config.MaintainBitmapIdx || p.config.MaintainBitmap64Idx || p.config.MaintainV2Idx {
+	// Flush bitmap indexes if enabled
+	if p.config.MaintainV2Idx {
 		if err := p.store.FlushBitmapIndexes(); err != nil {
 			return fmt.Errorf("failed to flush bitmap indexes: %w", err)
-		}
-	}
-
-	// Flush posting list indexes if enabled
-	if p.config.MaintainPostingListIdx {
-		if _, _, err := p.store.FlushPostingListIndexes(); err != nil {
-			return fmt.Errorf("failed to flush posting list indexes: %w", err)
 		}
 	}
 

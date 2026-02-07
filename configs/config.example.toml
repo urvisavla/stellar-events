@@ -49,18 +49,13 @@ cache_index_and_filter_blocks = true
 max_background_jobs = 8
 
 # --- Compression ---
-# Compression algorithm: "none", "snappy", "lz4", "zstd"
-compression = "lz4"
-
-# Compression for bottommost level (oldest data)
+compression = "zstd"
 bottommost_compression = "zstd"
 
-# --- WAL (Write-Ahead Log) ---
-# Disable WAL for faster bulk ingestion (safe - data can be re-ingested)
+# --- WAL ---
 disable_wal = true
 
 # --- Compaction ---
-# Disable background compaction during ingestion
 disable_auto_compaction = true
 
 # Target SST file size in MB (larger = fewer files)
@@ -73,46 +68,18 @@ max_bytes_for_level_base_mb = 1024
 # Ingestion
 # =============================================================================
 [ingestion]
-# Progress file path (empty = disabled)
-# When set, writes progress JSON every 10k ledgers with:
-# - ledger range being ingested
-# - events processed, avg per ledger
-# - processing rate and ETA
+# Progress file path (empty = disabled, writes every 10k ledgers)
 progress_file = "progress.json"
 
-# --- Post-processing ---
-# Run compaction after ingestion (optimizes for reads)
 final_compaction = false
 
 # Compute event stats after ingestion (slow)
 compute_stats = false
 
-# --- Index Maintenance ---
-# Index types (all use non-positional topic matching):
-#   - bitmap_indexes: 32-bit roaring bitmaps, ledger-level granularity (smallest)
-#   - bitmap64_indexes: 64-bit roaring bitmaps, event-level granularity (larger)
-#   - posting_list_indexes: TOID-based posting lists with delta-varint compression
-#
-# Column families per index type:
-#   - Posting lists:  contracts_pl, topics_pl
-#   - 32-bit bitmap:  contracts_bm, topics_bm
-#   - 64-bit bitmap:  contracts_bm64, topics_bm64
+# Index maintenance
+v2_indexes = true
+unique_indexes = true
 
-# 32-bit bitmap indexes (ledger-level) - recommended for most use cases
-bitmap_indexes = true
-
-# 64-bit bitmap indexes (event-level) - provides exact event matching
-bitmap64_indexes = false
-
-# Posting list indexes (TOID-based) - alternative to bitmaps
-posting_list_indexes = false
-
-# Maintain unique value counts during ingestion
-# If false, run 'build-indexes' command after ingestion
-unique_indexes = false
-
-# Ledgers between index flushes (applies to all index types)
-# Set to 0 to only flush at end of ingestion
 index_flush_interval = 10000
 
 # --- Parallelism ---

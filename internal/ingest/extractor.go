@@ -8,32 +8,18 @@ import (
 	"github.com/stellar/go-stellar-sdk/ingest"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
-	"github.com/urvisavla/stellar-events/internal/store"
+	"github.com/urvisavla/stellar-events/internal/event"
 )
 
-// ExtractEvents extracts events as raw XDR with minimal overhead.
-// This is the fastest extraction mode - no field parsing, just raw bytes.
-// Uses defensive copies to prevent memory leaks (safe for long-lived events).
-func ExtractEvents(xdrBytes []byte, networkPassphrase string, stats *LedgerStats) ([]*store.IngestEvent, error) {
-	return ExtractEventsWithOptions(xdrBytes, networkPassphrase, stats, false, false)
-}
-
-// ExtractEventsFast extracts events without defensive memory copies.
-// Use this for bulk ingestion where events are written immediately and not held in memory.
-// The returned events are only valid until the next call or until xdrBytes is modified.
-func ExtractEventsFast(xdrBytes []byte, networkPassphrase string, stats *LedgerStats) ([]*store.IngestEvent, error) {
-	return ExtractEventsWithOptions(xdrBytes, networkPassphrase, stats, true, false)
-}
-
 // ExtractEventsFastFiltered extracts events without defensive memory copies, with optional diagnostic filtering.
-func ExtractEventsFastFiltered(xdrBytes []byte, networkPassphrase string, stats *LedgerStats, excludeDiagnostic bool) ([]*store.IngestEvent, error) {
+func ExtractEventsFastFiltered(xdrBytes []byte, networkPassphrase string, stats *LedgerStats, excludeDiagnostic bool) ([]*event.IngestEvent, error) {
 	return ExtractEventsWithOptions(xdrBytes, networkPassphrase, stats, true, excludeDiagnostic)
 }
 
 // ExtractEventsWithOptions extracts events with configurable memory behavior.
 // When fastMode is true, skips defensive copies for better performance during bulk ingestion.
 // When excludeDiagnostic is true, skips diagnostic events (type=2).
-func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *LedgerStats, fastMode bool, excludeDiagnostic bool) ([]*store.IngestEvent, error) {
+func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *LedgerStats, fastMode bool, excludeDiagnostic bool) ([]*event.IngestEvent, error) {
 	var lcm xdr.LedgerCloseMeta
 	if err := lcm.UnmarshalBinary(xdrBytes); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal LedgerCloseMeta: %w", err)
@@ -54,7 +40,7 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 	}
 	defer txReader.Close()
 
-	var events []*store.IngestEvent
+	var events []*event.IngestEvent
 	ledgerSeq := lcm.LedgerSequence()
 
 	// Extract ledger close time (Unix timestamp to time.Time)
@@ -91,9 +77,9 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 		}
 
 		// Process transaction-level events
-		for eventIndex, event := range txEvents.TransactionEvents {
+		for eventIndex, ev := range txEvents.TransactionEvents {
 			// Skip diagnostic events if configured
-			if excludeDiagnostic && event.Event.Type == xdr.ContractEventTypeDiagnostic {
+			if excludeDiagnostic && ev.Event.Type == xdr.ContractEventTypeDiagnostic {
 				continue
 			}
 
@@ -102,7 +88,7 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 				stats.TotalEvents++
 			}
 
-			rawXDR, err := event.Event.MarshalBinary()
+			rawXDR, err := ev.Event.MarshalBinary()
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal event XDR: %w", err)
 			}
@@ -111,16 +97,16 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 			var contractID []byte
 			var topics [][]byte
 			var dataBytes []byte
-			if event.Event.ContractId != nil {
+			if ev.Event.ContractId != nil {
 				if fastMode {
-					contractID = event.Event.ContractId[:]
+					contractID = ev.Event.ContractId[:]
 				} else {
 					contractID = make([]byte, 32)
-					copy(contractID, event.Event.ContractId[:])
+					copy(contractID, ev.Event.ContractId[:])
 				}
 			}
-			if event.Event.Body.V == 0 {
-				body := event.Event.Body.MustV0()
+			if ev.Event.Body.V == 0 {
+				body := ev.Event.Body.MustV0()
 				for _, topic := range body.Topics {
 					topicBytes, _ := topic.MarshalBinary()
 					topics = append(topics, topicBytes)
@@ -128,7 +114,7 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 				dataBytes, _ = body.Data.MarshalBinary()
 			}
 
-			events = append(events, &store.IngestEvent{
+			events = append(events, &event.IngestEvent{
 				LedgerSequence:   ledgerSeq,
 				TransactionIndex: uint32(tx.Index),
 				OperationIndex:   0xFFFF, // Transaction-level events use sentinel value
@@ -137,7 +123,7 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 				ContractID:       contractID,
 				Topics:           topics,
 				TxHash:           txHash,
-				EventType:        int(event.Event.Type),
+				EventType:        int(ev.Event.Type),
 				DataBytes:        dataBytes,
 				LedgerClosedAt:   ledgerCloseTime,
 				Successful:       txSuccessful,
@@ -146,9 +132,9 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 
 		// Process operation-level events
 		for opIndex, opEvents := range txEvents.OperationEvents {
-			for eventIndex, event := range opEvents {
+			for eventIndex, ev := range opEvents {
 				// Skip diagnostic events if configured
-				if excludeDiagnostic && event.Type == xdr.ContractEventTypeDiagnostic {
+				if excludeDiagnostic && ev.Type == xdr.ContractEventTypeDiagnostic {
 					continue
 				}
 
@@ -157,7 +143,7 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 					stats.TotalEvents++
 				}
 
-				rawXDR, err := event.MarshalBinary()
+				rawXDR, err := ev.MarshalBinary()
 				if err != nil {
 					return nil, fmt.Errorf("failed to marshal event XDR: %w", err)
 				}
@@ -166,16 +152,16 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 				var contractID []byte
 				var topics [][]byte
 				var dataBytes []byte
-				if event.ContractId != nil {
+				if ev.ContractId != nil {
 					if fastMode {
-						contractID = event.ContractId[:]
+						contractID = ev.ContractId[:]
 					} else {
 						contractID = make([]byte, 32)
-						copy(contractID, event.ContractId[:])
+						copy(contractID, ev.ContractId[:])
 					}
 				}
-				if event.Body.V == 0 {
-					body := event.Body.MustV0()
+				if ev.Body.V == 0 {
+					body := ev.Body.MustV0()
 					for _, topic := range body.Topics {
 						topicBytes, _ := topic.MarshalBinary()
 						topics = append(topics, topicBytes)
@@ -183,7 +169,7 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 					dataBytes, _ = body.Data.MarshalBinary()
 				}
 
-				events = append(events, &store.IngestEvent{
+				events = append(events, &event.IngestEvent{
 					LedgerSequence:   ledgerSeq,
 					TransactionIndex: uint32(tx.Index),
 					OperationIndex:   uint16(opIndex),
@@ -192,7 +178,7 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 					ContractID:       contractID,
 					Topics:           topics,
 					TxHash:           txHash,
-					EventType:        int(event.Type),
+					EventType:        int(ev.Type),
 					DataBytes:        dataBytes,
 					LedgerClosedAt:   ledgerCloseTime,
 					Successful:       txSuccessful,

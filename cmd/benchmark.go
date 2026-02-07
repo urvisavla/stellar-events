@@ -111,7 +111,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 	fs.SetOutput(os.Stderr)
 
 	dataFile := fs.String("data", "", "Benchmark data file (JSON)")
-	indexTypes := fs.String("index", "all", "Index types to benchmark: posting,bitmap32,bitmap64,all")
+	indexTypes := fs.String("index", "all", "Index types to benchmark: posting-v2,bitmap32,all")
 	iterations := fs.Int("iterations", 5, "Number of iterations per query")
 	warmup := fs.Int("warmup", 1, "Warmup iterations (not counted)")
 	outputFormat := fs.String("format", "table", "Output format: table, csv, json")
@@ -178,13 +178,13 @@ func runBenchmark(cfg *config.Config, args []string) {
 	// Parse index types
 	var indexes []string
 	if *indexTypes == "all" {
-		indexes = []string{"posting", "posting-parallel", "posting-v2", "bitmap32", "bitmap64", "bitmap32-event"}
+		indexes = []string{"posting-v2", "bitmap32"}
 	} else {
 		indexes = strings.Split(*indexTypes, ",")
 	}
 
 	// Validate index types
-	validIndexes := map[string]bool{"posting": true, "posting-parallel": true, "posting-v2": true, "bitmap32": true, "bitmap64": true, "bitmap32-event": true}
+	validIndexes := map[string]bool{"posting-v2": true, "bitmap32": true}
 	for _, idx := range indexes {
 		if !validIndexes[idx] {
 			fmt.Fprintf(os.Stderr, "Error: invalid index type: %s\n", idx)
@@ -786,48 +786,12 @@ type QueryResult struct {
 
 func executeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topics [][]byte, indexType string, limit int) *QueryResult {
 	switch indexType {
-	case "posting":
-		eventStore.ParallelPostingReads = false
-		return executePostingQueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
-	case "posting-parallel":
-		eventStore.ParallelPostingReads = true
-		result := executePostingQueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
-		eventStore.ParallelPostingReads = false
-		return result
 	case "posting-v2":
 		return executePostingV2QueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
 	case "bitmap32":
 		return executeBitmap32QueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
-	case "bitmap64":
-		return executeBitmap64QueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
-	case "bitmap32-event":
-		return executeBitmap32EventQueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
 	}
 	return nil
-}
-
-func executePostingQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topics [][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithPostingListTiming(contractID, topics, startLedger, endLedger, limit)
-	if err != nil {
-		return &QueryResult{Error: err}
-	}
-
-	return &QueryResult{
-		EventsReturned:   len(events),
-		EventsScanned:    stats.EventsScanned,
-		IndexBytes:       stats.PostingListBytes,
-		EventBytes:       stats.EventBytesRead,
-		IndexMatches:     stats.TOIDsAfterIntersect,
-		IndexTime:        stats.PostingListTime + stats.IntersectTime,
-		IndexReadTime:    stats.PostingListReadTime,
-		IndexDecodeTime:  stats.PostingListDecodeTime,
-		EventTime:        stats.EventFetchTime + stats.DecodeTime + stats.FilterTime,
-		EventFetchTime:   stats.EventFetchTime,
-		EventDecodeTime:  stats.DecodeTime,
-		EventFilterTime:  stats.FilterTime,
-		SmallestListSize: stats.SmallestListSize,
-		LargestListSize:  stats.LargestListSize,
-	}
 }
 
 func executePostingV2QueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topics [][]byte, limit int) *QueryResult {
@@ -853,47 +817,6 @@ func executePostingV2QueryBenchmark(eventStore *store.RocksDBEventStore, startLe
 }
 
 func executeBitmap32QueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topics [][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithBitmap(contractID, topics, startLedger, endLedger, limit)
-	if err != nil {
-		return &QueryResult{Error: err}
-	}
-
-	return &QueryResult{
-		EventsReturned:  len(events),
-		EventsScanned:   stats.EventsScanned,
-		IndexBytes:      stats.IndexBytesRead,
-		EventBytes:      stats.EventBytesRead,
-		IndexMatches:    stats.MatchingLedgers,
-		IndexTime:       stats.IndexLookupTime,
-		EventTime:       stats.EventFetchTime,
-		EventFetchTime:  stats.DiskReadTime,
-		EventDecodeTime: stats.DecodeTime,
-		EventFilterTime: stats.FilterTime,
-	}
-}
-
-func executeBitmap64QueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topics [][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithBitmap64(contractID, topics, startLedger, endLedger, limit)
-	if err != nil {
-		return &QueryResult{Error: err}
-	}
-
-	return &QueryResult{
-		EventsReturned:  len(events),
-		EventsScanned:   stats.EventsScanned,
-		IndexBytes:      stats.IndexBytesRead,
-		EventBytes:      stats.EventBytesRead,
-		IndexMatches:    stats.MatchingTOIDs,
-		IndexTime:       stats.IndexLookupTime,
-		IndexReadTime:   stats.IndexReadTime,
-		IndexDecodeTime: stats.IndexDecodeTime,
-		EventTime:       stats.EventFetchTime,
-		EventFetchTime:  stats.EventFetchTime,
-		EventDecodeTime: stats.DecodeTime,
-	}
-}
-
-func executeBitmap32EventQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topics [][]byte, limit int) *QueryResult {
 	stats, events, err := eventStore.QueryEventsWithBitmap32EventIndex(contractID, topics, startLedger, endLedger, limit)
 	if err != nil {
 		return &QueryResult{Error: err}

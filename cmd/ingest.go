@@ -15,7 +15,6 @@ import (
 	"github.com/urvisavla/stellar-events/internal/config"
 	"github.com/urvisavla/stellar-events/internal/ingest"
 	"github.com/urvisavla/stellar-events/internal/progress"
-	"github.com/urvisavla/stellar-events/internal/reader"
 	"github.com/urvisavla/stellar-events/internal/store"
 )
 
@@ -33,7 +32,7 @@ func runIngest(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "Usage: ingest [options]\n\n")
 		fmt.Fprintf(os.Stderr, "Ingests contract events from ledger files into RocksDB.\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
-		fmt.Fprintf(os.Stderr, "  --start <ledger>   Start ledger (default: %d)\n", reader.FirstLedgerSequence)
+		fmt.Fprintf(os.Stderr, "  --start <ledger>   Start ledger (default: %d)\n", ingest.FirstLedgerSequence)
 		fmt.Fprintf(os.Stderr, "  --end <ledger>     End ledger (0 = auto-detect max)\n\n")
 		fmt.Fprintf(os.Stderr, "Parallelism configured in config.toml [ingestion]\n")
 	}
@@ -50,11 +49,11 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 
 	// Resolve ledger range
 	if startLedger == 0 {
-		startLedger = reader.FirstLedgerSequence
+		startLedger = ingest.FirstLedgerSequence
 	}
 
 	if endLedger == 0 {
-		minLedger, maxLedger, _, err := reader.GetLedgerDataStats(cfg.Source.LedgerDir)
+		minLedger, maxLedger, _, err := ingest.GetLedgerDataStats(cfg.Source.LedgerDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to get source stats: %v\n", err)
 			os.Exit(1)
@@ -64,8 +63,8 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	}
 
 	// Validate
-	if startLedger < reader.FirstLedgerSequence {
-		fmt.Fprintf(os.Stderr, "Error: start ledger must be >= %d\n", reader.FirstLedgerSequence)
+	if startLedger < ingest.FirstLedgerSequence {
+		fmt.Fprintf(os.Stderr, "Error: start ledger must be >= %d\n", ingest.FirstLedgerSequence)
 		os.Exit(2)
 	}
 	if endLedger < startLedger {
@@ -123,19 +122,16 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	}
 
 	pipelineConfig := ingest.PipelineConfig{
-		Workers:                workers,
-		BatchSize:              batchSize,
-		QueueSize:              queueSize,
-		DataDir:                cfg.Source.LedgerDir,
-		NetworkPassphrase:      networkPassphrase,
-		MaintainUniqueIdx:      cfg.Ingestion.UniqueIndexes,
-		MaintainBitmapIdx:      cfg.Ingestion.BitmapIndexes,
-		MaintainBitmap64Idx:    cfg.Ingestion.Bitmap64Indexes,
-		MaintainPostingListIdx: cfg.Ingestion.PostingListIndexes,
-		MaintainV2Idx:          cfg.Ingestion.V2Indexes,
-		IndexFlushInterval:     cfg.Ingestion.IndexFlushInterval,
-		ExcludeTopic0:          excludeTopic0,
-		ExcludeDiagnostic:      cfg.Ingestion.ExcludeDiagnostic,
+		Workers:            workers,
+		BatchSize:          batchSize,
+		QueueSize:          queueSize,
+		DataDir:            cfg.Source.LedgerDir,
+		NetworkPassphrase:  networkPassphrase,
+		MaintainUniqueIdx:  cfg.Ingestion.UniqueIndexes,
+		MaintainV2Idx:      cfg.Ingestion.V2Indexes,
+		IndexFlushInterval: cfg.Ingestion.IndexFlushInterval,
+		ExcludeTopic0:      excludeTopic0,
+		ExcludeDiagnostic:  cfg.Ingestion.ExcludeDiagnostic,
 	}
 
 	pipeline := ingest.NewPipeline(pipelineConfig, eventStore)
@@ -327,9 +323,6 @@ func printStorageSnapshot(sb *strings.Builder, snapshot *store.StorageSnapshot) 
 	// Print in a consistent order
 	cfOrder := []string{
 		"events", "unique", "default",
-		"contracts_pl", "topics_pl",
-		"contracts_bm", "topics_bm",
-		"contracts_bm64", "topics_bm64",
 		"contracts_bm32", "topics_bm32",
 		"contracts_plv2", "topics_plv2",
 	}
@@ -364,9 +357,6 @@ func printCompactionSummary(sb *strings.Builder, cs *store.CompactionSummary) {
 	// Print in a consistent order
 	cfOrder := []string{
 		"events", "unique", "default",
-		"contracts_pl", "topics_pl",
-		"contracts_bm", "topics_bm",
-		"contracts_bm64", "topics_bm64",
 		"contracts_bm32", "topics_bm32",
 		"contracts_plv2", "topics_plv2",
 	}

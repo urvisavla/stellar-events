@@ -1,4 +1,4 @@
-package reader
+package ingest
 
 import (
 	"encoding/binary"
@@ -390,8 +390,8 @@ func GetChunkDirectoryInfo(dataDir string) ([]ChunkDirInfo, error) {
 	chunksDir := filepath.Join(dataDir, "chunks")
 
 	// First, find all parent directories and their chunks
-	dirChunks := make(map[string][]uint32)  // parent dir -> list of chunk IDs
-	dirSizes := make(map[string]int64)      // parent dir -> total data size
+	dirChunks := make(map[string][]uint32) // parent dir -> list of chunk IDs
+	dirSizes := make(map[string]int64)     // parent dir -> total data size
 
 	err := filepath.Walk(chunksDir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {

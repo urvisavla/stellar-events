@@ -1,4 +1,4 @@
-package store
+package event
 
 import (
 	"encoding/base64"
@@ -8,8 +8,35 @@ import (
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/strkey"
+
 	"github.com/urvisavla/stellar-events/internal/query"
 )
+
+// =============================================================================
+// Event Types (Write Path)
+// =============================================================================
+
+// IngestEvent represents an event captured during ingestion.
+// Used for fast ingestion - no JSON serialization overhead.
+// Pre-extracted fields avoid re-parsing XDR during indexing and querying.
+type IngestEvent struct {
+	LedgerSequence   uint32
+	TransactionIndex uint32 // Changed from uint16: TOID uses 20 bits (0-1,048,575)
+	OperationIndex   uint16 // TOID uses 12 bits (0-4,095)
+	EventIndex       uint16
+	RawXDR           []byte
+
+	// Pre-extracted fields for indexing (avoids re-parsing XDR)
+	ContractID []byte   // 32 bytes if present, nil otherwise
+	Topics     [][]byte // Pre-marshaled topic XDR bytes
+	TxHash     []byte   // 32 bytes - transaction hash
+
+	// Pre-extracted fields for binary format storage (avoids XDR parsing at query time)
+	EventType      int       // 0=contract, 1=system, 2=diagnostic
+	DataBytes      []byte    // Pre-marshaled SCVal data bytes
+	LedgerClosedAt time.Time // Ledger close time for the event
+	Successful     bool      // True if event is from a successful contract call
+}
 
 // Binary event format v2 for fast queries - NO XDR parsing at query time.
 //
