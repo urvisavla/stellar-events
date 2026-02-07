@@ -417,8 +417,12 @@ func (s *BitmapEventSeqStore) QueryEventKeysWithStats(contractID []byte, topics 
 	}
 	allSegments := make(map[uint32]*segmentBitmaps)
 
+	// Count expected filter terms so we can skip segments missing any term
+	expectedTerms := 0
+
 	// Query contract index if specified
 	if len(contractID) > 0 {
+		expectedTerms++
 		termKey := ContractTermKey(contractID)
 		perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(true, termKey, startLedger, endLedger)
 		if err != nil {
@@ -442,6 +446,7 @@ func (s *BitmapEventSeqStore) QueryEventKeysWithStats(contractID []byte, topics 
 		if len(topic) == 0 {
 			continue
 		}
+		expectedTerms++
 		termKey := TopicTermKey(topic)
 		perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(false, termKey, startLedger, endLedger)
 		if err != nil {
@@ -461,8 +466,10 @@ func (s *BitmapEventSeqStore) QueryEventKeysWithStats(contractID []byte, topics 
 	}
 
 	// Intersect per-segment bitmaps
+	// Skip segments that don't have bitmaps from ALL filter terms — a missing
+	// term means no events in that segment match that term, so AND must be empty.
 	for segID, sb := range allSegments {
-		if len(sb.bitmaps) == 0 {
+		if len(sb.bitmaps) < expectedTerms {
 			continue
 		}
 		intersected := roaring.FastAnd(sb.bitmaps...)
