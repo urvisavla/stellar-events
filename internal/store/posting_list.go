@@ -616,100 +616,145 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets 
 }
 
 // fetchEventsByLocalIDsV2ForBucket fetches events for local IDs within a single bucket.
-// Uses a RocksDB iterator for efficient sequential access — avoids per-key malloc/free
-// overhead of GetCF and benefits from block-level locality for adjacent keys.
+// Uses parallel iterators to overlap RocksDB lookup latency across multiple goroutines.
 func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32, bucketStart uint32, limit int, contractID []byte, topics [][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
 	if len(localIDs) == 0 {
 		return nil, 0, 0, 0, 0, 0
 	}
 
 	fetchStart := time.Now()
-	var decodeTime, filterTime time.Duration
-	var bytesRead int64
-	var scanned int
 
 	// Cap fetch count at limit
 	fetchCount := len(localIDs)
 	if limit > 0 && fetchCount > limit {
 		fetchCount = limit
 	}
-	events := make([]*query.Event, 0, fetchCount)
 
-	iter := es.db.NewIteratorCF(es.ro, es.cfEvents)
-	defer iter.Close()
+	// Determine number of parallel workers
+	const maxWorkers = 4
+	numWorkers := maxWorkers
+	if fetchCount < numWorkers {
+		numWorkers = fetchCount
+	}
 
-	for i := 0; i < fetchCount; i++ {
-		if limit > 0 && len(events) >= limit {
-			break
+	type workerResult struct {
+		events     []*query.Event
+		decodeTime time.Duration
+		filterTime time.Duration
+		bytesRead  int64
+		scanned    int
+	}
+
+	results := make([]workerResult, numWorkers)
+	chunkSize := (fetchCount + numWorkers - 1) / numWorkers
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		start := w * chunkSize
+		end := start + chunkSize
+		if end > fetchCount {
+			end = fetchCount
 		}
-
-		ledger, eventSeq := event.DecodeLocalIDForBucket(localIDs[i], bucketStart)
-		key := event.EncodeKeyV2(ledger, eventSeq)
-
-		iter.Seek(key)
-		if !iter.Valid() {
-			break
-		}
-
-		// Check exact key match — Seek positions at >= key
-		iterKey := iter.Key()
-		if iterKey == nil || !bytes.Equal(iterKey.Data(), key) {
+		if start >= end {
 			continue
 		}
 
-		iterVal := iter.Value()
-		if iterVal == nil {
-			continue
-		}
-		valData := iterVal.Data()
-		if len(valData) == 0 {
-			continue
-		}
+		wg.Add(1)
+		go func(workerID, start, end int) {
+			defer wg.Done()
+			r := &results[workerID]
+			r.events = make([]*query.Event, 0, end-start)
 
-		// Copy value before next iterator operation invalidates it
-		valueCopy := make([]byte, len(valData))
-		copy(valueCopy, valData)
+			iter := es.db.NewIteratorCF(es.ro, es.cfEvents)
+			defer iter.Close()
 
-		bytesRead += int64(len(valueCopy))
-		scanned++
+			for i := start; i < end; i++ {
+				ledger, eventSeq := event.DecodeLocalIDForBucket(localIDs[i], bucketStart)
+				key := event.EncodeKeyV2(ledger, eventSeq)
 
-		// Filter using binary header
-		filterStart := time.Now()
-		if es.eventFormat == "binary" && (len(contractID) > 0 || len(topics) > 0) {
-			header := event.ParseBinaryHeader(valueCopy)
-			if header != nil {
-				matches := true
-				if len(contractID) > 0 && !header.MatchesContractID(contractID) {
-					matches = false
+				iter.Seek(key)
+				if !iter.Valid() {
+					break
 				}
-				if matches && len(topics) > 0 && !header.MatchesTopicsNonPositional(topics) {
-					matches = false
-				}
-				filterTime += time.Since(filterStart)
-				if !matches {
+
+				iterKey := iter.Key()
+				if iterKey == nil || !bytes.Equal(iterKey.Data(), key) {
 					continue
 				}
+
+				iterVal := iter.Value()
+				if iterVal == nil {
+					continue
+				}
+				valData := iterVal.Data()
+				if len(valData) == 0 {
+					continue
+				}
+
+				valueCopy := make([]byte, len(valData))
+				copy(valueCopy, valData)
+
+				r.bytesRead += int64(len(valueCopy))
+				r.scanned++
+
+				// Filter using binary header
+				filterStart := time.Now()
+				if es.eventFormat == "binary" && (len(contractID) > 0 || len(topics) > 0) {
+					header := event.ParseBinaryHeader(valueCopy)
+					if header != nil {
+						matches := true
+						if len(contractID) > 0 && !header.MatchesContractID(contractID) {
+							matches = false
+						}
+						if matches && len(topics) > 0 && !header.MatchesTopicsNonPositional(topics) {
+							matches = false
+						}
+						r.filterTime += time.Since(filterStart)
+						if !matches {
+							continue
+						}
+					}
+				} else {
+					r.filterTime += time.Since(filterStart)
+				}
+
+				// Decode to query.Event
+				decStart := time.Now()
+				var ev *query.Event
+				var decErr error
+				if es.eventFormat == "binary" {
+					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
+				} else {
+					ev, decErr = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
+				}
+				r.decodeTime += time.Since(decStart)
+
+				if decErr != nil {
+					continue
+				}
+
+				r.events = append(r.events, ev)
 			}
-		} else {
-			filterTime += time.Since(filterStart)
-		}
+		}(w, start, end)
+	}
 
-		// Decode to query.Event
-		decStart := time.Now()
-		var ev *query.Event
-		var decErr error
-		if es.eventFormat == "binary" {
-			ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
-		} else {
-			ev, decErr = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
-		}
-		decodeTime += time.Since(decStart)
+	wg.Wait()
 
-		if decErr != nil {
-			continue
-		}
+	// Merge results in order (chunks are in sorted key order)
+	var decodeTime, filterTime time.Duration
+	var bytesRead int64
+	var scanned int
+	events := make([]*query.Event, 0, fetchCount)
+	for _, r := range results {
+		events = append(events, r.events...)
+		decodeTime += r.decodeTime
+		filterTime += r.filterTime
+		bytesRead += r.bytesRead
+		scanned += r.scanned
+	}
 
-		events = append(events, ev)
+	if limit > 0 && len(events) > limit {
+		events = events[:limit]
 	}
 
 	return events, time.Since(fetchStart) - decodeTime - filterTime, decodeTime, filterTime, bytesRead, scanned
