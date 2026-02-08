@@ -482,6 +482,113 @@ func (s *BitmapEventSeqStore) QueryEventKeysWithStats(contractID []byte, topics 
 	return result, nil
 }
 
+// QueryEventKeysMultiFilter returns per-segment bitmaps with multi-value OR/AND filtering.
+// contractIDs: multiple contract IDs (OR within group)
+// topicGroups: per-position topic values (OR within position, AND across positions)
+// Semantics: (contract1 OR contract2 OR ...) AND (topic0val1 OR topic0val2 OR ...) AND ...
+func (s *BitmapEventSeqStore) QueryEventKeysMultiFilter(
+	contractIDs [][]byte,
+	topicGroups [4][][]byte,
+	startLedger, endLedger uint32,
+) (*EventSeqQueryResult, error) {
+	result := &EventSeqQueryResult{
+		PerSegment: make(map[uint32]*roaring.Bitmap),
+	}
+
+	// Collect per-group, per-segment bitmaps
+	// groupIdx 0 = contracts, 1-4 = topic positions
+	type groupSegBitmaps struct {
+		bitmaps map[uint32][]*roaring.Bitmap // segmentID -> bitmaps to OR
+	}
+	groups := make(map[int]*groupSegBitmaps)
+
+	// Query contract bitmaps (OR within contracts group)
+	if len(contractIDs) > 0 {
+		groups[0] = &groupSegBitmaps{bitmaps: make(map[uint32][]*roaring.Bitmap)}
+		for _, cid := range contractIDs {
+			termKey := ContractTermKey(cid)
+			perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(true, termKey, startLedger, endLedger)
+			if err != nil {
+				return nil, fmt.Errorf("contract bitmap32 multi-filter query failed: %w", err)
+			}
+			result.BytesRead += bytesRead
+			result.Segments += segments
+			result.ReadTime += readTime
+			result.DecodeTime += decodeTime
+
+			for segID, bm := range perSeg {
+				groups[0].bitmaps[segID] = append(groups[0].bitmaps[segID], bm)
+			}
+		}
+	}
+
+	// Query topic bitmaps per position (OR within each position group)
+	for pos, tg := range topicGroups {
+		if len(tg) == 0 {
+			continue
+		}
+		groupIdx := pos + 1
+		groups[groupIdx] = &groupSegBitmaps{bitmaps: make(map[uint32][]*roaring.Bitmap)}
+		for _, topicXDR := range tg {
+			if len(topicXDR) == 0 {
+				continue
+			}
+			termKey := TopicTermKey(topicXDR)
+			perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(false, termKey, startLedger, endLedger)
+			if err != nil {
+				return nil, fmt.Errorf("topic bitmap32 multi-filter query failed: %w", err)
+			}
+			result.BytesRead += bytesRead
+			result.Segments += segments
+			result.ReadTime += readTime
+			result.DecodeTime += decodeTime
+
+			for segID, bm := range perSeg {
+				groups[groupIdx].bitmaps[segID] = append(groups[groupIdx].bitmaps[segID], bm)
+			}
+		}
+	}
+
+	// Collect all segment IDs across all groups
+	allSegIDs := make(map[uint32]bool)
+	for _, g := range groups {
+		for segID := range g.bitmaps {
+			allSegIDs[segID] = true
+		}
+	}
+
+	// For each segment: OR within each group, then AND across groups
+	for segID := range allSegIDs {
+		var groupUnions []*roaring.Bitmap
+
+		for _, g := range groups {
+			bms := g.bitmaps[segID]
+			if len(bms) == 0 {
+				// This group has no data for this segment -> AND produces empty
+				groupUnions = nil
+				break
+			}
+			if len(bms) == 1 {
+				groupUnions = append(groupUnions, bms[0])
+			} else {
+				groupUnions = append(groupUnions, roaring.FastOr(bms...))
+			}
+		}
+
+		if len(groupUnions) == 0 {
+			continue
+		}
+
+		intersected := roaring.FastAnd(groupUnions...)
+		if !intersected.IsEmpty() {
+			result.PerSegment[segID] = intersected
+			result.TotalCount += intersected.GetCardinality()
+		}
+	}
+
+	return result, nil
+}
+
 // =============================================================================
 // Statistics
 // =============================================================================

@@ -184,23 +184,20 @@ func UnionLocalIDLists(a, b []uint32) []uint32 {
 
 // EncodeLocalIDListDeltaVarint encodes local IDs using delta-varint compression.
 // IDs must be sorted in ascending order.
-// Format: [count:varint][first_id:8bytes][delta1:varint][delta2:varint]...
-// The first ID is stored as 8 bytes (big-endian uint64) for wire format compatibility.
+// Format: [count:varint][first_id:varint][delta1:varint][delta2:varint]...
 func EncodeLocalIDListDeltaVarint(ids []uint32) []byte {
 	if len(ids) == 0 {
 		return nil
 	}
 
-	// Estimate size: count (5) + first id (8) + deltas (avg 2 bytes each)
-	buf := make([]byte, 0, 13+len(ids)*2)
+	// Estimate size: count (5) + first id (5) + deltas (avg 2 bytes each)
+	buf := make([]byte, 0, 10+len(ids)*2)
 
 	// Write count as varint
 	buf = appendVarint(buf, uint64(len(ids)))
 
-	// Write first ID as full 8 bytes (big-endian)
-	firstBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(firstBytes, uint64(ids[0]))
-	buf = append(buf, firstBytes...)
+	// Write first ID as varint
+	buf = appendVarint(buf, uint64(ids[0]))
 
 	// Write deltas as varints
 	prev := ids[0]
@@ -226,16 +223,15 @@ func DecodeLocalIDListDeltaVarint(data []byte) []uint32 {
 	}
 	data = data[n:]
 
-	// Need at least 8 bytes for first ID
-	if len(data) < 8 {
-		return nil
-	}
-
 	ids := make([]uint32, count)
 
-	// Read first ID (stored as uint64 for wire format compatibility)
-	ids[0] = uint32(binary.BigEndian.Uint64(data[:8]))
-	data = data[8:]
+	// Read first ID as varint
+	firstID, n := readVarint(data)
+	if n <= 0 {
+		return nil
+	}
+	ids[0] = uint32(firstID)
+	data = data[n:]
 
 	// Read deltas
 	prev := ids[0]
@@ -824,6 +820,318 @@ type PostingListV2QueryResult struct {
 	DecodeTime            time.Duration // Time decoding events
 	FilterTime            time.Duration // Time filtering events
 	TotalTime             time.Duration // Total query time
+}
+
+// QueryEventsWithPostingListV2MultiFilter queries events using V2 posting lists with multi-value OR filters.
+// contractIDs: multiple contract IDs (OR within group)
+// topicGroups: per-position topic values (OR within position, AND across positions)
+// Semantics: (contract1 OR contract2 OR ...) AND (topic0val1 OR topic0val2 OR ...) AND (topic1val1 OR ...)
+func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
+	contractIDs [][]byte,
+	topicGroups [4][][]byte,
+	startLedger, endLedger uint32,
+	limit int,
+) (*PostingListV2QueryResult, []*query.Event, error) {
+	totalStart := time.Now()
+	result := &PostingListV2QueryResult{
+		LedgerRange: endLedger - startLedger + 1,
+	}
+
+	hasContracts := len(contractIDs) > 0
+	hasTopics := false
+	for _, tg := range topicGroups {
+		if len(tg) > 0 {
+			hasTopics = true
+			break
+		}
+	}
+
+	if !hasContracts && !hasTopics {
+		result.TotalTime = time.Since(totalStart)
+		return result, nil, nil
+	}
+
+	buckets := GetBucketsForRange(startLedger, endLedger)
+	plStart := time.Now()
+
+	// Count total posting lists to read
+	numLists := len(contractIDs)
+	for _, tg := range topicGroups {
+		numLists += len(tg)
+	}
+
+	// Track which group each result belongs to for union/intersect
+	type plGroup struct {
+		groupIdx int // 0=contracts, 1-4=topic positions
+		result   postingListV2Result
+	}
+
+	plResults := make([]plGroup, numLists)
+	var wg sync.WaitGroup
+	idx := 0
+
+	// Read all contract posting lists in parallel
+	for ci, cid := range contractIDs {
+		wg.Add(1)
+		go func(i int, contractID []byte) {
+			defer wg.Done()
+			termKey := ContractTermKey(contractID)
+			ids, bucketsRead, bytesRead, readT, decodeT, err := es.queryPostingListV2WithStats(es.cfContractsPLV2, termKey, buckets, startLedger, endLedger)
+			plResults[i] = plGroup{
+				groupIdx: 0,
+				result: postingListV2Result{
+					localIDs:   ids,
+					buckets:    bucketsRead,
+					bytesRead:  bytesRead,
+					readTime:   readT,
+					decodeTime: decodeT,
+					err:        err,
+					isContract: true,
+				},
+			}
+		}(idx, cid)
+		idx++
+		_ = ci
+	}
+
+	// Read all topic posting lists in parallel
+	for pos, tg := range topicGroups {
+		for _, topicXDR := range tg {
+			if len(topicXDR) == 0 {
+				continue
+			}
+			wg.Add(1)
+			go func(i int, groupIdx int, topic []byte) {
+				defer wg.Done()
+				termKey := TopicTermKey(topic)
+				ids, bucketsRead, bytesRead, readT, decodeT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
+				plResults[i] = plGroup{
+					groupIdx: groupIdx,
+					result: postingListV2Result{
+						localIDs:   ids,
+						buckets:    bucketsRead,
+						bytesRead:  bytesRead,
+						readTime:   readT,
+						decodeTime: decodeT,
+						err:        err,
+						isContract: false,
+					},
+				}
+			}(idx, pos+1, topicXDR)
+			idx++
+		}
+	}
+
+	wg.Wait()
+
+	// Check for errors and aggregate stats
+	for _, pg := range plResults[:idx] {
+		if pg.result.err != nil {
+			return nil, nil, pg.result.err
+		}
+		result.BucketsScanned += pg.result.buckets
+		result.PostingListsRead++
+		result.PostingListBytes += pg.result.bytesRead
+		result.PostingListReadTime += pg.result.readTime
+		result.PostingListDecodeTime += pg.result.decodeTime
+		result.LocalIDsInPostingList += len(pg.result.localIDs)
+	}
+
+	// Union within each group, then intersect across groups
+	groupLists := make(map[int][][]uint32) // groupIdx -> list of localID lists
+	for _, pg := range plResults[:idx] {
+		groupLists[pg.groupIdx] = append(groupLists[pg.groupIdx], pg.result.localIDs)
+	}
+
+	// Union within each group
+	var groupUnions [][]uint32
+	for _, lists := range groupLists {
+		var unioned []uint32
+		for _, list := range lists {
+			unioned = UnionLocalIDLists(unioned, list)
+		}
+		groupUnions = append(groupUnions, unioned)
+	}
+
+	// Sort by size ascending for efficient intersection
+	sort.Slice(groupUnions, func(a, b int) bool {
+		return len(groupUnions[a]) < len(groupUnions[b])
+	})
+
+	// Intersect across groups
+	var resultLocalIDs []uint32
+	for i, unioned := range groupUnions {
+		if i == 0 {
+			resultLocalIDs = unioned
+		} else {
+			intersectStart := time.Now()
+			resultLocalIDs = IntersectLocalIDLists(resultLocalIDs, unioned)
+			result.IntersectTime += time.Since(intersectStart)
+		}
+		if len(resultLocalIDs) == 0 {
+			result.PostingListTime = time.Since(plStart) - result.IntersectTime
+			result.TotalTime = time.Since(totalStart)
+			return result, nil, nil
+		}
+	}
+
+	result.PostingListTime = time.Since(plStart) - result.IntersectTime
+	result.LocalIDsAfterIntersect = len(resultLocalIDs)
+
+	// Flatten contractIDs and topicGroups for post-filter compatibility
+	// For post-filtering, we pass all contracts and flatten topics (non-positional)
+	var flatTopics [][]byte
+	for _, tg := range topicGroups {
+		flatTopics = append(flatTopics, tg...)
+	}
+
+	// Fetch events using point gets with multi-value post-filter
+	events, fetchTime, decodeTime, filterTime, bytesRead, scanned := es.fetchEventsByLocalIDsV2MultiFilter(
+		resultLocalIDs, buckets, startLedger, endLedger, limit, contractIDs, topicGroups)
+
+	result.EventFetchTime = fetchTime
+	result.DecodeTime = decodeTime
+	result.FilterTime = filterTime
+	result.EventBytesRead = bytesRead
+	result.EventsScanned = scanned
+	result.EventsReturned = len(events)
+	result.TotalTime = time.Since(totalStart)
+
+	return result, events, nil
+}
+
+// fetchEventsByLocalIDsV2MultiFilter fetches events by local IDs with multi-value post-filtering.
+// Contract match: event matches ANY of the contractIDs
+// Topic match: for each topic position with filters, event's topic at that position matches ANY of the values
+func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint32, buckets []uint32, startLedger, endLedger uint32, limit int, contractIDs [][]byte, topicGroups [4][][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
+	fetchStart := time.Now()
+	var decodeTime, filterTime time.Duration
+	var bytesRead int64
+	var scanned int
+	events := make([]*query.Event, 0, min(limit, len(localIDs)))
+
+	// Group local IDs by bucket
+	localIDsByBucket := make(map[uint32][]uint32)
+	for _, localID := range localIDs {
+		ledgerOffset := localID >> 16
+		for _, bucketID := range buckets {
+			bucketStart := bucketID * BucketSize
+			ledger := bucketStart + ledgerOffset
+			_, bucketEnd := BucketRange(bucketID)
+			if ledger >= startLedger && ledger <= endLedger && ledger <= bucketEnd && ledgerOffset < BucketSize {
+				localIDsByBucket[bucketID] = append(localIDsByBucket[bucketID], localID)
+				break
+			}
+		}
+	}
+
+	// Process buckets in order
+	for _, bucketID := range buckets {
+		if limit > 0 && len(events) >= limit {
+			break
+		}
+
+		bucketLocalIDs := localIDsByBucket[bucketID]
+		if len(bucketLocalIDs) == 0 {
+			continue
+		}
+
+		bucketStart := bucketID * BucketSize
+		remaining := limit - len(events)
+		if limit <= 0 {
+			remaining = len(bucketLocalIDs)
+		}
+
+		for _, localID := range bucketLocalIDs {
+			if remaining <= 0 {
+				break
+			}
+
+			ledger, eventSeq := event.DecodeLocalIDForBucket(localID, bucketStart)
+			v2Key := event.EncodeKeyV2(ledger, eventSeq)
+
+			data, err := es.db.GetCF(es.ro, es.cfEvents, v2Key)
+			if err != nil {
+				continue
+			}
+			if data.Size() == 0 {
+				data.Free()
+				continue
+			}
+
+			valueData := data.Data()
+			valueCopy := make([]byte, len(valueData))
+			copy(valueCopy, valueData)
+			data.Free()
+
+			bytesRead += int64(len(valueCopy))
+			scanned++
+
+			// Multi-value post-filter using binary header
+			filterStart := time.Now()
+			hasTopicFilters := false
+			for _, tg := range topicGroups {
+				if len(tg) > 0 {
+					hasTopicFilters = true
+					break
+				}
+			}
+			if es.eventFormat == "binary" && (len(contractIDs) > 0 || hasTopicFilters) {
+				header := event.ParseBinaryHeader(valueCopy)
+				if header != nil {
+					matches := true
+					// Contract: event must match ANY of the contractIDs
+					if len(contractIDs) > 0 {
+						contractMatch := false
+						for _, cid := range contractIDs {
+							if header.MatchesContractID(cid) {
+								contractMatch = true
+								break
+							}
+						}
+						if !contractMatch {
+							matches = false
+						}
+					}
+					// Topics: for each position with filters, event's topics must match ANY value (non-positional fallback)
+					if matches {
+						var allTopics [][]byte
+						for _, tg := range topicGroups {
+							allTopics = append(allTopics, tg...)
+						}
+						if len(allTopics) > 0 && !header.MatchesTopicsNonPositional(allTopics) {
+							matches = false
+						}
+					}
+					filterTime += time.Since(filterStart)
+					if !matches {
+						continue
+					}
+				}
+			} else {
+				filterTime += time.Since(filterStart)
+			}
+
+			// Decode to query.Event
+			decStart := time.Now()
+			var ev *query.Event
+			if es.eventFormat == "binary" {
+				ev, err = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
+			} else {
+				ev, err = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
+			}
+			decodeTime += time.Since(decStart)
+
+			if err != nil {
+				continue
+			}
+
+			events = append(events, ev)
+			remaining--
+		}
+	}
+
+	return events, time.Since(fetchStart) - decodeTime - filterTime, decodeTime, filterTime, bytesRead, scanned
 }
 
 // ToUnified converts PostingListV2QueryResult to UnifiedQueryResult

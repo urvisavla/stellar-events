@@ -61,9 +61,9 @@ type TopicWithPosition struct {
 
 // QuerySpec describes a query to benchmark
 type QuerySpec struct {
-	Name       string   // Human-readable name
-	ContractID string   // Contract ID (strkey format) or empty
-	Topics     []string // Topic values (base64) or empty
+	Name        string     // Human-readable name
+	ContractIDs []string   // Contract IDs (OR logic, strkey format)
+	Topics      [][]string // Topics[position] = []values (OR per position, base64)
 }
 
 // BenchmarkResult holds timing results for a query
@@ -250,7 +250,20 @@ func runBenchmark(cfg *config.Config, args []string) {
 
 	// Generate query combinations
 	queries := generateQueryCombinations(data, *maxCombinations)
-	fmt.Fprintf(os.Stderr, "Generated %d query combinations\n", len(queries))
+	multiValueCount := 0
+	for _, q := range queries {
+		if len(q.ContractIDs) > 1 {
+			multiValueCount++
+			continue
+		}
+		for _, tv := range q.Topics {
+			if len(tv) > 1 {
+				multiValueCount++
+				break
+			}
+		}
+	}
+	fmt.Fprintf(os.Stderr, "Generated %d query combinations (%d multi-value OR)\n", len(queries), multiValueCount)
 	fmt.Fprintf(os.Stderr, "Benchmarking with %d iterations per query (+%d warmup)\n", *iterations, *warmup)
 	fmt.Fprintf(os.Stderr, "Index types: %v\n", indexes)
 	fmt.Fprintf(os.Stderr, "Ledger range: %d - %d (max per query: %d)\n\n", originalStartLedger, originalEndLedger, maxLedgerRange)
@@ -463,12 +476,21 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 		return "low"
 	}
 
-	// 1. Contract-only queries
+	// Helper to create positional topic spec: Topics[position] = []values
+	makeTopics := func(topics ...TopicWithPosition) [][]string {
+		result := make([][]string, 4)
+		for _, t := range topics {
+			result[t.Position] = append(result[t.Position], t.Value)
+		}
+		return result
+	}
+
+	// 1. Contract-only queries (single contract)
 	for i, c := range allContracts {
 		card := contractCardLabel(i)
 		queries = append(queries, QuerySpec{
-			Name:       fmt.Sprintf("contract-%s", card),
-			ContractID: c,
+			Name:        fmt.Sprintf("contract-%s", card),
+			ContractIDs: []string{c},
 		})
 	}
 
@@ -476,7 +498,7 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 	for _, t := range allTopics {
 		queries = append(queries, QuerySpec{
 			Name:   fmt.Sprintf("t%d-%s", t.Position, t.Card),
-			Topics: []string{t.Value},
+			Topics: makeTopics(t),
 		})
 	}
 
@@ -485,9 +507,9 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 		cCard := contractCardLabel(ci)
 		for _, t := range allTopics {
 			queries = append(queries, QuerySpec{
-				Name:       fmt.Sprintf("c-%s+t%d-%s", cCard, t.Position, t.Card),
-				ContractID: c,
-				Topics:     []string{t.Value},
+				Name:        fmt.Sprintf("c-%s+t%d-%s", cCard, t.Position, t.Card),
+				ContractIDs: []string{c},
+				Topics:      makeTopics(t),
 			})
 		}
 	}
@@ -496,13 +518,12 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 	for i := 0; i < len(allTopics); i++ {
 		for j := i + 1; j < len(allTopics); j++ {
 			t1, t2 := allTopics[i], allTopics[j]
-			// Skip if same position (can't have two topic0s)
 			if t1.Position == t2.Position {
 				continue
 			}
 			queries = append(queries, QuerySpec{
 				Name:   fmt.Sprintf("t%d-%s+t%d-%s", t1.Position, t1.Card, t2.Position, t2.Card),
-				Topics: []string{t1.Value, t2.Value},
+				Topics: makeTopics(t1, t2),
 			})
 		}
 	}
@@ -517,9 +538,9 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 					continue
 				}
 				queries = append(queries, QuerySpec{
-					Name:       fmt.Sprintf("c-%s+t%d+t%d", cCard, t1.Position, t2.Position),
-					ContractID: c,
-					Topics:     []string{t1.Value, t2.Value},
+					Name:        fmt.Sprintf("c-%s+t%d+t%d", cCard, t1.Position, t2.Position),
+					ContractIDs: []string{c},
+					Topics:      makeTopics(t1, t2),
 				})
 			}
 		}
@@ -530,13 +551,12 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 		for j := i + 1; j < len(allTopics); j++ {
 			for k := j + 1; k < len(allTopics); k++ {
 				t1, t2, t3 := allTopics[i], allTopics[j], allTopics[k]
-				// Skip if any positions are the same
 				if t1.Position == t2.Position || t1.Position == t3.Position || t2.Position == t3.Position {
 					continue
 				}
 				queries = append(queries, QuerySpec{
 					Name:   fmt.Sprintf("t%d+t%d+t%d", t1.Position, t2.Position, t3.Position),
-					Topics: []string{t1.Value, t2.Value, t3.Value},
+					Topics: makeTopics(t1, t2, t3),
 				})
 			}
 		}
@@ -548,14 +568,13 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 			for k := j + 1; k < len(allTopics); k++ {
 				for l := k + 1; l < len(allTopics); l++ {
 					t1, t2, t3, t4 := allTopics[i], allTopics[j], allTopics[k], allTopics[l]
-					// Must have all different positions (0,1,2,3)
 					positions := map[int]bool{t1.Position: true, t2.Position: true, t3.Position: true, t4.Position: true}
 					if len(positions) != 4 {
 						continue
 					}
 					queries = append(queries, QuerySpec{
 						Name:   "t0+t1+t2+t3",
-						Topics: []string{t1.Value, t2.Value, t3.Value, t4.Value},
+						Topics: makeTopics(t1, t2, t3, t4),
 					})
 				}
 			}
@@ -572,39 +591,167 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 						continue
 					}
 					queries = append(queries, QuerySpec{
-						Name:       fmt.Sprintf("c+t%d+t%d+t%d", t1.Position, t2.Position, t3.Position),
-						ContractID: c,
-						Topics:     []string{t1.Value, t2.Value, t3.Value},
+						Name:        fmt.Sprintf("c+t%d+t%d+t%d", t1.Position, t2.Position, t3.Position),
+						ContractIDs: []string{c},
+						Topics:      makeTopics(t1, t2, t3),
 					})
 				}
 			}
 		}
 	}
 
-	// Separate single-filter queries (always keep these) from multi-filter queries
-	var singleFilter []QuerySpec
-	var multiFilter []QuerySpec
-	for _, q := range queries {
-		isSingle := (q.ContractID != "" && len(q.Topics) == 0) || (q.ContractID == "" && len(q.Topics) == 1)
-		if isSingle {
-			singleFilter = append(singleFilter, q)
-		} else {
-			multiFilter = append(multiFilter, q)
+	// 9. Multi-contract queries (OR of 2-3 contracts, no topics)
+	if len(allContracts) >= 2 {
+		for i := 0; i < len(allContracts); i++ {
+			for j := i + 1; j < len(allContracts); j++ {
+				queries = append(queries, QuerySpec{
+					Name:        fmt.Sprintf("multi-c(%s+%s)", contractCardLabel(i), contractCardLabel(j)),
+					ContractIDs: []string{allContracts[i], allContracts[j]},
+				})
+			}
+		}
+		if len(allContracts) >= 3 {
+			queries = append(queries, QuerySpec{
+				Name:        "multi-c(all3)",
+				ContractIDs: allContracts[:3],
+			})
 		}
 	}
 
-	// Always include all single-filter queries, then add multi-filter up to max
-	result := singleFilter
-	remaining := maxCombinations - len(singleFilter)
-	if remaining > 0 && len(multiFilter) > 0 {
-		// Shuffle multi-filter queries and take up to remaining
-		rand.Shuffle(len(multiFilter), func(i, j int) {
-			multiFilter[i], multiFilter[j] = multiFilter[j], multiFilter[i]
-		})
-		if len(multiFilter) > remaining {
-			multiFilter = multiFilter[:remaining]
+	// 10. Multi-topic-per-position queries (2-3 values OR'd at one position)
+	topicsByPos := make(map[int][]TopicWithPosition)
+	for _, t := range allTopics {
+		topicsByPos[t.Position] = append(topicsByPos[t.Position], t)
+	}
+	for pos, posTopics := range topicsByPos {
+		if len(posTopics) >= 2 {
+			for i := 0; i < len(posTopics); i++ {
+				for j := i + 1; j < len(posTopics); j++ {
+					topicsSpec := make([][]string, 4)
+					topicsSpec[pos] = []string{posTopics[i].Value, posTopics[j].Value}
+					queries = append(queries, QuerySpec{
+						Name:   fmt.Sprintf("multi-t%d(%s+%s)", pos, posTopics[i].Card, posTopics[j].Card),
+						Topics: topicsSpec,
+					})
+				}
+			}
+			if len(posTopics) >= 3 {
+				topicsSpec := make([][]string, 4)
+				topicsSpec[pos] = []string{posTopics[0].Value, posTopics[1].Value, posTopics[2].Value}
+				queries = append(queries, QuerySpec{
+					Name:   fmt.Sprintf("multi-t%d(all3)", pos),
+					Topics: topicsSpec,
+				})
+			}
 		}
-		result = append(result, multiFilter...)
+	}
+
+	// 11. Mixed: multi-contract + single topic
+	if len(allContracts) >= 2 {
+		for _, t := range allTopics {
+			queries = append(queries, QuerySpec{
+				Name:        fmt.Sprintf("multi-c+t%d-%s", t.Position, t.Card),
+				ContractIDs: allContracts[:2],
+				Topics:      makeTopics(t),
+			})
+		}
+	}
+
+	// 12. Single contract + multi-topic at one position
+	for ci, c := range allContracts {
+		cCard := contractCardLabel(ci)
+		for pos, posTopics := range topicsByPos {
+			if len(posTopics) >= 2 {
+				topicsSpec := make([][]string, 4)
+				topicsSpec[pos] = []string{posTopics[0].Value, posTopics[1].Value}
+				queries = append(queries, QuerySpec{
+					Name:        fmt.Sprintf("c-%s+multi-t%d", cCard, pos),
+					ContractIDs: []string{c},
+					Topics:      topicsSpec,
+				})
+			}
+		}
+	}
+
+	// 13. Worst-case: 3 contracts + 3 values at each topic position
+	// (c1 OR c2 OR c3) AND (t0v1 OR t0v2 OR t0v3) AND ... for all 4 positions
+	if len(allContracts) >= 3 {
+		allPositionsHave3 := true
+		topicsSpec := make([][]string, 4)
+		for pos := 0; pos < 4; pos++ {
+			if len(topicsByPos[pos]) < 3 {
+				allPositionsHave3 = false
+				break
+			}
+			topicsSpec[pos] = []string{
+				topicsByPos[pos][0].Value,
+				topicsByPos[pos][1].Value,
+				topicsByPos[pos][2].Value,
+			}
+		}
+		if allPositionsHave3 {
+			queries = append(queries, QuerySpec{
+				Name:        "worst-3c+3t0+3t1+3t2+3t3",
+				ContractIDs: allContracts[:3],
+				Topics:      topicsSpec,
+			})
+		}
+	}
+
+	// Classify queries into three tiers:
+	// 1. singleTerm: one contract OR one topic (types 1-2) — always included
+	// 2. multiValueOR: multiple values in any field, i.e. OR within a group (types 9-12) — always included
+	// 3. singleValueAND: single value per field, multiple fields AND'd (types 3-8) — fill remaining
+	var singleTerm []QuerySpec
+	var multiValueOR []QuerySpec
+	var singleValueAND []QuerySpec
+	for _, q := range queries {
+		totalTopicValues := 0
+		maxTopicPerPos := 0
+		for _, tv := range q.Topics {
+			totalTopicValues += len(tv)
+			if len(tv) > maxTopicPerPos {
+				maxTopicPerPos = len(tv)
+			}
+		}
+		isSingleTerm := (len(q.ContractIDs) <= 1 && totalTopicValues == 0) || (len(q.ContractIDs) == 0 && totalTopicValues == 1)
+		isMultiValue := len(q.ContractIDs) > 1 || maxTopicPerPos > 1
+
+		if isSingleTerm {
+			singleTerm = append(singleTerm, q)
+		} else if isMultiValue {
+			multiValueOR = append(multiValueOR, q)
+		} else {
+			singleValueAND = append(singleValueAND, q)
+		}
+	}
+
+	// Always include all single-term queries
+	result := singleTerm
+
+	// Always include multi-value OR queries (shuffle + cap at 25% of max)
+	mvLimit := maxCombinations / 4
+	if mvLimit < 20 {
+		mvLimit = 20
+	}
+	rand.Shuffle(len(multiValueOR), func(i, j int) {
+		multiValueOR[i], multiValueOR[j] = multiValueOR[j], multiValueOR[i]
+	})
+	if len(multiValueOR) > mvLimit {
+		multiValueOR = multiValueOR[:mvLimit]
+	}
+	result = append(result, multiValueOR...)
+
+	// Fill remaining with single-value AND queries
+	remaining := maxCombinations - len(result)
+	if remaining > 0 && len(singleValueAND) > 0 {
+		rand.Shuffle(len(singleValueAND), func(i, j int) {
+			singleValueAND[i], singleValueAND[j] = singleValueAND[j], singleValueAND[i]
+		})
+		if len(singleValueAND) > remaining {
+			singleValueAND = singleValueAND[:remaining]
+		}
+		result = append(result, singleValueAND...)
 	}
 
 	return result
@@ -636,33 +783,38 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 	}
 	var timings []iterationTiming
 
-	// Decode contract ID if present
-	var contractBytes []byte
-	if spec.ContractID != "" {
-		var err error
-		contractBytes, err = decodeContractID(spec.ContractID)
+	// Decode contract IDs
+	var contractBytes [][]byte
+	for _, cid := range spec.ContractIDs {
+		decoded, err := decodeContractID(cid)
 		if err != nil {
 			result.Error = fmt.Sprintf("invalid contract ID: %v", err)
 			return result
 		}
+		contractBytes = append(contractBytes, decoded)
 	}
 
-	// Decode topics
-	var topicBytes [][]byte
-	for _, t := range spec.Topics {
-		decoded, err := decodeBase64(t)
-		if err != nil {
-			result.Error = fmt.Sprintf("invalid topic: %v", err)
-			return result
+	// Decode topics: Topics[position] = []values -> topicGroups[position] = [][]byte
+	var topicGroups [4][][]byte
+	for pos, values := range spec.Topics {
+		if pos >= 4 {
+			break
 		}
-		topicBytes = append(topicBytes, decoded)
+		for _, t := range values {
+			decoded, err := decodeBase64(t)
+			if err != nil {
+				result.Error = fmt.Sprintf("invalid topic: %v", err)
+				return result
+			}
+			topicGroups[pos] = append(topicGroups[pos], decoded)
+		}
 	}
 
 	// Warmup runs (with timeout)
 	for i := 0; i < warmup; i++ {
 		resultChan := make(chan *QueryResult, 1)
 		go func() {
-			resultChan <- executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicBytes, indexType, limit)
+			resultChan <- executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicGroups, indexType, limit)
 		}()
 		select {
 		case <-resultChan:
@@ -679,7 +831,7 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 
 		resultChan := make(chan *QueryResult, 1)
 		go func() {
-			resultChan <- executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicBytes, indexType, limit)
+			resultChan <- executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicGroups, indexType, limit)
 		}()
 
 		var qr *QueryResult
@@ -784,12 +936,46 @@ type QueryResult struct {
 	Error error
 }
 
-func executeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topics [][]byte, indexType string, limit int) *QueryResult {
+func executeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, indexType string, limit int) *QueryResult {
+	// Determine if this is a multi-value query (OR within any group)
+	isMultiValue := len(contractIDs) > 1
+	if !isMultiValue {
+		for _, tg := range topicGroups {
+			if len(tg) > 1 {
+				isMultiValue = true
+				break
+			}
+		}
+	}
+
+	// For single-value queries, use the original (optimized) functions
+	if !isMultiValue {
+		var singleContract []byte
+		if len(contractIDs) == 1 {
+			singleContract = contractIDs[0]
+		}
+		var flatTopics [][]byte
+		for _, tg := range topicGroups {
+			for _, t := range tg {
+				flatTopics = append(flatTopics, t)
+			}
+		}
+
+		switch indexType {
+		case "posting-v2":
+			return executePostingV2QueryBenchmark(eventStore, startLedger, endLedger, singleContract, flatTopics, limit)
+		case "bitmap32":
+			return executeBitmap32QueryBenchmark(eventStore, startLedger, endLedger, singleContract, flatTopics, limit)
+		}
+		return nil
+	}
+
+	// Multi-value: use new multi-filter functions
 	switch indexType {
 	case "posting-v2":
-		return executePostingV2QueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
+		return executePostingV2MultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
 	case "bitmap32":
-		return executeBitmap32QueryBenchmark(eventStore, startLedger, endLedger, contractID, topics, limit)
+		return executeBitmap32MultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
 	}
 	return nil
 }
@@ -838,6 +1024,50 @@ func executeBitmap32QueryBenchmark(eventStore *store.RocksDBEventStore, startLed
 	}
 }
 
+func executePostingV2MultiFilterBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEventsWithPostingListV2MultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
+	if err != nil {
+		return &QueryResult{Error: err}
+	}
+
+	return &QueryResult{
+		EventsReturned:  len(events),
+		EventsScanned:   stats.EventsScanned,
+		IndexBytes:      stats.PostingListBytes,
+		EventBytes:      stats.EventBytesRead,
+		IndexMatches:    stats.LocalIDsAfterIntersect,
+		IndexTime:       stats.PostingListTime + stats.IntersectTime,
+		IndexReadTime:   stats.PostingListReadTime,
+		IndexDecodeTime: stats.PostingListDecodeTime,
+		EventTime:       stats.EventFetchTime + stats.DecodeTime + stats.FilterTime,
+		EventFetchTime:  stats.EventFetchTime,
+		EventDecodeTime: stats.DecodeTime,
+		EventFilterTime: stats.FilterTime,
+	}
+}
+
+func executeBitmap32MultiFilterBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEventsWithBitmap32MultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
+	if err != nil {
+		return &QueryResult{Error: err}
+	}
+
+	return &QueryResult{
+		EventsReturned:  len(events),
+		EventsScanned:   stats.EventsScanned,
+		IndexBytes:      stats.IndexBytesRead,
+		EventBytes:      stats.EventBytesRead,
+		IndexMatches:    stats.MatchingLocalIDs,
+		IndexTime:       stats.IndexLookupTime,
+		IndexReadTime:   stats.IndexReadTime,
+		IndexDecodeTime: stats.IndexDecodeTime,
+		EventTime:       stats.EventFetchTime,
+		EventFetchTime:  stats.EventFetchTime,
+		EventDecodeTime: stats.DecodeTime,
+		EventFilterTime: stats.FilterTime,
+	}
+}
+
 // =============================================================================
 // Output Formatting
 // =============================================================================
@@ -849,8 +1079,8 @@ func outputTable(results []BenchmarkResult, indexes []string) {
 
 	for _, r := range results {
 		key := r.Query.Name
-		if r.Query.ContractID != "" {
-			key += ":" + r.Query.ContractID[:8]
+		if len(r.Query.ContractIDs) > 0 {
+			key += ":" + r.Query.ContractIDs[0][:8]
 		}
 		if _, ok := queryResults[key]; !ok {
 			queryResults[key] = make(map[string]BenchmarkResult)
@@ -928,15 +1158,15 @@ func outputCSV(results []BenchmarkResult) {
 	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,index_type,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,events_returned,events_scanned,event_bytes,iterations,error")
 
 	for _, r := range results {
-		contractID := r.Query.ContractID
+		contractID := strings.Join(r.Query.ContractIDs, "|")
 		if contractID == "" {
 			contractID = "-"
 		}
 
 		topics := make([]string, 4)
 		for i := 0; i < 4; i++ {
-			if i < len(r.Query.Topics) {
-				topics[i] = r.Query.Topics[i]
+			if i < len(r.Query.Topics) && len(r.Query.Topics[i]) > 0 {
+				topics[i] = strings.Join(r.Query.Topics[i], "|")
 			} else {
 				topics[i] = "-"
 			}
@@ -972,10 +1202,10 @@ func outputCSV(results []BenchmarkResult) {
 func outputJSON(results []BenchmarkResult) {
 	type jsonResult struct {
 		// Query identification
-		QueryName  string   `json:"query_name"`
-		ContractID string   `json:"contract_id,omitempty"`
-		Topics     []string `json:"topics,omitempty"`
-		IndexType  string   `json:"index_type"`
+		QueryName   string     `json:"query_name"`
+		ContractIDs []string   `json:"contract_ids,omitempty"`
+		Topics      [][]string `json:"topics,omitempty"`
+		IndexType   string     `json:"index_type"`
 
 		// Timing
 		P50Ms float64 `json:"p50_total_ms"`
@@ -1008,7 +1238,7 @@ func outputJSON(results []BenchmarkResult) {
 	for _, r := range results {
 		jr := jsonResult{
 			QueryName:        r.Query.Name,
-			ContractID:       r.Query.ContractID,
+			ContractIDs:      r.Query.ContractIDs,
 			Topics:           r.Query.Topics,
 			IndexType:        r.IndexType,
 			P50Ms:            float64(r.P50Time.Microseconds()) / 1000.0,
@@ -1043,12 +1273,12 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 		// Write as JSON Lines (one JSON object per line)
 		jr := struct {
 			// Query identification
-			QueryName   string   `json:"query_name"`
-			ContractID  string   `json:"contract_id,omitempty"`
-			Topics      []string `json:"topics,omitempty"`
-			IndexType   string   `json:"index_type"`
-			StartLedger uint32   `json:"start_ledger"`
-			EndLedger   uint32   `json:"end_ledger"`
+			QueryName   string     `json:"query_name"`
+			ContractIDs []string   `json:"contract_ids,omitempty"`
+			Topics      [][]string `json:"topics,omitempty"`
+			IndexType   string     `json:"index_type"`
+			StartLedger uint32     `json:"start_ledger"`
+			EndLedger   uint32     `json:"end_ledger"`
 
 			// Timing
 			P50Ms float64 `json:"p50_total_ms"`
@@ -1077,7 +1307,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			Error      string `json:"error,omitempty"`
 		}{
 			QueryName:        r.Query.Name,
-			ContractID:       r.Query.ContractID,
+			ContractIDs:      r.Query.ContractIDs,
 			Topics:           r.Query.Topics,
 			IndexType:        r.IndexType,
 			StartLedger:      r.StartLedger,
@@ -1105,14 +1335,14 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 		fmt.Fprintln(w, string(line))
 	default:
 		// CSV format
-		contractID := r.Query.ContractID
+		contractID := strings.Join(r.Query.ContractIDs, "|")
 		if contractID == "" {
 			contractID = "-"
 		}
 		topics := make([]string, 4)
 		for i := 0; i < 4; i++ {
-			if i < len(r.Query.Topics) {
-				topics[i] = r.Query.Topics[i]
+			if i < len(r.Query.Topics) && len(r.Query.Topics[i]) > 0 {
+				topics[i] = strings.Join(r.Query.Topics[i], "|")
 			} else {
 				topics[i] = "-"
 			}
