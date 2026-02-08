@@ -91,7 +91,8 @@ type DistributionStats struct {
 	P90   int64      `json:"p90"`
 	P99   int64      `json:"p99"`
 	Total int64      `json:"total"`
-	TopN  []TopEntry `json:"top_n,omitempty"`
+	TopN    []TopEntry `json:"top_n,omitempty"`
+	BottomN []TopEntry `json:"bottom_n,omitempty"`
 
 	// Key size metrics (for bitmap index truncation analysis)
 	Over32Bytes int64 `json:"over_32_bytes"` // Count of unique values > 32 bytes
@@ -209,6 +210,74 @@ func (h *topNHeap) getSorted() []TopEntry {
 	copy(result, h.entries)
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].EventCount > result[j].EventCount
+	})
+	return result
+}
+
+// bottomNHeap is a max-heap for tracking bottom N entries by count (smallest event counts).
+// It keeps the N smallest entries by evicting the largest when full.
+type bottomNHeap struct {
+	entries   []TopEntry
+	maxSize   int
+	indexType byte
+}
+
+func (h *bottomNHeap) Len() int           { return len(h.entries) }
+func (h *bottomNHeap) Less(i, j int) bool { return h.entries[i].EventCount > h.entries[j].EventCount }
+func (h *bottomNHeap) Swap(i, j int)      { h.entries[i], h.entries[j] = h.entries[j], h.entries[i] }
+
+func (h *bottomNHeap) Push(x interface{}) {
+	h.entries = append(h.entries, x.(TopEntry))
+}
+
+func (h *bottomNHeap) Pop() interface{} {
+	old := h.entries
+	n := len(old)
+	x := old[n-1]
+	h.entries = old[0 : n-1]
+	return x
+}
+
+// tryAdd adds an entry if it belongs in bottom N (max-heap, so largest is at top)
+func (h *bottomNHeap) tryAdd(value []byte, count int64) {
+	if h.maxSize <= 0 {
+		return
+	}
+
+	var encoded string
+	if h.indexType == UniqueTypeContract && len(value) == 32 {
+		if s, err := strkey.Encode(strkey.VersionByteContract, value); err == nil {
+			encoded = s
+		} else {
+			encoded = base64.StdEncoding.EncodeToString(value)
+		}
+	} else {
+		encoded = base64.StdEncoding.EncodeToString(value)
+	}
+
+	if len(h.entries) < h.maxSize {
+		heap.Push(h, TopEntry{
+			Value:      encoded,
+			EventCount: count,
+		})
+	} else if count < h.entries[0].EventCount {
+		h.entries[0] = TopEntry{
+			Value:      encoded,
+			EventCount: count,
+		}
+		heap.Fix(h, 0)
+	}
+}
+
+// getSorted returns entries sorted by count ascending (smallest first)
+func (h *bottomNHeap) getSorted() []TopEntry {
+	if len(h.entries) == 0 {
+		return nil
+	}
+	result := make([]TopEntry, len(h.entries))
+	copy(result, h.entries)
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].EventCount < result[j].EventCount
 	})
 	return result
 }

@@ -167,4 +167,10 @@ func printDistribution(name string, stats *store.DistributionStats) {
 			p.Printf("    %2d. %s (%d events)\n", i+1, entry.Value, entry.EventCount)
 		}
 	}
+	if len(stats.BottomN) > 0 {
+		p.Printf("  Bottom %d by event count:\n", len(stats.BottomN))
+		for i, entry := range stats.BottomN {
+			p.Printf("    %2d. %s (%d events)\n", i+1, entry.Value, entry.EventCount)
+		}
+	}
 }

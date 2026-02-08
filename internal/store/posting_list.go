@@ -312,6 +312,7 @@ type postingListV2Result struct {
 	bytesRead  int64
 	readTime   time.Duration
 	decodeTime time.Duration
+	filterTime time.Duration
 	err        error
 	isContract bool
 }
@@ -365,6 +366,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2Timing(contractID []byt
 		result.PostingListBytes += plr.bytesRead
 		result.PostingListReadTime += plr.readTime
 		result.PostingListDecodeTime += plr.decodeTime
+		result.PostingListFilterTime += plr.filterTime
 		result.LocalIDsInPostingList += len(plr.localIDs)
 	}
 
@@ -434,13 +436,14 @@ func (es *RocksDBEventStore) queryPostingListsV2Parallel(contractID []byte, topi
 		go func(i int) {
 			defer wg.Done()
 			termKey := ContractTermKey(contractID)
-			ids, bucketsRead, bytesRead, readT, decodeT, err := es.queryPostingListV2WithStats(es.cfContractsPLV2, termKey, buckets, startLedger, endLedger)
+			ids, bucketsRead, bytesRead, readT, decodeT, filterT, err := es.queryPostingListV2WithStats(es.cfContractsPLV2, termKey, buckets, startLedger, endLedger)
 			results[i] = postingListV2Result{
 				localIDs:   ids,
 				buckets:    bucketsRead,
 				bytesRead:  bytesRead,
 				readTime:   readT,
 				decodeTime: decodeT,
+				filterTime: filterT,
 				err:        err,
 				isContract: true,
 			}
@@ -458,13 +461,14 @@ func (es *RocksDBEventStore) queryPostingListsV2Parallel(contractID []byte, topi
 			go func(i, p int, topic []byte) {
 				defer wg.Done()
 				termKey := TopicTermKey(p, topic)
-				ids, bucketsRead, bytesRead, readT, decodeT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
+				ids, bucketsRead, bytesRead, readT, decodeT, filterT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
 				results[i] = postingListV2Result{
 					localIDs:   ids,
 					buckets:    bucketsRead,
 					bytesRead:  bytesRead,
 					readTime:   readT,
 					decodeTime: decodeT,
+					filterTime: filterT,
 					err:        err,
 					isContract: false,
 				}
@@ -506,7 +510,7 @@ func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topi
 	}
 
 	var allEvents []*query.Event
-	var plTime, plReadTime, plDecodeTime time.Duration
+	var plTime, plReadTime, plDecodeTime, plFilterTime time.Duration
 	var fetchTime, decodeTime, filterTime time.Duration
 
 	for _, bucketID := range buckets {
@@ -549,7 +553,9 @@ func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topi
 		plDecodeTime += time.Since(t1)
 
 		// Filter by ledger range
+		t2 := time.Now()
 		filtered := FilterLocalIDsByLedgerRange(localIDs, bucketStart, startLedger, endLedger)
+		plFilterTime += time.Since(t2)
 		result.LocalIDsInPostingList += len(filtered)
 		result.LocalIDsAfterIntersect += len(filtered)
 		plTime += time.Since(plStart)
@@ -571,6 +577,7 @@ func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topi
 	result.PostingListTime = plTime
 	result.PostingListReadTime = plReadTime
 	result.PostingListDecodeTime = plDecodeTime
+	result.PostingListFilterTime = plFilterTime
 	result.EventFetchTime = fetchTime
 	result.DecodeTime = decodeTime
 	result.FilterTime = filterTime
@@ -784,10 +791,10 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32,
 }
 
 // queryPostingListV2WithStats reads V2 posting lists (32-bit local IDs) and returns stats.
-func (es *RocksDBEventStore) queryPostingListV2WithStats(cf *grocksdb.ColumnFamilyHandle, termKey [32]byte, buckets []uint32, startLedger, endLedger uint32) ([]uint32, int, int64, time.Duration, time.Duration, error) {
+func (es *RocksDBEventStore) queryPostingListV2WithStats(cf *grocksdb.ColumnFamilyHandle, termKey [32]byte, buckets []uint32, startLedger, endLedger uint32) ([]uint32, int, int64, time.Duration, time.Duration, time.Duration, error) {
 	var allLocalIDs []uint32
 	var bytesRead int64
-	var readTime, decodeTime time.Duration
+	var readTime, decodeTime, filterTime time.Duration
 
 	for _, bucketID := range buckets {
 		indexKey := EncodeIndexKeyWithBucket(termKey, bucketID)
@@ -796,7 +803,7 @@ func (es *RocksDBEventStore) queryPostingListV2WithStats(cf *grocksdb.ColumnFami
 		value, err := es.db.GetCF(es.ro, cf, indexKey)
 		readTime += time.Since(t0)
 		if err != nil {
-			return nil, 0, 0, 0, 0, fmt.Errorf("failed to read V2 posting list: %w", err)
+			return nil, 0, 0, 0, 0, 0, fmt.Errorf("failed to read V2 posting list: %w", err)
 		}
 
 		if value.Exists() {
@@ -806,14 +813,16 @@ func (es *RocksDBEventStore) queryPostingListV2WithStats(cf *grocksdb.ColumnFami
 			localIDs := DecodeLocalIDListDeltaVarint(data)
 			decodeTime += time.Since(t1)
 
+			t2 := time.Now()
 			bucketStart := bucketID * BucketSize
 			filtered := FilterLocalIDsByLedgerRange(localIDs, bucketStart, startLedger, endLedger)
 			allLocalIDs = append(allLocalIDs, filtered...)
+			filterTime += time.Since(t2)
 		}
 		value.Free()
 	}
 
-	return allLocalIDs, len(buckets), bytesRead, readTime, decodeTime, nil
+	return allLocalIDs, len(buckets), bytesRead, readTime, decodeTime, filterTime, nil
 }
 
 // =============================================================================
@@ -839,10 +848,11 @@ type PostingListV2QueryResult struct {
 	EventBytesRead int64 // Bytes read from event storage
 
 	// Timing breakdown
-	PostingListTime       time.Duration // Time reading posting lists (total)
-	PostingListReadTime   time.Duration // I/O: time in RocksDB GetCF
-	PostingListDecodeTime time.Duration // CPU: time in DecodeLocalIDListDeltaVarint
-	IntersectTime         time.Duration // Time intersecting local ID lists
+	PostingListTime        time.Duration // Time reading posting lists (total wall-clock)
+	PostingListReadTime    time.Duration // I/O: time in RocksDB GetCF
+	PostingListDecodeTime  time.Duration // CPU: time in DecodeLocalIDListDeltaVarint
+	PostingListFilterTime  time.Duration // CPU: time in FilterLocalIDsByLedgerRange
+	IntersectTime          time.Duration // Time intersecting local ID lists
 	EventFetchTime        time.Duration // Time fetching events
 	DecodeTime            time.Duration // Time decoding events
 	FilterTime            time.Duration // Time filtering events
@@ -903,7 +913,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 		go func(i int, contractID []byte) {
 			defer wg.Done()
 			termKey := ContractTermKey(contractID)
-			ids, bucketsRead, bytesRead, readT, decodeT, err := es.queryPostingListV2WithStats(es.cfContractsPLV2, termKey, buckets, startLedger, endLedger)
+			ids, bucketsRead, bytesRead, readT, decodeT, filterT, err := es.queryPostingListV2WithStats(es.cfContractsPLV2, termKey, buckets, startLedger, endLedger)
 			plResults[i] = plGroup{
 				groupIdx: 0,
 				result: postingListV2Result{
@@ -912,6 +922,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 					bytesRead:  bytesRead,
 					readTime:   readT,
 					decodeTime: decodeT,
+					filterTime: filterT,
 					err:        err,
 					isContract: true,
 				},
@@ -931,7 +942,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 			go func(i int, groupIdx int, p int, topic []byte) {
 				defer wg.Done()
 				termKey := TopicTermKey(p, topic)
-				ids, bucketsRead, bytesRead, readT, decodeT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
+				ids, bucketsRead, bytesRead, readT, decodeT, filterT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
 				plResults[i] = plGroup{
 					groupIdx: groupIdx,
 					result: postingListV2Result{
@@ -940,6 +951,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 						bytesRead:  bytesRead,
 						readTime:   readT,
 						decodeTime: decodeT,
+						filterTime: filterT,
 						err:        err,
 						isContract: false,
 					},
@@ -961,6 +973,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 		result.PostingListBytes += pg.result.bytesRead
 		result.PostingListReadTime += pg.result.readTime
 		result.PostingListDecodeTime += pg.result.decodeTime
+		result.PostingListFilterTime += pg.result.filterTime
 		result.LocalIDsInPostingList += len(pg.result.localIDs)
 	}
 

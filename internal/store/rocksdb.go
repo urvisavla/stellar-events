@@ -644,7 +644,8 @@ func (es *RocksDBEventStore) GetEventsInRangeWithTiming(startLedger, endLedger u
 		Timing: query.FetchTiming{},
 	}
 
-	startKey := event.EncodeKeyFromParts(startLedger, 0, 0, 0)
+	// Use V2 key (6 bytes) for seeking — works as prefix for both V2 and TOID keys
+	startKey := event.EncodeKeyV2(startLedger, 0)
 
 	// Time iterator creation and seek
 	diskStart := time.Now()
@@ -664,17 +665,26 @@ func (es *RocksDBEventStore) GetEventsInRangeWithTiming(startLedger, endLedger u
 		key := it.Key().Data()
 		result.Timing.DiskReadTime += time.Since(diskStart)
 
-		if len(key) < 10 {
+		if len(key) < 6 {
 			break
 		}
 
-		// Compare ledger (bytes 0-3)
+		// Compare ledger (bytes 0-3, same position in both V2 and TOID keys)
 		keyLedger := binary.BigEndian.Uint32(key[0:4])
 		if keyLedger > endLedger {
 			break
 		}
 
-		_, tx, op, eventIdx := event.DecodeKeyFull(key)
+		// Decode key based on format (6 bytes = V2, 10 bytes = TOID)
+		var tx, op uint32
+		var eventIdx uint16
+		if len(key) == 6 {
+			eventIdx = binary.BigEndian.Uint16(key[4:6])
+		} else if len(key) >= 10 {
+			_, tx, op, eventIdx = event.DecodeKeyFull(key)
+		} else {
+			break
+		}
 
 		// Time value access (disk read)
 		diskStart = time.Now()
@@ -722,13 +732,13 @@ func (es *RocksDBEventStore) GetEventsInRangeWithTiming(startLedger, endLedger u
 func (es *RocksDBEventStore) GetEventsInLedger(ledger uint32) ([]*query.Event, error) {
 	var events []*query.Event
 
-	startKey := event.EncodeKeyFromParts(ledger, 0, 0, 0)
+	startKey := event.EncodeKeyV2(ledger, 0)
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
 	defer it.Close()
 
 	for it.Seek(startKey); it.Valid(); it.Next() {
 		key := it.Key().Data()
-		if len(key) < 10 {
+		if len(key) < 6 {
 			break
 		}
 
@@ -737,7 +747,16 @@ func (es *RocksDBEventStore) GetEventsInLedger(ledger uint32) ([]*query.Event, e
 			break
 		}
 
-		_, tx, op, eventIdx := event.DecodeKeyFull(key)
+		var tx, op uint32
+		var eventIdx uint16
+		if len(key) == 6 {
+			eventIdx = binary.BigEndian.Uint16(key[4:6])
+		} else if len(key) >= 10 {
+			_, tx, op, eventIdx = event.DecodeKeyFull(key)
+		} else {
+			break
+		}
+
 		valueData := it.Value().Data()
 
 		var ev *query.Event
@@ -767,7 +786,7 @@ func (es *RocksDBEventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.
 		Timing: query.FetchTiming{},
 	}
 
-	startKey := event.EncodeKeyFromParts(ledger, 0, 0, 0)
+	startKey := event.EncodeKeyV2(ledger, 0)
 
 	// Time iterator creation and seek
 	diskStart := time.Now()
@@ -782,7 +801,7 @@ func (es *RocksDBEventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.
 		key := it.Key().Data()
 		result.Timing.DiskReadTime += time.Since(diskStart)
 
-		if len(key) < 10 {
+		if len(key) < 6 {
 			break
 		}
 
@@ -791,7 +810,15 @@ func (es *RocksDBEventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.
 			break
 		}
 
-		_, tx, op, eventIdx := event.DecodeKeyFull(key)
+		var tx, op uint32
+		var eventIdx uint16
+		if len(key) == 6 {
+			eventIdx = binary.BigEndian.Uint16(key[4:6])
+		} else if len(key) >= 10 {
+			_, tx, op, eventIdx = event.DecodeKeyFull(key)
+		} else {
+			break
+		}
 
 		// Time value access (disk read)
 		diskStart = time.Now()
@@ -910,7 +937,7 @@ func (es *RocksDBEventStore) BuildIndexes(workers int, opts *BuildIndexOptions, 
 // buildIndexesForRange reads events for a ledger range and sends index data to collector.
 // Unique indexes are still handled locally (no lock contention issue with RocksDB merge).
 func (es *RocksDBEventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *BuildIndexOptions, entryCh chan<- *indexEntry) error {
-	startKey := event.EncodeKeyFromParts(startLedger, 0, 0, 0)
+	startKey := event.EncodeKeyV2(startLedger, 0)
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
 	defer it.Close()
 
@@ -922,19 +949,26 @@ func (es *RocksDBEventStore) buildIndexesForRange(startLedger, endLedger uint32,
 
 	for it.Seek(startKey); it.Valid(); it.Next() {
 		key := it.Key().Data()
-		if len(key) < 10 {
+		if len(key) < 6 {
 			break
 		}
 
-		// Parse key: [ledger:4][tx:2][op:2][event:2]
+		// Parse key: V2 = [ledger:4][eventSeq:2], TOID = [ledger:4][tx:2][op:2][event:2]
 		ledger := binary.BigEndian.Uint32(key[0:4])
 		if ledger > endLedger {
 			break
 		}
 
-		txIdx := binary.BigEndian.Uint16(key[4:6])
-		opIdx := binary.BigEndian.Uint16(key[6:8])
-		eventIdx := binary.BigEndian.Uint16(key[8:10])
+		var txIdx, opIdx, eventIdx uint16
+		if len(key) == 6 {
+			eventIdx = binary.BigEndian.Uint16(key[4:6])
+		} else if len(key) >= 10 {
+			txIdx = binary.BigEndian.Uint16(key[4:6])
+			opIdx = binary.BigEndian.Uint16(key[6:8])
+			eventIdx = binary.BigEndian.Uint16(key[8:10])
+		} else {
+			break
+		}
 
 		var xdrEvent xdr.ContractEvent
 		if err := xdrEvent.UnmarshalBinary(it.Value().Data()); err != nil {
@@ -1486,7 +1520,12 @@ func (es *RocksDBEventStore) countIndexTypePartition(indexType byte, partition, 
 
 // GetIndexDistribution computes percentile statistics for each index type in parallel
 // topN specifies how many top entries to include (0 for none)
-func (es *RocksDBEventStore) GetIndexDistribution(topN int) (*IndexDistribution, error) {
+func (es *RocksDBEventStore) GetIndexDistribution(topN int, bottomN ...int) (*IndexDistribution, error) {
+	botN := 0
+	if len(bottomN) > 0 {
+		botN = bottomN[0]
+	}
+
 	// Scan each type prefix in parallel
 	type result struct {
 		indexType byte
@@ -1502,7 +1541,7 @@ func (es *RocksDBEventStore) GetIndexDistribution(topN int) (*IndexDistribution,
 		wg.Add(1)
 		go func(idxType byte) {
 			defer wg.Done()
-			stats, err := es.computeDistributionForType(idxType, topN)
+			stats, err := es.computeDistributionForType(idxType, topN, botN)
 			results <- result{idxType, stats, err}
 		}(indexType)
 	}
@@ -1537,7 +1576,7 @@ func (es *RocksDBEventStore) GetIndexDistribution(topN int) (*IndexDistribution,
 }
 
 // computeDistributionForType computes distribution for a single index type using parallel partitions
-func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN int) (*DistributionStats, error) {
+func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN, bottomN int) (*DistributionStats, error) {
 	const partitions = 16
 
 	type partitionResult struct {
@@ -1545,6 +1584,7 @@ func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN int
 		total       int64
 		over32Bytes int64
 		topN        []TopEntry
+		bottomN     []TopEntry
 		err         error
 	}
 
@@ -1556,8 +1596,8 @@ func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN int
 		wg.Add(1)
 		go func(partition int) {
 			defer wg.Done()
-			counts, total, over32, top, err := es.scanDistributionPartition(indexType, partition, partitions, topN)
-			results <- partitionResult{counts, total, over32, top, err}
+			counts, total, over32, top, bot, err := es.scanDistributionPartition(indexType, partition, partitions, topN, bottomN)
+			results <- partitionResult{counts, total, over32, top, bot, err}
 		}(p)
 	}
 
@@ -1571,6 +1611,7 @@ func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN int
 	var totalSum int64
 	var over32Sum int64
 	mergedTopN := &topNHeap{maxSize: topN, entries: make([]TopEntry, 0, topN)}
+	mergedBottomN := &bottomNHeap{maxSize: bottomN, entries: make([]TopEntry, 0, bottomN)}
 
 	for r := range results {
 		if r.err != nil {
@@ -1587,6 +1628,16 @@ func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN int
 			} else if entry.EventCount > mergedTopN.entries[0].EventCount {
 				mergedTopN.entries[0] = entry
 				heap.Fix(mergedTopN, 0)
+			}
+		}
+
+		// Merge bottom-N entries
+		for _, entry := range r.bottomN {
+			if len(mergedBottomN.entries) < bottomN {
+				heap.Push(mergedBottomN, entry)
+			} else if entry.EventCount < mergedBottomN.entries[0].EventCount {
+				mergedBottomN.entries[0] = entry
+				heap.Fix(mergedBottomN, 0)
 			}
 		}
 	}
@@ -1611,13 +1662,14 @@ func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN int
 		P90:         percentile(allCounts, 90),
 		P99:         percentile(allCounts, 99),
 		TopN:        mergedTopN.getSorted(),
+		BottomN:     mergedBottomN.getSorted(),
 		Over32Bytes: over32Sum,
 	}, nil
 }
 
 // scanDistributionPartition scans a partition and returns counts for distribution
-// Returns: counts, total, over32Bytes, topN entries, error
-func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition, totalPartitions, topN int) ([]int64, int64, int64, []TopEntry, error) {
+// Returns: counts, total, over32Bytes, topN entries, bottomN entries, error
+func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition, totalPartitions, topN, bottomN int) ([]int64, int64, int64, []TopEntry, []TopEntry, error) {
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 
@@ -1637,6 +1689,7 @@ func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition
 	var total int64
 	var over32Bytes int64
 	topHeap := &topNHeap{maxSize: topN, entries: make([]TopEntry, 0, topN), indexType: indexType}
+	botHeap := &bottomNHeap{maxSize: bottomN, entries: make([]TopEntry, 0, bottomN), indexType: indexType}
 
 	for it.Seek(startKey); it.Valid(); it.Next() {
 		key := it.Key().Data()
@@ -1663,13 +1716,14 @@ func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition
 		counts = append(counts, eventCount)
 		total += eventCount
 		topHeap.tryAdd(key[1:], eventCount)
+		botHeap.tryAdd(key[1:], eventCount)
 	}
 
 	if err := it.Err(); err != nil {
-		return nil, 0, 0, nil, fmt.Errorf("iterator error for type %d partition %d: %w", indexType, partition, err)
+		return nil, 0, 0, nil, nil, fmt.Errorf("iterator error for type %d partition %d: %w", indexType, partition, err)
 	}
 
-	return counts, total, over32Bytes, topHeap.getSorted(), nil
+	return counts, total, over32Bytes, topHeap.getSorted(), botHeap.getSorted(), nil
 }
 
 // getLedgerRange finds the min and max ledger sequences in the database
@@ -1909,7 +1963,7 @@ func (es *RocksDBEventStore) computeStatsForRange(startLedger, endLedger uint32)
 		topic3s:   make(map[string]struct{}),
 	}
 
-	startKey := event.EncodeKeyFromParts(startLedger, 0, 0, 0)
+	startKey := event.EncodeKeyV2(startLedger, 0)
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
 	defer it.Close()
 

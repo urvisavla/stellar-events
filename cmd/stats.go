@@ -21,6 +21,7 @@ func runStats(cfg *config.Config, args []string) {
 	fs.SetOutput(os.Stderr)
 
 	top := fs.Int("top", 10, "Number of top entries to show in distribution stats")
+	bottom := fs.Int("bottom", 0, "Number of bottom (lowest cardinality) entries to show")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: stats [options]\n\n")
@@ -38,10 +39,10 @@ func runStats(cfg *config.Config, args []string) {
 		os.Exit(2)
 	}
 
-	cmdStats(cfg, *top)
+	cmdStats(cfg, *top, *bottom)
 }
 
-func cmdStats(cfg *config.Config, top int) {
+func cmdStats(cfg *config.Config, top, bottom int) {
 	p := message.NewPrinter(language.English)
 
 	eventStore, err := openEventStore(cfg)
@@ -122,8 +123,8 @@ func cmdStats(cfg *config.Config, top int) {
 	}
 
 	// Distribution stats
-	fmt.Fprintf(os.Stderr, "Computing distribution statistics (top %d)...\n", top)
-	dist, err := eventStore.GetIndexDistribution(top)
+	fmt.Fprintf(os.Stderr, "Computing distribution statistics (top %d, bottom %d)...\n", top, bottom)
+	dist, err := eventStore.GetIndexDistribution(top, bottom)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to get distribution: %v\n", err)
 	} else {
