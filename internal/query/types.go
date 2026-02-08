@@ -43,6 +43,25 @@ func (f *Filter) TopicFilters() [][]byte {
 	return [][]byte{f.Topic0, f.Topic1, f.Topic2, f.Topic3}
 }
 
+// TopicGroups returns topics as positional groups for index queries.
+// Each position has 0 or 1 entries (single-value filter per position).
+func (f *Filter) TopicGroups() [4][][]byte {
+	var tg [4][][]byte
+	if len(f.Topic0) > 0 {
+		tg[0] = [][]byte{f.Topic0}
+	}
+	if len(f.Topic1) > 0 {
+		tg[1] = [][]byte{f.Topic1}
+	}
+	if len(f.Topic2) > 0 {
+		tg[2] = [][]byte{f.Topic2}
+	}
+	if len(f.Topic3) > 0 {
+		tg[3] = [][]byte{f.Topic3}
+	}
+	return tg
+}
+
 // =============================================================================
 // Query Options
 // =============================================================================

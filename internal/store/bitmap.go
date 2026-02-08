@@ -86,9 +86,9 @@ func (bi *eventBitmap32Index) AddContractEvent(contractID []byte, ledger uint32,
 	}
 }
 
-// AddTopicEvent adds an event to the topic index (non-positional).
-func (bi *eventBitmap32Index) AddTopicEvent(topicValue []byte, ledger uint32, eventSeq uint16) {
-	termKey := TopicTermKey(topicValue)
+// AddTopicEvent adds an event to the topic index (positional).
+func (bi *eventBitmap32Index) AddTopicEvent(pos int, topicValue []byte, ledger uint32, eventSeq uint16) {
+	termKey := TopicTermKey(pos, topicValue)
 	segmentID := BucketID(ledger)
 	segmentStart := segmentID * BucketSize
 	ledgerOffset := uint16(ledger - segmentStart)
@@ -387,9 +387,9 @@ func (s *BitmapEventSeqStore) AddContractEvent(contractID []byte, ledger uint32,
 	s.bitmap.AddContractEvent(contractID, ledger, eventSeq)
 }
 
-// AddTopicEvent adds an event to the topic index (non-positional).
-func (s *BitmapEventSeqStore) AddTopicEvent(topic []byte, ledger uint32, eventSeq uint16) {
-	s.bitmap.AddTopicEvent(topic, ledger, eventSeq)
+// AddTopicEvent adds an event to the topic index (positional).
+func (s *BitmapEventSeqStore) AddTopicEvent(pos int, topic []byte, ledger uint32, eventSeq uint16) {
+	s.bitmap.AddTopicEvent(pos, topic, ledger, eventSeq)
 }
 
 // =============================================================================
@@ -408,7 +408,7 @@ type EventSeqQueryResult struct {
 }
 
 // QueryEventKeysWithStats returns per-segment bitmaps of matching local IDs.
-func (s *BitmapEventSeqStore) QueryEventKeysWithStats(contractID []byte, topics [][]byte, startLedger, endLedger uint32) (*EventSeqQueryResult, error) {
+func (s *BitmapEventSeqStore) QueryEventKeysWithStats(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32) (*EventSeqQueryResult, error) {
 	result := &EventSeqQueryResult{
 		PerSegment: make(map[uint32]*roaring.Bitmap),
 	}
@@ -442,27 +442,29 @@ func (s *BitmapEventSeqStore) QueryEventKeysWithStats(contractID []byte, topics 
 		}
 	}
 
-	// Query topic indexes (non-positional)
-	for _, topic := range topics {
-		if len(topic) == 0 {
-			continue
-		}
-		expectedTerms++
-		termKey := TopicTermKey(topic)
-		perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(false, termKey, startLedger, endLedger)
-		if err != nil {
-			return nil, fmt.Errorf("topic bitmap32 query failed: %w", err)
-		}
-		result.BytesRead += bytesRead
-		result.Segments += segments
-		result.ReadTime += readTime
-		result.DecodeTime += decodeTime
-
-		for segID, bm := range perSeg {
-			if _, ok := allSegments[segID]; !ok {
-				allSegments[segID] = &segmentBitmaps{}
+	// Query topic indexes (positional)
+	for pos, tg := range topicGroups {
+		for _, topic := range tg {
+			if len(topic) == 0 {
+				continue
 			}
-			allSegments[segID].bitmaps = append(allSegments[segID].bitmaps, bm)
+			expectedTerms++
+			termKey := TopicTermKey(pos, topic)
+			perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(false, termKey, startLedger, endLedger)
+			if err != nil {
+				return nil, fmt.Errorf("topic bitmap32 query failed: %w", err)
+			}
+			result.BytesRead += bytesRead
+			result.Segments += segments
+			result.ReadTime += readTime
+			result.DecodeTime += decodeTime
+
+			for segID, bm := range perSeg {
+				if _, ok := allSegments[segID]; !ok {
+					allSegments[segID] = &segmentBitmaps{}
+				}
+				allSegments[segID].bitmaps = append(allSegments[segID].bitmaps, bm)
+			}
 		}
 	}
 
@@ -536,7 +538,7 @@ func (s *BitmapEventSeqStore) QueryEventKeysMultiFilter(
 			if len(topicXDR) == 0 {
 				continue
 			}
-			termKey := TopicTermKey(topicXDR)
+			termKey := TopicTermKey(pos, topicXDR)
 			perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(false, termKey, startLedger, endLedger)
 			if err != nil {
 				return nil, fmt.Errorf("topic bitmap32 multi-filter query failed: %w", err)

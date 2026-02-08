@@ -485,9 +485,9 @@ func (es *RocksDBEventStore) StoreEvents(events []*event.IngestEvent, opts *Stor
 				eventBitmap32Idx.AddContractEvent(ev.ContractID, ev.LedgerSequence, eventSeq)
 			}
 
-			// Index topics -> local ID (32-bit, non-positional)
-			for _, topicBytes := range ev.Topics {
-				eventBitmap32Idx.AddTopicEvent(topicBytes, ev.LedgerSequence, eventSeq)
+			// Index topics -> local ID (32-bit, positional)
+			for pos, topicBytes := range ev.Topics {
+				eventBitmap32Idx.AddTopicEvent(pos, topicBytes, ev.LedgerSequence, eventSeq)
 			}
 		}
 
@@ -504,8 +504,8 @@ func (es *RocksDBEventStore) StoreEvents(events []*event.IngestEvent, opts *Stor
 				es.contractPostingsV2[indexKey] = append(es.contractPostingsV2[indexKey], localIDBytes...)
 			}
 
-			for _, topicBytes := range ev.Topics {
-				termKey := TopicTermKey(topicBytes)
+			for pos, topicBytes := range ev.Topics {
+				termKey := TopicTermKey(pos, topicBytes)
 				indexKey := string(EncodeIndexKey(termKey, ev.LedgerSequence))
 				es.topicPostingsV2[indexKey] = append(es.topicPostingsV2[indexKey], localIDBytes...)
 			}
@@ -1973,7 +1973,7 @@ func (es *RocksDBEventStore) computeStatsForRange(startLedger, endLedger uint32)
 
 // QueryEventsWithBitmap32EventIndex queries events using the 32-bit event-level bitmap index.
 // Uses sequential event IDs + FromBuffer for near-zero-cost index decode.
-func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
 	totalStart := time.Now()
 	result := &Bitmap32EventQueryResult{
 		LedgerRange: endLedger - startLedger + 1,
@@ -1983,9 +1983,9 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 		return nil, nil, fmt.Errorf("bitmap32 event index not available")
 	}
 
-	// Query the bitmap32 index (non-positional topic matching)
+	// Query the bitmap32 index (positional topic matching)
 	indexStart := time.Now()
-	queryResult, err := es.eventIndex32Store.QueryEventKeysWithStats(contractID, topics, startLedger, endLedger)
+	queryResult, err := es.eventIndex32Store.QueryEventKeysWithStats(contractID, topicGroups, startLedger, endLedger)
 	if err != nil {
 		return nil, nil, fmt.Errorf("bitmap32 event query failed: %w", err)
 	}
@@ -2116,26 +2116,18 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 				r.bytesRead += int64(len(valueCopy))
 				r.scanned++
 
-				// Filter using binary header
+				// Filter using binary header (contract ID only; topic filtering is handled by positional index)
 				filterStart := time.Now()
-				if es.eventFormat == "binary" && (len(contractID) > 0 || len(topics) > 0) {
+				if es.eventFormat == "binary" && len(contractID) > 0 {
 					header := event.ParseBinaryHeader(valueCopy)
 					if header != nil {
-						matches := true
-						if len(contractID) > 0 && !header.MatchesContractID(contractID) {
-							matches = false
-						}
-						if matches && len(topics) > 0 && !header.MatchesTopicsNonPositional(topics) {
-							matches = false
-						}
-						r.filterTime += time.Since(filterStart)
-						if !matches {
+						if !header.MatchesContractID(contractID) {
+							r.filterTime += time.Since(filterStart)
 							continue
 						}
 					}
-				} else {
-					r.filterTime += time.Since(filterStart)
 				}
+				r.filterTime += time.Since(filterStart)
 
 				// Decode to query.Event
 				ledgerOffset, eventSeq := event.DecodeBitmap32LocalID(meta.localID)
@@ -2227,15 +2219,6 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 	if queryResult.TotalCount == 0 {
 		result.TotalTime = time.Since(totalStart)
 		return result, nil, nil
-	}
-
-	// Pre-compute hasTopicFilters once
-	hasTopicFilters := false
-	for _, tg := range topicGroups {
-		if len(tg) > 0 {
-			hasTopicFilters = true
-			break
-		}
 	}
 
 	// Collect all keys and metadata from bitmap results, capped at limit
@@ -2352,36 +2335,25 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 				r.bytesRead += int64(len(valueCopy))
 				r.scanned++
 
-				// Multi-value post-filter using binary header
+				// Post-filter: contract ID only (topic filtering is handled by positional index)
 				filterStart := time.Now()
-				if es.eventFormat == "binary" && (len(contractIDs) > 0 || hasTopicFilters) {
+				if es.eventFormat == "binary" && len(contractIDs) > 0 {
 					header := event.ParseBinaryHeader(valueCopy)
 					if header != nil {
-						matches := true
-						if len(contractIDs) > 0 {
-							contractMatch := false
-							for _, cid := range contractIDs {
-								if header.MatchesContractID(cid) {
-									contractMatch = true
-									break
-								}
-							}
-							if !contractMatch {
-								matches = false
+						contractMatch := false
+						for _, cid := range contractIDs {
+							if header.MatchesContractID(cid) {
+								contractMatch = true
+								break
 							}
 						}
-						// Topics: OR within each position, AND across positions
-						if matches && hasTopicFilters && !header.MatchesTopicsPositionalMulti(topicGroups) {
-							matches = false
-						}
-						r.filterTime += time.Since(filterStart)
-						if !matches {
+						if !contractMatch {
+							r.filterTime += time.Since(filterStart)
 							continue
 						}
 					}
-				} else {
-					r.filterTime += time.Since(filterStart)
 				}
+				r.filterTime += time.Since(filterStart)
 
 				// Decode to query.Event
 				ledgerOffset, eventSeq := event.DecodeBitmap32LocalID(meta.localID)

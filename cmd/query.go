@@ -25,10 +25,10 @@ func runQuery(cfg *config.Config, args []string) {
 	contract := fs.String("contract", "", "Contract ID (C... strkey format)")
 	topics := fs.String("topics", "", "Comma-separated topics (base64), position-independent AND logic")
 	useBitmap := fs.Bool("bitmap", false, "Use 32-bit bitmap index (ledger-level, positional topics)")
-	topic0 := fs.String("topic0", "", "Topic0 (base64) - positional, use --topics for non-positional")
-	topic1 := fs.String("topic1", "", "Topic1 (base64)")
-	topic2 := fs.String("topic2", "", "Topic2 (base64)")
-	topic3 := fs.String("topic3", "", "Topic3 (base64)")
+	topic0 := fs.String("topic0", "", "Topic0 (base64) - positional filter at position 0")
+	topic1 := fs.String("topic1", "", "Topic1 (base64) - positional filter at position 1")
+	topic2 := fs.String("topic2", "", "Topic2 (base64) - positional filter at position 2")
+	topic3 := fs.String("topic3", "", "Topic3 (base64) - positional filter at position 3")
 	limit := fs.Int("limit", 0, "Max results (0 = use config default)")
 	compareDB := fs.String("compare-db", "", "Compare with another database (path)")
 	compareFormat := fs.String("compare-format", "", "Format of compare database: xdr or binary (auto-detect if not set)")
@@ -44,10 +44,10 @@ func runQuery(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "\nFilter options:\n")
 		fmt.Fprintf(os.Stderr, "  --contract <id>   Filter by contract ID (C... strkey format)\n")
 		fmt.Fprintf(os.Stderr, "  --topics <list>   Comma-separated topics (base64), position-independent AND\n")
-		fmt.Fprintf(os.Stderr, "  --topic0 <val>    Filter by topic0 (base64) - positional, requires --bitmap\n")
-		fmt.Fprintf(os.Stderr, "  --topic1 <val>    Filter by topic1 (base64) - positional, requires --bitmap\n")
-		fmt.Fprintf(os.Stderr, "  --topic2 <val>    Filter by topic2 (base64) - positional, requires --bitmap\n")
-		fmt.Fprintf(os.Stderr, "  --topic3 <val>    Filter by topic3 (base64) - positional, requires --bitmap\n")
+		fmt.Fprintf(os.Stderr, "  --topic0 <val>    Filter by topic0 (base64) - positional\n")
+		fmt.Fprintf(os.Stderr, "  --topic1 <val>    Filter by topic1 (base64) - positional\n")
+		fmt.Fprintf(os.Stderr, "  --topic2 <val>    Filter by topic2 (base64) - positional\n")
+		fmt.Fprintf(os.Stderr, "  --topic3 <val>    Filter by topic3 (base64) - positional\n")
 		fmt.Fprintf(os.Stderr, "  --limit <n>       Max results (default: %d from config)\n", cfg.Query.DefaultLimit)
 		fmt.Fprintf(os.Stderr, "\nComparison options:\n")
 		fmt.Fprintf(os.Stderr, "  --compare-db <path>     Compare with another database\n")
@@ -193,20 +193,11 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 		return
 	}
 
-	// Select index type
-	switch indexType {
-	case "posting-v2":
-		runPostingV2Query(eventStore, contractID, topicsCSV, startLedger, endLedger, limit)
-		return
+	// If positional --topic0/1/2/3 flags are used, build a filter from them
+	hasPositionalTopics := hasTopic0 || hasTopic1 || hasTopic2 || hasTopic3
 
-	case "bitmap32":
-		// If --topics is used (non-positional), use non-positional query
-		if hasTopics {
-			runBitmap32NonPositionalQuery(eventStore, contractID, topicsCSV, startLedger, endLedger, limit)
-			return
-		}
-
-		// If --topic0/1/2/3 are used, use positional query
+	if hasPositionalTopics || !hasTopics {
+		// Use positional topic flags (or contract-only)
 		filter := buildFilter(contractID, topic0, topic1, topic2, topic3)
 		if filter == nil {
 			os.Exit(2)
@@ -218,8 +209,21 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 			return
 		}
 
-		// Single database query (bitmap32 positional index)
-		runSingleQuery(eventStore, filter, startLedger, endLedger, limit)
+		switch indexType {
+		case "posting-v2":
+			runPostingV2PositionalQuery(eventStore, filter, startLedger, endLedger, limit)
+		case "bitmap32":
+			runBitmap32PositionalQuery(eventStore, filter, startLedger, endLedger, limit)
+		}
+		return
+	}
+
+	// --topics CSV flag: parse as positional (topic0,topic1,topic2,topic3)
+	switch indexType {
+	case "posting-v2":
+		runPostingV2Query(eventStore, contractID, topicsCSV, startLedger, endLedger, limit)
+	case "bitmap32":
+		runBitmap32NonPositionalQuery(eventStore, contractID, topicsCSV, startLedger, endLedger, limit)
 	}
 }
 
@@ -275,12 +279,38 @@ func buildFilter(contractID, topic0, topic1, topic2, topic3 string) *query.Filte
 	return filter
 }
 
-// runSingleQuery runs a query using V2 posting list indexes
-func runSingleQuery(eventStore *store.RocksDBEventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) {
+// runPostingV2PositionalQuery runs a query using V2 posting list indexes with positional topic filters.
+func runPostingV2PositionalQuery(eventStore *store.RocksDBEventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) {
 	fmt.Fprintf(os.Stderr, "Querying with V2 posting list in ledgers %d-%d...\n", startLedger, endLedger)
 
-	topics := filter.TopicFilters()
-	stats, events, err := eventStore.QueryEventsWithPostingListV2Timing(filter.ContractID, topics, startLedger, endLedger, limit)
+	topicGroups := filter.TopicGroups()
+	stats, events, err := eventStore.QueryEventsWithPostingListV2Timing(filter.ContractID, topicGroups, startLedger, endLedger, limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	printUnifiedResult(stats.ToUnified())
+
+	if events == nil {
+		fmt.Println("[]")
+		return
+	}
+
+	output, err := json.MarshalIndent(events, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to marshal events: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(output))
+}
+
+// runBitmap32PositionalQuery runs a query using V2 bitmap32 index with positional topic filters.
+func runBitmap32PositionalQuery(eventStore *store.RocksDBEventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) {
+	fmt.Fprintf(os.Stderr, "Querying with V2 bitmap32 index in ledgers %d-%d...\n", startLedger, endLedger)
+
+	topicGroups := filter.TopicGroups()
+	stats, events, err := eventStore.QueryEventsWithBitmap32EventIndex(filter.ContractID, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		os.Exit(1)
@@ -316,10 +346,14 @@ func runBitmap32NonPositionalQuery(eventStore *store.RocksDBEventStore, contract
 		}
 	}
 
-	// Parse topics (base64 encoded)
-	var topicsList [][]byte
+	// Parse topics (base64 encoded, positional: topic0,topic1,topic2,topic3)
+	var topicGroups [4][][]byte
+	hasTopics := false
 	if topicsCSV != "" {
-		for _, t := range strings.Split(topicsCSV, ",") {
+		for i, t := range strings.Split(topicsCSV, ",") {
+			if i >= 4 {
+				break
+			}
 			t = strings.TrimSpace(t)
 			if t == "" {
 				continue
@@ -329,17 +363,18 @@ func runBitmap32NonPositionalQuery(eventStore *store.RocksDBEventStore, contract
 				fmt.Fprintf(os.Stderr, "Error: invalid topic (expected base64): %v\n", err)
 				os.Exit(2)
 			}
-			topicsList = append(topicsList, topicBytes)
+			topicGroups[i] = [][]byte{topicBytes}
+			hasTopics = true
 		}
 	}
 
-	if len(contractBytes) == 0 && len(topicsList) == 0 {
+	if len(contractBytes) == 0 && !hasTopics {
 		fmt.Fprintf(os.Stderr, "Error: at least one filter (--contract or --topics) must be specified\n")
 		os.Exit(2)
 	}
 
 	// Query using V2 bitmap32 index
-	stats, events, err := eventStore.QueryEventsWithBitmap32EventIndex(contractBytes, topicsList, startLedger, endLedger, limit)
+	stats, events, err := eventStore.QueryEventsWithBitmap32EventIndex(contractBytes, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		os.Exit(1)
@@ -376,11 +411,14 @@ func runPostingV2Query(eventStore *store.RocksDBEventStore, contractID, topicsCS
 		}
 	}
 
-	// Parse comma-separated topics (base64)
-	var topicsList [][]byte
+	// Parse comma-separated topics (base64, positional: topic0,topic1,topic2,topic3)
+	var topicGroups [4][][]byte
 	if topicsCSV != "" {
 		topicStrs := strings.Split(topicsCSV, ",")
-		for _, topicStr := range topicStrs {
+		for i, topicStr := range topicStrs {
+			if i >= 4 {
+				break
+			}
 			topicStr = strings.TrimSpace(topicStr)
 			if topicStr == "" {
 				continue
@@ -390,12 +428,12 @@ func runPostingV2Query(eventStore *store.RocksDBEventStore, contractID, topicsCS
 				fmt.Fprintf(os.Stderr, "Error: invalid topic (expected base64): %v\n", err)
 				os.Exit(2)
 			}
-			topicsList = append(topicsList, topicBytes)
+			topicGroups[i] = [][]byte{topicBytes}
 		}
 	}
 
 	// Query using V2 posting list index with detailed stats
-	stats, events, err := eventStore.QueryEventsWithPostingListV2Timing(contractBytes, topicsList, startLedger, endLedger, limit)
+	stats, events, err := eventStore.QueryEventsWithPostingListV2Timing(contractBytes, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		os.Exit(1)
@@ -644,8 +682,8 @@ func printUnfilteredPerformanceComparison(primary, compare *query.Result, primar
 
 // executeQuery runs a query using V2 posting list and returns the result
 func executeQuery(eventStore *store.RocksDBEventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) *query.Result {
-	topics := filter.TopicFilters()
-	stats, events, err := eventStore.QueryEventsWithPostingListV2Timing(filter.ContractID, topics, startLedger, endLedger, limit)
+	topicGroups := filter.TopicGroups()
+	stats, events, err := eventStore.QueryEventsWithPostingListV2Timing(filter.ContractID, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		return nil

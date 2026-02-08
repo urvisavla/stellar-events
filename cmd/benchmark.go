@@ -430,9 +430,15 @@ func generateSampleData() {
 		},
 		// Topic3 is optional extra data
 		Topic3: TopicData{
-			High:   []string{},
-			Medium: []string{},
-			Low:    []string{},
+			High: []string{
+				"AAAACgAAAAAAAAAAAAAAAAAAAAA=", // common amount/value
+			},
+			Medium: []string{
+				"AAAACgAAAAAAAAAAAAAAAAABhqA=", // medium amount
+			},
+			Low: []string{
+				"AAAACgAAAAAAAAAAAAAPQkA=", // rare amount
+			},
 		},
 	}
 
@@ -674,25 +680,31 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 		}
 	}
 
-	// 13. Worst-case: 3 contracts + 3 values at each topic position
-	// (c1 OR c2 OR c3) AND (t0v1 OR t0v2 OR t0v3) AND ... for all 4 positions
+	// 13. Worst-case: 3 contracts + up to 3 values at each topic position
+	// Uses whatever positions have data (doesn't require all 4 positions to have 3+ topics)
 	if len(allContracts) >= 3 {
-		allPositionsHave3 := true
 		topicsSpec := make([][]string, 4)
+		var nameParts []string
+		hasAnyTopics := false
 		for pos := 0; pos < 4; pos++ {
-			if len(topicsByPos[pos]) < 3 {
-				allPositionsHave3 = false
-				break
+			n := len(topicsByPos[pos])
+			if n == 0 {
+				continue
 			}
-			topicsSpec[pos] = []string{
-				topicsByPos[pos][0].Value,
-				topicsByPos[pos][1].Value,
-				topicsByPos[pos][2].Value,
+			if n > 3 {
+				n = 3
 			}
+			vals := make([]string, n)
+			for i := 0; i < n; i++ {
+				vals[i] = topicsByPos[pos][i].Value
+			}
+			topicsSpec[pos] = vals
+			nameParts = append(nameParts, fmt.Sprintf("%dt%d", n, pos))
+			hasAnyTopics = true
 		}
-		if allPositionsHave3 {
+		if hasAnyTopics {
 			queries = append(queries, QuerySpec{
-				Name:        "worst-3c+3t0+3t1+3t2+3t3",
+				Name:        fmt.Sprintf("worst-3c+%s", strings.Join(nameParts, "+")),
 				ContractIDs: allContracts[:3],
 				Topics:      topicsSpec,
 			})
@@ -958,18 +970,12 @@ func executeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, end
 		if len(contractIDs) == 1 {
 			singleContract = contractIDs[0]
 		}
-		var flatTopics [][]byte
-		for _, tg := range topicGroups {
-			for _, t := range tg {
-				flatTopics = append(flatTopics, t)
-			}
-		}
 
 		switch indexType {
 		case "posting-v2":
-			return executePostingV2QueryBenchmark(eventStore, startLedger, endLedger, singleContract, flatTopics, limit)
+			return executePostingV2QueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
 		case "bitmap32":
-			return executeBitmap32QueryBenchmark(eventStore, startLedger, endLedger, singleContract, flatTopics, limit)
+			return executeBitmap32QueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
 		}
 		return nil
 	}
@@ -984,8 +990,8 @@ func executeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, end
 	return nil
 }
 
-func executePostingV2QueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topics [][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithPostingListV2Timing(contractID, topics, startLedger, endLedger, limit)
+func executePostingV2QueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEventsWithPostingListV2Timing(contractID, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		return &QueryResult{Error: err}
 	}
@@ -1007,8 +1013,8 @@ func executePostingV2QueryBenchmark(eventStore *store.RocksDBEventStore, startLe
 	}
 }
 
-func executeBitmap32QueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topics [][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithBitmap32EventIndex(contractID, topics, startLedger, endLedger, limit)
+func executeBitmap32QueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEventsWithBitmap32EventIndex(contractID, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		return &QueryResult{Error: err}
 	}

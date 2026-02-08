@@ -53,9 +53,13 @@ func ContractTermKey(contractID []byte) [32]byte {
 	return sha256.Sum256(contractID)
 }
 
-// TopicTermKey computes the term key (SHA-256) for a topic XDR value.
-func TopicTermKey(topicXDR []byte) [32]byte {
-	return sha256.Sum256(topicXDR)
+// TopicTermKey computes the term key (SHA-256) for a topic XDR value at a given position.
+// The position byte is prepended before hashing to produce distinct keys per topic position.
+func TopicTermKey(pos int, topicXDR []byte) [32]byte {
+	buf := make([]byte, 1+len(topicXDR))
+	buf[0] = byte(pos)
+	copy(buf[1:], topicXDR)
+	return sha256.Sum256(buf)
 }
 
 // =============================================================================
@@ -316,15 +320,22 @@ type postingListV2Result struct {
 // Uses point gets with V2 event keys instead of TOID-based range scans.
 // Supports parallel reads, guided intersection (smallest-first), and streaming for single-filter queries.
 // Requires data ingested with V2Indexes: true (V2 event keys in cfEvents).
-func (es *RocksDBEventStore) QueryEventsWithPostingListV2Timing(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int) (*PostingListV2QueryResult, []*query.Event, error) {
+func (es *RocksDBEventStore) QueryEventsWithPostingListV2Timing(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*PostingListV2QueryResult, []*query.Event, error) {
 	totalStart := time.Now()
 	result := &PostingListV2QueryResult{
 		LedgerRange: endLedger - startLedger + 1,
 	}
 
 	hasContract := len(contractID) > 0
-	hasTopics := len(topics) > 0
-	multiFilter := (hasContract && hasTopics) || len(topics) > 1
+	hasTopics := false
+	topicTermCount := 0
+	for _, tg := range topicGroups {
+		if len(tg) > 0 {
+			hasTopics = true
+			topicTermCount += len(tg)
+		}
+	}
+	multiFilter := (hasContract && hasTopics) || topicTermCount > 1
 
 	if !hasContract && !hasTopics {
 		result.TotalTime = time.Since(totalStart)
@@ -333,7 +344,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2Timing(contractID []byt
 
 	// For single filter queries with limit, use streaming approach
 	if !multiFilter && limit > 0 {
-		return es.queryPostingListV2Streaming(contractID, topics, startLedger, endLedger, limit, result, totalStart)
+		return es.queryPostingListV2Streaming(contractID, topicGroups, startLedger, endLedger, limit, result, totalStart)
 	}
 
 	// Multi-filter: use parallel reads + guided intersection
@@ -342,7 +353,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2Timing(contractID []byt
 	plStart := time.Now()
 
 	// Parallel read all posting lists
-	plResults := es.queryPostingListsV2Parallel(contractID, topics, buckets, startLedger, endLedger)
+	plResults := es.queryPostingListsV2Parallel(contractID, topicGroups, buckets, startLedger, endLedger)
 
 	// Check for errors and aggregate stats
 	for _, plr := range plResults {
@@ -384,7 +395,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2Timing(contractID []byt
 
 	// Fetch events using point gets
 	events, fetchTime, decodeTime, filterTime, bytesRead, scanned := es.fetchEventsByLocalIDsV2(
-		resultLocalIDs, buckets, startLedger, endLedger, limit, contractID, topics)
+		resultLocalIDs, buckets, startLedger, endLedger, limit, contractID)
 
 	result.EventFetchTime = fetchTime
 	result.DecodeTime = decodeTime
@@ -398,15 +409,17 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2Timing(contractID []byt
 }
 
 // queryPostingListsV2Parallel reads all V2 posting lists in parallel.
-func (es *RocksDBEventStore) queryPostingListsV2Parallel(contractID []byte, topics [][]byte, buckets []uint32, startLedger, endLedger uint32) []postingListV2Result {
+func (es *RocksDBEventStore) queryPostingListsV2Parallel(contractID []byte, topicGroups [4][][]byte, buckets []uint32, startLedger, endLedger uint32) []postingListV2Result {
 	// Count how many posting lists to read
 	numLists := 0
 	if len(contractID) > 0 {
 		numLists++
 	}
-	for _, t := range topics {
-		if len(t) > 0 {
-			numLists++
+	for _, tg := range topicGroups {
+		for _, t := range tg {
+			if len(t) > 0 {
+				numLists++
+			}
 		}
 	}
 
@@ -435,27 +448,29 @@ func (es *RocksDBEventStore) queryPostingListsV2Parallel(contractID []byte, topi
 		idx++
 	}
 
-	// Read topic posting lists
-	for _, topicXDR := range topics {
-		if len(topicXDR) == 0 {
-			continue
-		}
-		wg.Add(1)
-		go func(i int, topic []byte) {
-			defer wg.Done()
-			termKey := TopicTermKey(topic)
-			ids, bucketsRead, bytesRead, readT, decodeT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
-			results[i] = postingListV2Result{
-				localIDs:   ids,
-				buckets:    bucketsRead,
-				bytesRead:  bytesRead,
-				readTime:   readT,
-				decodeTime: decodeT,
-				err:        err,
-				isContract: false,
+	// Read topic posting lists (positional)
+	for pos, tg := range topicGroups {
+		for _, topicXDR := range tg {
+			if len(topicXDR) == 0 {
+				continue
 			}
-		}(idx, topicXDR)
-		idx++
+			wg.Add(1)
+			go func(i, p int, topic []byte) {
+				defer wg.Done()
+				termKey := TopicTermKey(p, topic)
+				ids, bucketsRead, bytesRead, readT, decodeT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
+				results[i] = postingListV2Result{
+					localIDs:   ids,
+					buckets:    bucketsRead,
+					bytesRead:  bytesRead,
+					readTime:   readT,
+					decodeTime: decodeT,
+					err:        err,
+					isContract: false,
+				}
+			}(idx, pos, topicXDR)
+			idx++
+		}
 	}
 
 	wg.Wait()
@@ -464,7 +479,7 @@ func (es *RocksDBEventStore) queryPostingListsV2Parallel(contractID []byte, topi
 
 // queryPostingListV2Streaming reads posting lists bucket-by-bucket and fetches events incrementally.
 // Stops early when limit is reached.
-func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topics [][]byte, startLedger, endLedger uint32, limit int, result *PostingListV2QueryResult, totalStart time.Time) (*PostingListV2QueryResult, []*query.Event, error) {
+func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int, result *PostingListV2QueryResult, totalStart time.Time) (*PostingListV2QueryResult, []*query.Event, error) {
 	buckets := GetBucketsForRange(startLedger, endLedger)
 
 	// Determine which CF and term key to use
@@ -474,12 +489,20 @@ func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topi
 	if len(contractID) > 0 {
 		cf = es.cfContractsPLV2
 		termKey = ContractTermKey(contractID)
-	} else if len(topics) > 0 && len(topics[0]) > 0 {
-		cf = es.cfTopicsPLV2
-		termKey = TopicTermKey(topics[0])
 	} else {
-		result.TotalTime = time.Since(totalStart)
-		return result, nil, nil
+		found := false
+		for pos, tg := range topicGroups {
+			if len(tg) > 0 && len(tg[0]) > 0 {
+				termKey = TopicTermKey(pos, tg[0])
+				cf = es.cfTopicsPLV2
+				found = true
+				break
+			}
+		}
+		if !found {
+			result.TotalTime = time.Since(totalStart)
+			return result, nil, nil
+		}
 	}
 
 	var allEvents []*query.Event
@@ -534,7 +557,7 @@ func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topi
 		// Fetch events for this bucket's local IDs
 		remaining := limit - len(allEvents)
 		events, ft, dt, flt, bytesRead, scanned := es.fetchEventsByLocalIDsV2ForBucket(
-			filtered, bucketStart, remaining, contractID, topics)
+			filtered, bucketStart, remaining, contractID)
 
 		fetchTime += ft
 		decodeTime += dt
@@ -558,7 +581,7 @@ func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topi
 }
 
 // fetchEventsByLocalIDsV2 fetches events by local IDs using point gets with V2 keys.
-func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets []uint32, startLedger, endLedger uint32, limit int, contractID []byte, topics [][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
+func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets []uint32, startLedger, endLedger uint32, limit int, contractID []byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
 	var fetchTime, decodeTime, filterTime time.Duration
 	var bytesRead int64
 	var scanned int
@@ -598,7 +621,7 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets 
 		}
 
 		evts, ft, dt, flt, br, sc := es.fetchEventsByLocalIDsV2ForBucket(
-			bucketLocalIDs, bucketStart, remaining, contractID, topics)
+			bucketLocalIDs, bucketStart, remaining, contractID)
 
 		fetchTime += ft
 		decodeTime += dt
@@ -613,7 +636,7 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets 
 
 // fetchEventsByLocalIDsV2ForBucket fetches events for local IDs within a single bucket.
 // Uses parallel iterators to overlap RocksDB lookup latency across multiple goroutines.
-func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32, bucketStart uint32, limit int, contractID []byte, topics [][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
+func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32, bucketStart uint32, limit int, contractID []byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
 	if len(localIDs) == 0 {
 		return nil, 0, 0, 0, 0, 0
 	}
@@ -698,26 +721,18 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32,
 				r.bytesRead += int64(len(valueCopy))
 				r.scanned++
 
-				// Filter using binary header
+				// Filter using binary header (contract ID only; topic filtering is handled by positional index)
 				filterStart := time.Now()
-				if es.eventFormat == "binary" && (len(contractID) > 0 || len(topics) > 0) {
+				if es.eventFormat == "binary" && len(contractID) > 0 {
 					header := event.ParseBinaryHeader(valueCopy)
 					if header != nil {
-						matches := true
-						if len(contractID) > 0 && !header.MatchesContractID(contractID) {
-							matches = false
-						}
-						if matches && len(topics) > 0 && !header.MatchesTopicsNonPositional(topics) {
-							matches = false
-						}
-						r.filterTime += time.Since(filterStart)
-						if !matches {
+						if !header.MatchesContractID(contractID) {
+							r.filterTime += time.Since(filterStart)
 							continue
 						}
 					}
-				} else {
-					r.filterTime += time.Since(filterStart)
 				}
+				r.filterTime += time.Since(filterStart)
 
 				// Decode to query.Event
 				decStart := time.Now()
@@ -913,9 +928,9 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 				continue
 			}
 			wg.Add(1)
-			go func(i int, groupIdx int, topic []byte) {
+			go func(i int, groupIdx int, p int, topic []byte) {
 				defer wg.Done()
-				termKey := TopicTermKey(topic)
+				termKey := TopicTermKey(p, topic)
 				ids, bucketsRead, bytesRead, readT, decodeT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
 				plResults[i] = plGroup{
 					groupIdx: groupIdx,
@@ -929,7 +944,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 						isContract: false,
 					},
 				}
-			}(idx, pos+1, topicXDR)
+			}(idx, pos+1, pos, topicXDR)
 			idx++
 		}
 	}
@@ -990,16 +1005,9 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 	result.PostingListTime = time.Since(plStart) - result.IntersectTime
 	result.LocalIDsAfterIntersect = len(resultLocalIDs)
 
-	// Flatten contractIDs and topicGroups for post-filter compatibility
-	// For post-filtering, we pass all contracts and flatten topics (non-positional)
-	var flatTopics [][]byte
-	for _, tg := range topicGroups {
-		flatTopics = append(flatTopics, tg...)
-	}
-
-	// Fetch events using point gets with multi-value post-filter
+	// Fetch events using point gets with contract post-filter
 	events, fetchTime, decodeTime, filterTime, bytesRead, scanned := es.fetchEventsByLocalIDsV2MultiFilter(
-		resultLocalIDs, buckets, startLedger, endLedger, limit, contractIDs, topicGroups)
+		resultLocalIDs, buckets, startLedger, endLedger, limit, contractIDs)
 
 	result.EventFetchTime = fetchTime
 	result.DecodeTime = decodeTime
@@ -1016,16 +1024,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 // Contract match: event matches ANY of the contractIDs
 // Topic match: for each topic position with filters, event's topic at that position matches ANY of the values
 // Uses parallel iterators to overlap RocksDB lookup latency across multiple goroutines.
-func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint32, buckets []uint32, startLedger, endLedger uint32, limit int, contractIDs [][]byte, topicGroups [4][][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
-
-	// Pre-compute hasTopicFilters once
-	hasTopicFilters := false
-	for _, tg := range topicGroups {
-		if len(tg) > 0 {
-			hasTopicFilters = true
-			break
-		}
-	}
+func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint32, buckets []uint32, startLedger, endLedger uint32, limit int, contractIDs [][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
 
 	// Group local IDs by bucket and flatten into ordered keys
 	type keyMeta struct {
@@ -1150,37 +1149,25 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint3
 				r.bytesRead += int64(len(valueCopy))
 				r.scanned++
 
-				// Multi-value post-filter using binary header
+				// Post-filter: contract ID only (topic filtering is handled by positional index)
 				filterStart := time.Now()
-				if es.eventFormat == "binary" && (len(contractIDs) > 0 || hasTopicFilters) {
+				if es.eventFormat == "binary" && len(contractIDs) > 0 {
 					header := event.ParseBinaryHeader(valueCopy)
 					if header != nil {
-						matches := true
-						// Contract: event must match ANY of the contractIDs
-						if len(contractIDs) > 0 {
-							contractMatch := false
-							for _, cid := range contractIDs {
-								if header.MatchesContractID(cid) {
-									contractMatch = true
-									break
-								}
-							}
-							if !contractMatch {
-								matches = false
+						contractMatch := false
+						for _, cid := range contractIDs {
+							if header.MatchesContractID(cid) {
+								contractMatch = true
+								break
 							}
 						}
-						// Topics: OR within each position, AND across positions
-						if matches && hasTopicFilters && !header.MatchesTopicsPositionalMulti(topicGroups) {
-							matches = false
-						}
-						r.filterTime += time.Since(filterStart)
-						if !matches {
+						if !contractMatch {
+							r.filterTime += time.Since(filterStart)
 							continue
 						}
 					}
-				} else {
-					r.filterTime += time.Since(filterStart)
 				}
+				r.filterTime += time.Since(filterStart)
 
 				// Decode to query.Event
 				bucketStart := km.bucketID * BucketSize
