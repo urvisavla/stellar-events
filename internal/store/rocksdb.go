@@ -2215,111 +2215,192 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 		return result, nil, nil
 	}
 
-	// Fetch events by local IDs from each segment (same as single-filter but with multi-value post-filter)
-	fetchStart := time.Now()
-	var decodeTime, filterTime time.Duration
-	events := make([]*query.Event, 0, min(limit, result.MatchingLocalIDs))
+	// Pre-compute hasTopicFilters once
+	hasTopicFilters := false
+	for _, tg := range topicGroups {
+		if len(tg) > 0 {
+			hasTopicFilters = true
+			break
+		}
+	}
 
-	// Sort segment IDs for ordered output
+	// Collect all keys and metadata from bitmap results, capped at limit
+	type bitmapEvtMeta struct {
+		segmentStart uint32
+		localID      uint32
+	}
+
 	segIDs := make([]uint32, 0, len(queryResult.PerSegment))
 	for segID := range queryResult.PerSegment {
 		segIDs = append(segIDs, segID)
 	}
 	sort.Slice(segIDs, func(i, j int) bool { return segIDs[i] < segIDs[j] })
 
+	fetchCap := result.MatchingLocalIDs
+	if limit > 0 && fetchCap > limit {
+		fetchCap = limit
+	}
+	allKeys := make([][]byte, 0, fetchCap)
+	allMetas := make([]bitmapEvtMeta, 0, fetchCap)
+
 	for _, segID := range segIDs {
-		localIDs := queryResult.PerSegment[segID]
-		segmentStart := segID * BucketSize
-
-		iter := localIDs.Iterator()
-		for iter.HasNext() && (limit <= 0 || len(events) < limit) {
-			localID := iter.Next()
-
-			v2Key := event.LocalIDToKeyV2(segmentStart, localID)
-
-			data, err := es.db.GetCF(es.ro, es.cfEvents, v2Key)
-			if err != nil {
-				continue
-			}
-			if data.Size() == 0 {
-				data.Free()
-				continue
-			}
-
-			valueData := data.Data()
-			valueCopy := make([]byte, len(valueData))
-			copy(valueCopy, valueData)
-			data.Free()
-
-			result.EventBytesRead += int64(len(valueCopy))
-			result.EventsScanned++
-
-			// Multi-value post-filter using binary header
-			filterStart := time.Now()
-			hasTopicFilters := false
-			for _, tg := range topicGroups {
-				if len(tg) > 0 {
-					hasTopicFilters = true
-					break
-				}
-			}
-			if es.eventFormat == "binary" && (len(contractIDs) > 0 || hasTopicFilters) {
-				header := event.ParseBinaryHeader(valueCopy)
-				if header != nil {
-					matches := true
-					if len(contractIDs) > 0 {
-						contractMatch := false
-						for _, cid := range contractIDs {
-							if header.MatchesContractID(cid) {
-								contractMatch = true
-								break
-							}
-						}
-						if !contractMatch {
-							matches = false
-						}
-					}
-					if matches && hasTopicFilters {
-						var allTopics [][]byte
-						for _, tg := range topicGroups {
-							allTopics = append(allTopics, tg...)
-						}
-						if len(allTopics) > 0 && !header.MatchesTopicsNonPositional(allTopics) {
-							matches = false
-						}
-					}
-					filterTime += time.Since(filterStart)
-					if !matches {
-						continue
-					}
-				}
-			} else {
-				filterTime += time.Since(filterStart)
-			}
-
-			// Decode to query.Event
-			ledgerOffset, eventSeq := event.DecodeBitmap32LocalID(localID)
-			ledger := segmentStart + uint32(ledgerOffset)
-
-			decStart := time.Now()
-			var ev *query.Event
-			if es.eventFormat == "binary" {
-				ev, err = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
-			} else {
-				ev, err = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
-			}
-			decodeTime += time.Since(decStart)
-
-			if err != nil {
-				continue
-			}
-
-			events = append(events, ev)
-		}
-
-		if limit > 0 && len(events) >= limit {
+		if len(allKeys) >= fetchCap {
 			break
 		}
+		bitmap := queryResult.PerSegment[segID]
+		segmentStart := segID * BucketSize
+
+		bitmapIter := bitmap.Iterator()
+		for bitmapIter.HasNext() {
+			if len(allKeys) >= fetchCap {
+				break
+			}
+			localID := bitmapIter.Next()
+			allKeys = append(allKeys, event.LocalIDToKeyV2(segmentStart, localID))
+			allMetas = append(allMetas, bitmapEvtMeta{segmentStart: segmentStart, localID: localID})
+		}
+	}
+
+	// Parallel fetch using iterators
+	fetchStart := time.Now()
+
+	const maxWorkers = 4
+	numWorkers := maxWorkers
+	if len(allKeys) < numWorkers {
+		numWorkers = len(allKeys)
+	}
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	type workerResult struct {
+		events     []*query.Event
+		decodeTime time.Duration
+		filterTime time.Duration
+		bytesRead  int64
+		scanned    int
+	}
+
+	results := make([]workerResult, numWorkers)
+	chunkSize := (len(allKeys) + numWorkers - 1) / numWorkers
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		start := w * chunkSize
+		end := start + chunkSize
+		if end > len(allKeys) {
+			end = len(allKeys)
+		}
+		if start >= end {
+			continue
+		}
+
+		wg.Add(1)
+		go func(workerID, start, end int) {
+			defer wg.Done()
+			r := &results[workerID]
+			r.events = make([]*query.Event, 0, end-start)
+
+			dbIter := es.db.NewIteratorCF(es.ro, es.cfEvents)
+			defer dbIter.Close()
+
+			for i := start; i < end; i++ {
+				key := allKeys[i]
+				meta := allMetas[i]
+
+				dbIter.Seek(key)
+				if !dbIter.Valid() {
+					break
+				}
+
+				iterKey := dbIter.Key()
+				if iterKey == nil || !bytes.Equal(iterKey.Data(), key) {
+					continue
+				}
+
+				iterVal := dbIter.Value()
+				if iterVal == nil {
+					continue
+				}
+				valData := iterVal.Data()
+				if len(valData) == 0 {
+					continue
+				}
+
+				valueCopy := make([]byte, len(valData))
+				copy(valueCopy, valData)
+
+				r.bytesRead += int64(len(valueCopy))
+				r.scanned++
+
+				// Multi-value post-filter using binary header
+				filterStart := time.Now()
+				if es.eventFormat == "binary" && (len(contractIDs) > 0 || hasTopicFilters) {
+					header := event.ParseBinaryHeader(valueCopy)
+					if header != nil {
+						matches := true
+						if len(contractIDs) > 0 {
+							contractMatch := false
+							for _, cid := range contractIDs {
+								if header.MatchesContractID(cid) {
+									contractMatch = true
+									break
+								}
+							}
+							if !contractMatch {
+								matches = false
+							}
+						}
+						// Topics: OR within each position, AND across positions
+						if matches && hasTopicFilters && !header.MatchesTopicsPositionalMulti(topicGroups) {
+							matches = false
+						}
+						r.filterTime += time.Since(filterStart)
+						if !matches {
+							continue
+						}
+					}
+				} else {
+					r.filterTime += time.Since(filterStart)
+				}
+
+				// Decode to query.Event
+				ledgerOffset, eventSeq := event.DecodeBitmap32LocalID(meta.localID)
+				ledger := meta.segmentStart + uint32(ledgerOffset)
+
+				decStart := time.Now()
+				var ev *query.Event
+				var decErr error
+				if es.eventFormat == "binary" {
+					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
+				} else {
+					ev, decErr = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
+				}
+				r.decodeTime += time.Since(decStart)
+
+				if decErr != nil {
+					continue
+				}
+
+				r.events = append(r.events, ev)
+			}
+		}(w, start, end)
+	}
+
+	wg.Wait()
+
+	// Merge results in order
+	var decodeTime, filterTime time.Duration
+	events := make([]*query.Event, 0, fetchCap)
+	for _, r := range results {
+		events = append(events, r.events...)
+		decodeTime += r.decodeTime
+		filterTime += r.filterTime
+		result.EventBytesRead += r.bytesRead
+		result.EventsScanned += r.scanned
+	}
+	if limit > 0 && len(events) > limit {
+		events = events[:limit]
 	}
 
 	result.EventFetchTime = time.Since(fetchStart) - decodeTime - filterTime

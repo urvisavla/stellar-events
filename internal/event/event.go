@@ -1,6 +1,7 @@
 package event
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -342,6 +343,32 @@ func (h *BinaryEventHeader) MatchesTopicsNonPositional(topicFilters [][]byte) bo
 		}
 
 		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// MatchesTopicsPositionalMulti checks multi-value positional topic matching.
+// For each position with filters, event's topic at that position must match
+// ANY of the values (OR within position). AND across positions.
+func (h *BinaryEventHeader) MatchesTopicsPositionalMulti(topicGroups [4][][]byte) bool {
+	topics := h.GetTopics()
+	for pos, group := range topicGroups {
+		if len(group) == 0 {
+			continue // no filter at this position
+		}
+		if pos >= len(topics) {
+			return false // event doesn't have this topic position
+		}
+		posMatch := false
+		for _, filterVal := range group {
+			if bytes.Equal(topics[pos], filterVal) {
+				posMatch = true
+				break
+			}
+		}
+		if !posMatch {
 			return false
 		}
 	}

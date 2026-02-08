@@ -1003,14 +1003,26 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 // fetchEventsByLocalIDsV2MultiFilter fetches events by local IDs with multi-value post-filtering.
 // Contract match: event matches ANY of the contractIDs
 // Topic match: for each topic position with filters, event's topic at that position matches ANY of the values
+// Uses parallel iterators to overlap RocksDB lookup latency across multiple goroutines.
 func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint32, buckets []uint32, startLedger, endLedger uint32, limit int, contractIDs [][]byte, topicGroups [4][][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
 	fetchStart := time.Now()
-	var decodeTime, filterTime time.Duration
-	var bytesRead int64
-	var scanned int
-	events := make([]*query.Event, 0, min(limit, len(localIDs)))
 
-	// Group local IDs by bucket
+	// Pre-compute hasTopicFilters once
+	hasTopicFilters := false
+	for _, tg := range topicGroups {
+		if len(tg) > 0 {
+			hasTopicFilters = true
+			break
+		}
+	}
+
+	// Group local IDs by bucket and flatten into ordered keys
+	type keyMeta struct {
+		key      []byte
+		localID  uint32
+		bucketID uint32
+	}
+
 	localIDsByBucket := make(map[uint32][]uint32)
 	for _, localID := range localIDs {
 		ledgerOffset := localID >> 16
@@ -1025,110 +1037,173 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint3
 		}
 	}
 
-	// Process buckets in order
+	// Build ordered list of keys, capped at limit
+	fetchCap := len(localIDs)
+	if limit > 0 && fetchCap > limit {
+		fetchCap = limit
+	}
+	allKeys := make([]keyMeta, 0, fetchCap)
 	for _, bucketID := range buckets {
-		if limit > 0 && len(events) >= limit {
+		if len(allKeys) >= fetchCap {
 			break
 		}
-
 		bucketLocalIDs := localIDsByBucket[bucketID]
-		if len(bucketLocalIDs) == 0 {
+		bucketStart := bucketID * BucketSize
+		for _, localID := range bucketLocalIDs {
+			if len(allKeys) >= fetchCap {
+				break
+			}
+			ledger, eventSeq := event.DecodeLocalIDForBucket(localID, bucketStart)
+			allKeys = append(allKeys, keyMeta{
+				key:      event.EncodeKeyV2(ledger, eventSeq),
+				localID:  localID,
+				bucketID: bucketID,
+			})
+		}
+	}
+
+	if len(allKeys) == 0 {
+		return nil, 0, 0, 0, 0, 0
+	}
+
+	// Parallel fetch using iterators
+	const maxWorkers = 4
+	numWorkers := maxWorkers
+	if len(allKeys) < numWorkers {
+		numWorkers = len(allKeys)
+	}
+
+	type workerResult struct {
+		events     []*query.Event
+		decodeTime time.Duration
+		filterTime time.Duration
+		bytesRead  int64
+		scanned    int
+	}
+
+	results := make([]workerResult, numWorkers)
+	chunkSize := (len(allKeys) + numWorkers - 1) / numWorkers
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		start := w * chunkSize
+		end := start + chunkSize
+		if end > len(allKeys) {
+			end = len(allKeys)
+		}
+		if start >= end {
 			continue
 		}
 
-		bucketStart := bucketID * BucketSize
-		remaining := limit - len(events)
-		if limit <= 0 {
-			remaining = len(bucketLocalIDs)
-		}
+		wg.Add(1)
+		go func(workerID, start, end int) {
+			defer wg.Done()
+			r := &results[workerID]
+			r.events = make([]*query.Event, 0, end-start)
 
-		for _, localID := range bucketLocalIDs {
-			if remaining <= 0 {
-				break
-			}
+			iter := es.db.NewIteratorCF(es.ro, es.cfEvents)
+			defer iter.Close()
 
-			ledger, eventSeq := event.DecodeLocalIDForBucket(localID, bucketStart)
-			v2Key := event.EncodeKeyV2(ledger, eventSeq)
+			for i := start; i < end; i++ {
+				km := allKeys[i]
 
-			data, err := es.db.GetCF(es.ro, es.cfEvents, v2Key)
-			if err != nil {
-				continue
-			}
-			if data.Size() == 0 {
-				data.Free()
-				continue
-			}
-
-			valueData := data.Data()
-			valueCopy := make([]byte, len(valueData))
-			copy(valueCopy, valueData)
-			data.Free()
-
-			bytesRead += int64(len(valueCopy))
-			scanned++
-
-			// Multi-value post-filter using binary header
-			filterStart := time.Now()
-			hasTopicFilters := false
-			for _, tg := range topicGroups {
-				if len(tg) > 0 {
-					hasTopicFilters = true
+				iter.Seek(km.key)
+				if !iter.Valid() {
 					break
 				}
-			}
-			if es.eventFormat == "binary" && (len(contractIDs) > 0 || hasTopicFilters) {
-				header := event.ParseBinaryHeader(valueCopy)
-				if header != nil {
-					matches := true
-					// Contract: event must match ANY of the contractIDs
-					if len(contractIDs) > 0 {
-						contractMatch := false
-						for _, cid := range contractIDs {
-							if header.MatchesContractID(cid) {
-								contractMatch = true
-								break
+
+				iterKey := iter.Key()
+				if iterKey == nil || !bytes.Equal(iterKey.Data(), km.key) {
+					continue
+				}
+
+				iterVal := iter.Value()
+				if iterVal == nil {
+					continue
+				}
+				valData := iterVal.Data()
+				if len(valData) == 0 {
+					continue
+				}
+
+				valueCopy := make([]byte, len(valData))
+				copy(valueCopy, valData)
+
+				r.bytesRead += int64(len(valueCopy))
+				r.scanned++
+
+				// Multi-value post-filter using binary header
+				filterStart := time.Now()
+				if es.eventFormat == "binary" && (len(contractIDs) > 0 || hasTopicFilters) {
+					header := event.ParseBinaryHeader(valueCopy)
+					if header != nil {
+						matches := true
+						// Contract: event must match ANY of the contractIDs
+						if len(contractIDs) > 0 {
+							contractMatch := false
+							for _, cid := range contractIDs {
+								if header.MatchesContractID(cid) {
+									contractMatch = true
+									break
+								}
+							}
+							if !contractMatch {
+								matches = false
 							}
 						}
-						if !contractMatch {
+						// Topics: OR within each position, AND across positions
+						if matches && hasTopicFilters && !header.MatchesTopicsPositionalMulti(topicGroups) {
 							matches = false
 						}
-					}
-					// Topics: for each position with filters, event's topics must match ANY value (non-positional fallback)
-					if matches {
-						var allTopics [][]byte
-						for _, tg := range topicGroups {
-							allTopics = append(allTopics, tg...)
-						}
-						if len(allTopics) > 0 && !header.MatchesTopicsNonPositional(allTopics) {
-							matches = false
+						r.filterTime += time.Since(filterStart)
+						if !matches {
+							continue
 						}
 					}
-					filterTime += time.Since(filterStart)
-					if !matches {
-						continue
-					}
+				} else {
+					r.filterTime += time.Since(filterStart)
 				}
-			} else {
-				filterTime += time.Since(filterStart)
-			}
 
-			// Decode to query.Event
-			decStart := time.Now()
-			var ev *query.Event
-			if es.eventFormat == "binary" {
-				ev, err = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
-			} else {
-				ev, err = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
-			}
-			decodeTime += time.Since(decStart)
+				// Decode to query.Event
+				bucketStart := km.bucketID * BucketSize
+				ledger, eventSeq := event.DecodeLocalIDForBucket(km.localID, bucketStart)
 
-			if err != nil {
-				continue
-			}
+				decStart := time.Now()
+				var ev *query.Event
+				var decErr error
+				if es.eventFormat == "binary" {
+					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
+				} else {
+					ev, decErr = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
+				}
+				r.decodeTime += time.Since(decStart)
 
-			events = append(events, ev)
-			remaining--
-		}
+				if decErr != nil {
+					continue
+				}
+
+				r.events = append(r.events, ev)
+			}
+		}(w, start, end)
+	}
+
+	wg.Wait()
+
+	// Merge results in order (chunks are in sorted key order)
+	var decodeTime, filterTime time.Duration
+	var bytesRead int64
+	var scanned int
+	events := make([]*query.Event, 0, fetchCap)
+	for _, r := range results {
+		events = append(events, r.events...)
+		decodeTime += r.decodeTime
+		filterTime += r.filterTime
+		bytesRead += r.bytesRead
+		scanned += r.scanned
+	}
+
+	if limit > 0 && len(events) > limit {
+		events = events[:limit]
 	}
 
 	return events, time.Since(fetchStart) - decodeTime - filterTime, decodeTime, filterTime, bytesRead, scanned
