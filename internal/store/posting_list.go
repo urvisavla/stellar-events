@@ -559,8 +559,7 @@ func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topi
 
 // fetchEventsByLocalIDsV2 fetches events by local IDs using point gets with V2 keys.
 func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets []uint32, startLedger, endLedger uint32, limit int, contractID []byte, topics [][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
-	fetchStart := time.Now()
-	var decodeTime, filterTime time.Duration
+	var fetchTime, decodeTime, filterTime time.Duration
 	var bytesRead int64
 	var scanned int
 	events := make([]*query.Event, 0, min(limit, len(localIDs)))
@@ -598,9 +597,10 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets 
 			remaining = len(bucketLocalIDs)
 		}
 
-		evts, _, dt, flt, br, sc := es.fetchEventsByLocalIDsV2ForBucket(
+		evts, ft, dt, flt, br, sc := es.fetchEventsByLocalIDsV2ForBucket(
 			bucketLocalIDs, bucketStart, remaining, contractID, topics)
 
+		fetchTime += ft
 		decodeTime += dt
 		filterTime += flt
 		bytesRead += br
@@ -608,7 +608,7 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets 
 		events = append(events, evts...)
 	}
 
-	return events, time.Since(fetchStart) - decodeTime - filterTime, decodeTime, filterTime, bytesRead, scanned
+	return events, fetchTime, decodeTime, filterTime, bytesRead, scanned
 }
 
 // fetchEventsByLocalIDsV2ForBucket fetches events for local IDs within a single bucket.
@@ -617,8 +617,6 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32,
 	if len(localIDs) == 0 {
 		return nil, 0, 0, 0, 0, 0
 	}
-
-	fetchStart := time.Now()
 
 	// Cap fetch count at limit
 	fetchCount := len(localIDs)
@@ -635,6 +633,7 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32,
 
 	type workerResult struct {
 		events     []*query.Event
+		fetchTime  time.Duration
 		decodeTime time.Duration
 		filterTime time.Duration
 		bytesRead  int64
@@ -668,27 +667,33 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32,
 				ledger, eventSeq := event.DecodeLocalIDForBucket(localIDs[i], bucketStart)
 				key := event.EncodeKeyV2(ledger, eventSeq)
 
+				seekStart := time.Now()
 				iter.Seek(key)
 				if !iter.Valid() {
+					r.fetchTime += time.Since(seekStart)
 					break
 				}
 
 				iterKey := iter.Key()
 				if iterKey == nil || !bytes.Equal(iterKey.Data(), key) {
+					r.fetchTime += time.Since(seekStart)
 					continue
 				}
 
 				iterVal := iter.Value()
 				if iterVal == nil {
+					r.fetchTime += time.Since(seekStart)
 					continue
 				}
 				valData := iterVal.Data()
 				if len(valData) == 0 {
+					r.fetchTime += time.Since(seekStart)
 					continue
 				}
 
 				valueCopy := make([]byte, len(valData))
 				copy(valueCopy, valData)
+				r.fetchTime += time.Since(seekStart)
 
 				r.bytesRead += int64(len(valueCopy))
 				r.scanned++
@@ -736,15 +741,22 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32,
 
 	wg.Wait()
 
-	// Merge results in order (chunks are in sorted key order)
-	var decodeTime, filterTime time.Duration
+	// Merge results - use max of per-worker times since workers run in parallel
+	var fetchTime, decodeTime, filterTime time.Duration
 	var bytesRead int64
 	var scanned int
 	events := make([]*query.Event, 0, fetchCount)
 	for _, r := range results {
 		events = append(events, r.events...)
-		decodeTime += r.decodeTime
-		filterTime += r.filterTime
+		if r.fetchTime > fetchTime {
+			fetchTime = r.fetchTime
+		}
+		if r.decodeTime > decodeTime {
+			decodeTime = r.decodeTime
+		}
+		if r.filterTime > filterTime {
+			filterTime = r.filterTime
+		}
 		bytesRead += r.bytesRead
 		scanned += r.scanned
 	}
@@ -753,7 +765,7 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32,
 		events = events[:limit]
 	}
 
-	return events, time.Since(fetchStart) - decodeTime - filterTime, decodeTime, filterTime, bytesRead, scanned
+	return events, fetchTime, decodeTime, filterTime, bytesRead, scanned
 }
 
 // queryPostingListV2WithStats reads V2 posting lists (32-bit local IDs) and returns stats.
@@ -1005,7 +1017,6 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 // Topic match: for each topic position with filters, event's topic at that position matches ANY of the values
 // Uses parallel iterators to overlap RocksDB lookup latency across multiple goroutines.
 func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint32, buckets []uint32, startLedger, endLedger uint32, limit int, contractIDs [][]byte, topicGroups [4][][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
-	fetchStart := time.Now()
 
 	// Pre-compute hasTopicFilters once
 	hasTopicFilters := false
@@ -1075,6 +1086,7 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint3
 
 	type workerResult struct {
 		events     []*query.Event
+		fetchTime  time.Duration
 		decodeTime time.Duration
 		filterTime time.Duration
 		bytesRead  int64
@@ -1107,27 +1119,33 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint3
 			for i := start; i < end; i++ {
 				km := allKeys[i]
 
+				seekStart := time.Now()
 				iter.Seek(km.key)
 				if !iter.Valid() {
+					r.fetchTime += time.Since(seekStart)
 					break
 				}
 
 				iterKey := iter.Key()
 				if iterKey == nil || !bytes.Equal(iterKey.Data(), km.key) {
+					r.fetchTime += time.Since(seekStart)
 					continue
 				}
 
 				iterVal := iter.Value()
 				if iterVal == nil {
+					r.fetchTime += time.Since(seekStart)
 					continue
 				}
 				valData := iterVal.Data()
 				if len(valData) == 0 {
+					r.fetchTime += time.Since(seekStart)
 					continue
 				}
 
 				valueCopy := make([]byte, len(valData))
 				copy(valueCopy, valData)
+				r.fetchTime += time.Since(seekStart)
 
 				r.bytesRead += int64(len(valueCopy))
 				r.scanned++
@@ -1189,15 +1207,22 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint3
 
 	wg.Wait()
 
-	// Merge results in order (chunks are in sorted key order)
-	var decodeTime, filterTime time.Duration
+	// Merge results - use max of per-worker times since workers run in parallel
+	var fetchTime, decodeTime, filterTime time.Duration
 	var bytesRead int64
 	var scanned int
 	events := make([]*query.Event, 0, fetchCap)
 	for _, r := range results {
 		events = append(events, r.events...)
-		decodeTime += r.decodeTime
-		filterTime += r.filterTime
+		if r.fetchTime > fetchTime {
+			fetchTime = r.fetchTime
+		}
+		if r.decodeTime > decodeTime {
+			decodeTime = r.decodeTime
+		}
+		if r.filterTime > filterTime {
+			filterTime = r.filterTime
+		}
 		bytesRead += r.bytesRead
 		scanned += r.scanned
 	}
@@ -1206,7 +1231,7 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint3
 		events = events[:limit]
 	}
 
-	return events, time.Since(fetchStart) - decodeTime - filterTime, decodeTime, filterTime, bytesRead, scanned
+	return events, fetchTime, decodeTime, filterTime, bytesRead, scanned
 }
 
 // ToUnified converts PostingListV2QueryResult to UnifiedQueryResult

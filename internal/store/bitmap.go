@@ -398,12 +398,13 @@ func (s *BitmapEventSeqStore) AddTopicEvent(topic []byte, ledger uint32, eventSe
 
 // EventSeqQueryResult holds the result of a bitmap32 event key query including stats.
 type EventSeqQueryResult struct {
-	PerSegment map[uint32]*roaring.Bitmap // segmentID -> local ID bitmap
-	TotalCount uint64
-	BytesRead  int64
-	Segments   int
-	ReadTime   time.Duration
-	DecodeTime time.Duration
+	PerSegment    map[uint32]*roaring.Bitmap // segmentID -> local ID bitmap
+	TotalCount    uint64
+	BytesRead     int64
+	Segments      int
+	ReadTime      time.Duration
+	DecodeTime    time.Duration
+	IntersectTime time.Duration // Time spent on bitmap OR/AND operations
 }
 
 // QueryEventKeysWithStats returns per-segment bitmaps of matching local IDs.
@@ -468,6 +469,7 @@ func (s *BitmapEventSeqStore) QueryEventKeysWithStats(contractID []byte, topics 
 	// Intersect per-segment bitmaps
 	// Skip segments that don't have bitmaps from ALL filter terms — a missing
 	// term means no events in that segment match that term, so AND must be empty.
+	intersectStart := time.Now()
 	for segID, sb := range allSegments {
 		if len(sb.bitmaps) < expectedTerms {
 			continue
@@ -478,6 +480,7 @@ func (s *BitmapEventSeqStore) QueryEventKeysWithStats(contractID []byte, topics 
 			result.TotalCount += intersected.GetCardinality()
 		}
 	}
+	result.IntersectTime = time.Since(intersectStart)
 
 	return result, nil
 }
@@ -558,6 +561,7 @@ func (s *BitmapEventSeqStore) QueryEventKeysMultiFilter(
 	}
 
 	// For each segment: OR within each group, then AND across groups
+	intersectStart := time.Now()
 	for segID := range allSegIDs {
 		var groupUnions []*roaring.Bitmap
 
@@ -585,6 +589,7 @@ func (s *BitmapEventSeqStore) QueryEventKeysMultiFilter(
 			result.TotalCount += intersected.GetCardinality()
 		}
 	}
+	result.IntersectTime = time.Since(intersectStart)
 
 	return result, nil
 }
@@ -672,13 +677,14 @@ type Bitmap32EventQueryResult struct {
 	EventBytesRead int64 // Bytes read from event storage
 
 	// Timing breakdown
-	IndexLookupTime time.Duration // Time querying bitmap index
-	IndexReadTime   time.Duration // Time reading bitmap segments from storage (I/O)
-	IndexDecodeTime time.Duration // Time decoding bitmap segments (CPU - near zero with FromBuffer)
-	EventFetchTime  time.Duration // Time fetching events
-	DecodeTime      time.Duration // Time decoding events
-	FilterTime      time.Duration // Time filtering events
-	TotalTime       time.Duration // Total query time
+	IndexLookupTime    time.Duration // Time querying bitmap index
+	IndexReadTime      time.Duration // Time reading bitmap segments from storage (I/O)
+	IndexDecodeTime    time.Duration // Time decoding bitmap segments (CPU - near zero with FromBuffer)
+	IndexIntersectTime time.Duration // Time spent on bitmap OR/AND operations
+	EventFetchTime     time.Duration // Time fetching events
+	DecodeTime         time.Duration // Time decoding events
+	FilterTime         time.Duration // Time filtering events
+	TotalTime          time.Duration // Total query time
 }
 
 // ToUnified converts Bitmap32EventQueryResult to UnifiedQueryResult

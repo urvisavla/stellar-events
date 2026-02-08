@@ -1995,6 +1995,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 	result.SegmentsScanned = queryResult.Segments
 	result.IndexReadTime = queryResult.ReadTime
 	result.IndexDecodeTime = queryResult.DecodeTime
+	result.IndexIntersectTime = queryResult.IntersectTime
 
 	if queryResult.TotalCount == 0 {
 		result.TotalTime = time.Since(totalStart)
@@ -2039,8 +2040,6 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 	}
 
 	// Parallel fetch using iterators
-	fetchStart := time.Now()
-
 	const maxWorkers = 4
 	numWorkers := maxWorkers
 	if len(allKeys) < numWorkers {
@@ -2052,6 +2051,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 
 	type workerResult struct {
 		events     []*query.Event
+		fetchTime  time.Duration
 		decodeTime time.Duration
 		filterTime time.Duration
 		bytesRead  int64
@@ -2085,27 +2085,33 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 				key := allKeys[i]
 				meta := allMetas[i]
 
+				seekStart := time.Now()
 				dbIter.Seek(key)
 				if !dbIter.Valid() {
+					r.fetchTime += time.Since(seekStart)
 					break
 				}
 
 				iterKey := dbIter.Key()
 				if iterKey == nil || !bytes.Equal(iterKey.Data(), key) {
+					r.fetchTime += time.Since(seekStart)
 					continue
 				}
 
 				iterVal := dbIter.Value()
 				if iterVal == nil {
+					r.fetchTime += time.Since(seekStart)
 					continue
 				}
 				valData := iterVal.Data()
 				if len(valData) == 0 {
+					r.fetchTime += time.Since(seekStart)
 					continue
 				}
 
 				valueCopy := make([]byte, len(valData))
 				copy(valueCopy, valData)
+				r.fetchTime += time.Since(seekStart)
 
 				r.bytesRead += int64(len(valueCopy))
 				r.scanned++
@@ -2156,13 +2162,20 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 
 	wg.Wait()
 
-	// Merge results in order
-	var decodeTime, filterTime time.Duration
+	// Merge results - use max of per-worker times since workers run in parallel
+	var fetchTime, decodeTime, filterTime time.Duration
 	events := make([]*query.Event, 0, fetchCap)
 	for _, r := range results {
 		events = append(events, r.events...)
-		decodeTime += r.decodeTime
-		filterTime += r.filterTime
+		if r.fetchTime > fetchTime {
+			fetchTime = r.fetchTime
+		}
+		if r.decodeTime > decodeTime {
+			decodeTime = r.decodeTime
+		}
+		if r.filterTime > filterTime {
+			filterTime = r.filterTime
+		}
 		result.EventBytesRead += r.bytesRead
 		result.EventsScanned += r.scanned
 	}
@@ -2170,7 +2183,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 		events = events[:limit]
 	}
 
-	result.EventFetchTime = time.Since(fetchStart) - decodeTime - filterTime
+	result.EventFetchTime = fetchTime
 	result.DecodeTime = decodeTime
 	result.FilterTime = filterTime
 	result.EventsReturned = len(events)
@@ -2209,6 +2222,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 	result.SegmentsScanned = queryResult.Segments
 	result.IndexReadTime = queryResult.ReadTime
 	result.IndexDecodeTime = queryResult.DecodeTime
+	result.IndexIntersectTime = queryResult.IntersectTime
 
 	if queryResult.TotalCount == 0 {
 		result.TotalTime = time.Since(totalStart)
@@ -2262,8 +2276,6 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 	}
 
 	// Parallel fetch using iterators
-	fetchStart := time.Now()
-
 	const maxWorkers = 4
 	numWorkers := maxWorkers
 	if len(allKeys) < numWorkers {
@@ -2275,6 +2287,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 
 	type workerResult struct {
 		events     []*query.Event
+		fetchTime  time.Duration
 		decodeTime time.Duration
 		filterTime time.Duration
 		bytesRead  int64
@@ -2308,27 +2321,33 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 				key := allKeys[i]
 				meta := allMetas[i]
 
+				seekStart := time.Now()
 				dbIter.Seek(key)
 				if !dbIter.Valid() {
+					r.fetchTime += time.Since(seekStart)
 					break
 				}
 
 				iterKey := dbIter.Key()
 				if iterKey == nil || !bytes.Equal(iterKey.Data(), key) {
+					r.fetchTime += time.Since(seekStart)
 					continue
 				}
 
 				iterVal := dbIter.Value()
 				if iterVal == nil {
+					r.fetchTime += time.Since(seekStart)
 					continue
 				}
 				valData := iterVal.Data()
 				if len(valData) == 0 {
+					r.fetchTime += time.Since(seekStart)
 					continue
 				}
 
 				valueCopy := make([]byte, len(valData))
 				copy(valueCopy, valData)
+				r.fetchTime += time.Since(seekStart)
 
 				r.bytesRead += int64(len(valueCopy))
 				r.scanned++
@@ -2389,13 +2408,20 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 
 	wg.Wait()
 
-	// Merge results in order
-	var decodeTime, filterTime time.Duration
+	// Merge results - use max of per-worker times since workers run in parallel
+	var fetchTime, decodeTime, filterTime time.Duration
 	events := make([]*query.Event, 0, fetchCap)
 	for _, r := range results {
 		events = append(events, r.events...)
-		decodeTime += r.decodeTime
-		filterTime += r.filterTime
+		if r.fetchTime > fetchTime {
+			fetchTime = r.fetchTime
+		}
+		if r.decodeTime > decodeTime {
+			decodeTime = r.decodeTime
+		}
+		if r.filterTime > filterTime {
+			filterTime = r.filterTime
+		}
 		result.EventBytesRead += r.bytesRead
 		result.EventsScanned += r.scanned
 	}
@@ -2403,7 +2429,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 		events = events[:limit]
 	}
 
-	result.EventFetchTime = time.Since(fetchStart) - decodeTime - filterTime
+	result.EventFetchTime = fetchTime
 	result.DecodeTime = decodeTime
 	result.FilterTime = filterTime
 	result.EventsReturned = len(events)
