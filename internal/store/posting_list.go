@@ -101,25 +101,30 @@ func readVarint(data []byte) (uint64, int) {
 // Local ID format: (ledger_offset << 16) | event_seq (same as bitmap32)
 // This enables point gets instead of range scans when fetching events.
 
-// FilterLocalIDsByLedgerRange filters local IDs to only include those within the ledger range.
-func FilterLocalIDsByLedgerRange(localIDs []uint32, bucketStart, startLedger, endLedger uint32) []uint32 {
+// FilterLocalIDsByLedgerRange filters dense local IDs to only include those within the ledger range.
+// Uses the BucketLedgerMap to convert ledger range to dense ID range for filtering.
+func FilterLocalIDsByLedgerRange(localIDs []uint32, lm *BucketLedgerMap, bucketStart, startLedger, endLedger uint32) []uint32 {
 	if len(localIDs) == 0 {
 		return nil
 	}
 
-	// Compute local ID boundaries
-	var startOffset, endOffset uint32
-	if startLedger > bucketStart {
-		startOffset = startLedger - bucketStart
-	}
-	endOffset = endLedger - bucketStart
-	_, bucketEnd := BucketRange(BucketID(bucketStart))
-	if endLedger > bucketEnd {
-		endOffset = bucketEnd - bucketStart
+	if lm == nil {
+		// No ledger map — can't filter by range, return all
+		return localIDs
 	}
 
-	startLocalID := startOffset << 16        // min local ID for start ledger
-	endLocalID := (endOffset << 16) | 0xFFFF // max local ID for end ledger
+	// Compute ledger offsets within the bucket
+	var startOff uint16
+	if startLedger > bucketStart {
+		startOff = uint16(startLedger - bucketStart)
+	}
+	endOff := uint16(BucketSize - 1)
+	_, bucketEnd := BucketRange(BucketID(bucketStart))
+	if endLedger < bucketEnd {
+		endOff = uint16(endLedger - bucketStart)
+	}
+
+	startLocalID, endLocalID := lm.LedgerRangeToIDRange(startOff, endOff)
 
 	var result []uint32
 	for _, id := range localIDs {
@@ -307,14 +312,15 @@ func (m *postingListV2MergeOperator) PartialMerge(key, leftOperand, rightOperand
 
 // postingListV2Result holds the result of reading a single V2 posting list.
 type postingListV2Result struct {
-	localIDs   []uint32
-	buckets    int
-	bytesRead  int64
-	readTime   time.Duration
-	decodeTime time.Duration
-	filterTime time.Duration
-	err        error
-	isContract bool
+	localIDs         []uint32            // flat list (for stats/compat)
+	localIDsByBucket map[uint32][]uint32 // per-bucket dense IDs
+	buckets          int
+	bytesRead        int64
+	readTime         time.Duration
+	decodeTime       time.Duration
+	filterTime       time.Duration
+	err              error
+	isContract       bool
 }
 
 // QueryEventsWithPostingListV2Timing queries events using V2 posting lists (32-bit local IDs).
@@ -370,34 +376,55 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2Timing(contractID []byt
 		result.LocalIDsInPostingList += len(plr.localIDs)
 	}
 
-	// Sort by size ascending (smallest first for efficient intersection)
-	sort.Slice(plResults, func(a, b int) bool {
-		return len(plResults[a].localIDs) < len(plResults[b].localIDs)
-	})
+	// Intersect per-bucket (dense IDs are only unique within a bucket)
+	intersectStart := time.Now()
+	resultByBucket := make(map[uint32][]uint32)
+	totalAfterIntersect := 0
 
-	// Intersect progressively (guided by smallest list)
-	var resultLocalIDs []uint32
-	for i, plr := range plResults {
-		if i == 0 {
-			resultLocalIDs = plr.localIDs
-		} else {
-			intersectStart := time.Now()
-			resultLocalIDs = IntersectLocalIDLists(resultLocalIDs, plr.localIDs)
-			result.IntersectTime += time.Since(intersectStart)
+	for _, bucketID := range buckets {
+		// Collect per-bucket lists from all posting list results
+		var bucketLists [][]uint32
+		for _, plr := range plResults {
+			if ids, ok := plr.localIDsByBucket[bucketID]; ok {
+				bucketLists = append(bucketLists, ids)
+			}
 		}
-		if len(resultLocalIDs) == 0 {
-			result.PostingListTime = time.Since(plStart) - result.IntersectTime
-			result.TotalTime = time.Since(totalStart)
-			return result, nil, nil
+		// All posting lists must have data for this bucket
+		if len(bucketLists) < len(plResults) {
+			continue
 		}
+
+		// Sort by size for efficient intersection
+		sort.Slice(bucketLists, func(a, b int) bool {
+			return len(bucketLists[a]) < len(bucketLists[b])
+		})
+
+		ids := bucketLists[0]
+		for i := 1; i < len(bucketLists); i++ {
+			ids = IntersectLocalIDLists(ids, bucketLists[i])
+			if len(ids) == 0 {
+				break
+			}
+		}
+		if len(ids) > 0 {
+			resultByBucket[bucketID] = ids
+			totalAfterIntersect += len(ids)
+		}
+	}
+	result.IntersectTime = time.Since(intersectStart)
+
+	if totalAfterIntersect == 0 {
+		result.PostingListTime = time.Since(plStart) - result.IntersectTime
+		result.TotalTime = time.Since(totalStart)
+		return result, nil, nil
 	}
 
 	result.PostingListTime = time.Since(plStart) - result.IntersectTime
-	result.LocalIDsAfterIntersect = len(resultLocalIDs)
+	result.LocalIDsAfterIntersect = totalAfterIntersect
 
-	// Fetch events using point gets
-	events, fetchTime, decodeTime, filterTime, bytesRead, scanned := es.fetchEventsByLocalIDsV2(
-		resultLocalIDs, buckets, startLedger, endLedger, limit, contractID)
+	// Fetch events per bucket using point gets
+	events, fetchTime, decodeTime, filterTime, bytesRead, scanned := es.fetchEventsByLocalIDsV2PerBucket(
+		resultByBucket, buckets, limit, contractID)
 
 	result.EventFetchTime = fetchTime
 	result.DecodeTime = decodeTime
@@ -436,16 +463,17 @@ func (es *RocksDBEventStore) queryPostingListsV2Parallel(contractID []byte, topi
 		go func(i int) {
 			defer wg.Done()
 			termKey := ContractTermKey(contractID)
-			ids, bucketsRead, bytesRead, readT, decodeT, filterT, err := es.queryPostingListV2WithStats(es.cfContractsPLV2, termKey, buckets, startLedger, endLedger)
+			ids, perBucket, bucketsRead, bytesRead, readT, decodeT, filterT, err := es.queryPostingListV2WithStats(es.cfContractsPLV2, termKey, buckets, startLedger, endLedger)
 			results[i] = postingListV2Result{
-				localIDs:   ids,
-				buckets:    bucketsRead,
-				bytesRead:  bytesRead,
-				readTime:   readT,
-				decodeTime: decodeT,
-				filterTime: filterT,
-				err:        err,
-				isContract: true,
+				localIDs:         ids,
+				localIDsByBucket: perBucket,
+				buckets:          bucketsRead,
+				bytesRead:        bytesRead,
+				readTime:         readT,
+				decodeTime:       decodeT,
+				filterTime:       filterT,
+				err:              err,
+				isContract:       true,
 			}
 		}(idx)
 		idx++
@@ -461,16 +489,17 @@ func (es *RocksDBEventStore) queryPostingListsV2Parallel(contractID []byte, topi
 			go func(i, p int, topic []byte) {
 				defer wg.Done()
 				termKey := TopicTermKey(p, topic)
-				ids, bucketsRead, bytesRead, readT, decodeT, filterT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
+				ids, perBucket, bucketsRead, bytesRead, readT, decodeT, filterT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
 				results[i] = postingListV2Result{
-					localIDs:   ids,
-					buckets:    bucketsRead,
-					bytesRead:  bytesRead,
-					readTime:   readT,
-					decodeTime: decodeT,
-					filterTime: filterT,
-					err:        err,
-					isContract: false,
+					localIDs:         ids,
+					localIDsByBucket: perBucket,
+					buckets:          bucketsRead,
+					bytesRead:        bytesRead,
+					readTime:         readT,
+					decodeTime:       decodeT,
+					filterTime:       filterT,
+					err:              err,
+					isContract:       false,
 				}
 			}(idx, pos, topicXDR)
 			idx++
@@ -552,9 +581,15 @@ func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topi
 		localIDs := DecodeLocalIDListDeltaVarint(dataCopy)
 		plDecodeTime += time.Since(t1)
 
-		// Filter by ledger range
+		// Load ledger map for this bucket for range filtering and ID resolution
+		lm, lmErr := es.LoadBucketLedgerMap(bucketID)
+		if lmErr != nil {
+			return nil, nil, fmt.Errorf("failed to load ledger map for bucket %d: %w", bucketID, lmErr)
+		}
+
+		// Filter by ledger range using dense IDs
 		t2 := time.Now()
-		filtered := FilterLocalIDsByLedgerRange(localIDs, bucketStart, startLedger, endLedger)
+		filtered := FilterLocalIDsByLedgerRange(localIDs, lm, bucketStart, startLedger, endLedger)
 		plFilterTime += time.Since(t2)
 		result.LocalIDsInPostingList += len(filtered)
 		result.LocalIDsAfterIntersect += len(filtered)
@@ -563,7 +598,7 @@ func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topi
 		// Fetch events for this bucket's local IDs
 		remaining := limit - len(allEvents)
 		events, ft, dt, flt, bytesRead, scanned := es.fetchEventsByLocalIDsV2ForBucket(
-			filtered, bucketStart, remaining, contractID)
+			filtered, lm, remaining, contractID)
 
 		fetchTime += ft
 		decodeTime += dt
@@ -587,28 +622,13 @@ func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topi
 	return result, allEvents, nil
 }
 
-// fetchEventsByLocalIDsV2 fetches events by local IDs using point gets with V2 keys.
-func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets []uint32, startLedger, endLedger uint32, limit int, contractID []byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
+// fetchEventsByLocalIDsV2PerBucket fetches events by per-bucket dense local IDs using point gets with V2 keys.
+// Uses the BucketLedgerMap to convert dense IDs to (ledger, eventSeq) pairs.
+func (es *RocksDBEventStore) fetchEventsByLocalIDsV2PerBucket(localIDsByBucket map[uint32][]uint32, buckets []uint32, limit int, contractID []byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
 	var fetchTime, decodeTime, filterTime time.Duration
 	var bytesRead int64
 	var scanned int
-	events := make([]*query.Event, 0, min(limit, len(localIDs)))
-
-	// Group local IDs by bucket
-	localIDsByBucket := make(map[uint32][]uint32)
-	for _, localID := range localIDs {
-		ledgerOffset := localID >> 16
-		// Find which bucket this belongs to
-		for _, bucketID := range buckets {
-			bucketStart := bucketID * BucketSize
-			ledger := bucketStart + ledgerOffset
-			_, bucketEnd := BucketRange(bucketID)
-			if ledger >= startLedger && ledger <= endLedger && ledger <= bucketEnd && ledgerOffset < BucketSize {
-				localIDsByBucket[bucketID] = append(localIDsByBucket[bucketID], localID)
-				break
-			}
-		}
-	}
+	events := make([]*query.Event, 0)
 
 	// Process buckets in order
 	for _, bucketID := range buckets {
@@ -621,14 +641,18 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets 
 			continue
 		}
 
-		bucketStart := bucketID * BucketSize
+		lm, err := es.LoadBucketLedgerMap(bucketID)
+		if err != nil || lm == nil {
+			continue
+		}
+
 		remaining := limit - len(events)
 		if limit <= 0 {
 			remaining = len(bucketLocalIDs)
 		}
 
 		evts, ft, dt, flt, br, sc := es.fetchEventsByLocalIDsV2ForBucket(
-			bucketLocalIDs, bucketStart, remaining, contractID)
+			bucketLocalIDs, lm, remaining, contractID)
 
 		fetchTime += ft
 		decodeTime += dt
@@ -641,10 +665,11 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2(localIDs []uint32, buckets 
 	return events, fetchTime, decodeTime, filterTime, bytesRead, scanned
 }
 
-// fetchEventsByLocalIDsV2ForBucket fetches events for local IDs within a single bucket.
+// fetchEventsByLocalIDsV2ForBucket fetches events for dense local IDs within a single bucket.
+// Uses the BucketLedgerMap to convert dense IDs to (ledger, eventSeq) pairs.
 // Uses parallel iterators to overlap RocksDB lookup latency across multiple goroutines.
-func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32, bucketStart uint32, limit int, contractID []byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
-	if len(localIDs) == 0 {
+func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32, lm *BucketLedgerMap, limit int, contractID []byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
+	if len(localIDs) == 0 || lm == nil {
 		return nil, 0, 0, 0, 0, 0
 	}
 
@@ -694,7 +719,7 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32,
 			defer iter.Close()
 
 			for i := start; i < end; i++ {
-				ledger, eventSeq := event.DecodeLocalIDForBucket(localIDs[i], bucketStart)
+				ledger, eventSeq := lm.DenseIDToLedgerAndSeq(localIDs[i])
 				key := event.EncodeKeyV2(ledger, eventSeq)
 
 				seekStart := time.Now()
@@ -790,9 +815,11 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32,
 	return events, fetchTime, decodeTime, filterTime, bytesRead, scanned
 }
 
-// queryPostingListV2WithStats reads V2 posting lists (32-bit local IDs) and returns stats.
-func (es *RocksDBEventStore) queryPostingListV2WithStats(cf *grocksdb.ColumnFamilyHandle, termKey [32]byte, buckets []uint32, startLedger, endLedger uint32) ([]uint32, int, int64, time.Duration, time.Duration, time.Duration, error) {
+// queryPostingListV2WithStats reads V2 posting lists (32-bit dense local IDs) and returns stats.
+// Returns both a flat list (for stats) and per-bucket map (for correct per-bucket intersection with dense IDs).
+func (es *RocksDBEventStore) queryPostingListV2WithStats(cf *grocksdb.ColumnFamilyHandle, termKey [32]byte, buckets []uint32, startLedger, endLedger uint32) ([]uint32, map[uint32][]uint32, int, int64, time.Duration, time.Duration, time.Duration, error) {
 	var allLocalIDs []uint32
+	perBucket := make(map[uint32][]uint32)
 	var bytesRead int64
 	var readTime, decodeTime, filterTime time.Duration
 
@@ -803,7 +830,7 @@ func (es *RocksDBEventStore) queryPostingListV2WithStats(cf *grocksdb.ColumnFami
 		value, err := es.db.GetCF(es.ro, cf, indexKey)
 		readTime += time.Since(t0)
 		if err != nil {
-			return nil, 0, 0, 0, 0, 0, fmt.Errorf("failed to read V2 posting list: %w", err)
+			return nil, nil, 0, 0, 0, 0, 0, fmt.Errorf("failed to read V2 posting list: %w", err)
 		}
 
 		if value.Exists() {
@@ -815,14 +842,22 @@ func (es *RocksDBEventStore) queryPostingListV2WithStats(cf *grocksdb.ColumnFami
 
 			t2 := time.Now()
 			bucketStart := bucketID * BucketSize
-			filtered := FilterLocalIDsByLedgerRange(localIDs, bucketStart, startLedger, endLedger)
+			lm, lmErr := es.LoadBucketLedgerMap(bucketID)
+			if lmErr != nil {
+				value.Free()
+				return nil, nil, 0, 0, 0, 0, 0, fmt.Errorf("failed to load ledger map for bucket %d: %w", bucketID, lmErr)
+			}
+			filtered := FilterLocalIDsByLedgerRange(localIDs, lm, bucketStart, startLedger, endLedger)
 			allLocalIDs = append(allLocalIDs, filtered...)
+			if len(filtered) > 0 {
+				perBucket[bucketID] = filtered
+			}
 			filterTime += time.Since(t2)
 		}
 		value.Free()
 	}
 
-	return allLocalIDs, len(buckets), bytesRead, readTime, decodeTime, filterTime, nil
+	return allLocalIDs, perBucket, len(buckets), bytesRead, readTime, decodeTime, filterTime, nil
 }
 
 // =============================================================================
@@ -913,18 +948,19 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 		go func(i int, contractID []byte) {
 			defer wg.Done()
 			termKey := ContractTermKey(contractID)
-			ids, bucketsRead, bytesRead, readT, decodeT, filterT, err := es.queryPostingListV2WithStats(es.cfContractsPLV2, termKey, buckets, startLedger, endLedger)
+			ids, perBucket, bucketsRead, bytesRead, readT, decodeT, filterT, err := es.queryPostingListV2WithStats(es.cfContractsPLV2, termKey, buckets, startLedger, endLedger)
 			plResults[i] = plGroup{
 				groupIdx: 0,
 				result: postingListV2Result{
-					localIDs:   ids,
-					buckets:    bucketsRead,
-					bytesRead:  bytesRead,
-					readTime:   readT,
-					decodeTime: decodeT,
-					filterTime: filterT,
-					err:        err,
-					isContract: true,
+					localIDs:         ids,
+					localIDsByBucket: perBucket,
+					buckets:          bucketsRead,
+					bytesRead:        bytesRead,
+					readTime:         readT,
+					decodeTime:       decodeT,
+					filterTime:       filterT,
+					err:              err,
+					isContract:       true,
 				},
 			}
 		}(idx, cid)
@@ -942,18 +978,19 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 			go func(i int, groupIdx int, p int, topic []byte) {
 				defer wg.Done()
 				termKey := TopicTermKey(p, topic)
-				ids, bucketsRead, bytesRead, readT, decodeT, filterT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
+				ids, perBucket, bucketsRead, bytesRead, readT, decodeT, filterT, err := es.queryPostingListV2WithStats(es.cfTopicsPLV2, termKey, buckets, startLedger, endLedger)
 				plResults[i] = plGroup{
 					groupIdx: groupIdx,
 					result: postingListV2Result{
-						localIDs:   ids,
-						buckets:    bucketsRead,
-						bytesRead:  bytesRead,
-						readTime:   readT,
-						decodeTime: decodeT,
-						filterTime: filterT,
-						err:        err,
-						isContract: false,
+						localIDs:         ids,
+						localIDsByBucket: perBucket,
+						buckets:          bucketsRead,
+						bytesRead:        bytesRead,
+						readTime:         readT,
+						decodeTime:       decodeT,
+						filterTime:       filterT,
+						err:              err,
+						isContract:       false,
 					},
 				}
 			}(idx, pos+1, pos, topicXDR)
@@ -977,50 +1014,81 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 		result.LocalIDsInPostingList += len(pg.result.localIDs)
 	}
 
-	// Union within each group, then intersect across groups
-	groupLists := make(map[int][][]uint32) // groupIdx -> list of localID lists
+	// Per-bucket: union within each group, then intersect across groups
+	// groupBucketLists: groupIdx -> bucketID -> list of localID slices
+	type groupBucketData struct {
+		lists map[uint32][][]uint32 // bucketID -> list of ID slices to union
+	}
+	groupData := make(map[int]*groupBucketData)
 	for _, pg := range plResults[:idx] {
-		groupLists[pg.groupIdx] = append(groupLists[pg.groupIdx], pg.result.localIDs)
+		gd, ok := groupData[pg.groupIdx]
+		if !ok {
+			gd = &groupBucketData{lists: make(map[uint32][][]uint32)}
+			groupData[pg.groupIdx] = gd
+		}
+		for bucketID, ids := range pg.result.localIDsByBucket {
+			gd.lists[bucketID] = append(gd.lists[bucketID], ids)
+		}
 	}
 
-	// Union within each group
-	var groupUnions [][]uint32
-	for _, lists := range groupLists {
-		var unioned []uint32
-		for _, list := range lists {
-			unioned = UnionLocalIDLists(unioned, list)
+	// For each bucket: union within each group, then intersect across groups
+	intersectStart := time.Now()
+	resultByBucket := make(map[uint32][]uint32)
+	totalAfterIntersect := 0
+	numGroups := len(groupData)
+
+	for _, bucketID := range buckets {
+		// Union within each group for this bucket
+		var groupUnions [][]uint32
+		for _, gd := range groupData {
+			lists := gd.lists[bucketID]
+			if len(lists) == 0 {
+				// This group has no data for this bucket -> AND produces empty
+				groupUnions = nil
+				break
+			}
+			var unioned []uint32
+			for _, list := range lists {
+				unioned = UnionLocalIDLists(unioned, list)
+			}
+			groupUnions = append(groupUnions, unioned)
 		}
-		groupUnions = append(groupUnions, unioned)
+
+		if len(groupUnions) < numGroups {
+			continue
+		}
+
+		// Sort by size for efficient intersection
+		sort.Slice(groupUnions, func(a, b int) bool {
+			return len(groupUnions[a]) < len(groupUnions[b])
+		})
+
+		ids := groupUnions[0]
+		for i := 1; i < len(groupUnions); i++ {
+			ids = IntersectLocalIDLists(ids, groupUnions[i])
+			if len(ids) == 0 {
+				break
+			}
+		}
+		if len(ids) > 0 {
+			resultByBucket[bucketID] = ids
+			totalAfterIntersect += len(ids)
+		}
 	}
+	result.IntersectTime = time.Since(intersectStart)
 
-	// Sort by size ascending for efficient intersection
-	sort.Slice(groupUnions, func(a, b int) bool {
-		return len(groupUnions[a]) < len(groupUnions[b])
-	})
-
-	// Intersect across groups
-	var resultLocalIDs []uint32
-	for i, unioned := range groupUnions {
-		if i == 0 {
-			resultLocalIDs = unioned
-		} else {
-			intersectStart := time.Now()
-			resultLocalIDs = IntersectLocalIDLists(resultLocalIDs, unioned)
-			result.IntersectTime += time.Since(intersectStart)
-		}
-		if len(resultLocalIDs) == 0 {
-			result.PostingListTime = time.Since(plStart) - result.IntersectTime
-			result.TotalTime = time.Since(totalStart)
-			return result, nil, nil
-		}
+	if totalAfterIntersect == 0 {
+		result.PostingListTime = time.Since(plStart) - result.IntersectTime
+		result.TotalTime = time.Since(totalStart)
+		return result, nil, nil
 	}
 
 	result.PostingListTime = time.Since(plStart) - result.IntersectTime
-	result.LocalIDsAfterIntersect = len(resultLocalIDs)
+	result.LocalIDsAfterIntersect = totalAfterIntersect
 
-	// Fetch events using point gets with contract post-filter
-	events, fetchTime, decodeTime, filterTime, bytesRead, scanned := es.fetchEventsByLocalIDsV2MultiFilter(
-		resultLocalIDs, buckets, startLedger, endLedger, limit, contractIDs)
+	// Fetch events per bucket using point gets with contract post-filter
+	events, fetchTime, decodeTime, filterTime, bytesRead, scanned := es.fetchEventsByLocalIDsV2MultiFilterPerBucket(
+		resultByBucket, buckets, limit, contractIDs)
 
 	result.EventFetchTime = fetchTime
 	result.DecodeTime = decodeTime
@@ -1033,35 +1101,22 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 	return result, events, nil
 }
 
-// fetchEventsByLocalIDsV2MultiFilter fetches events by local IDs with multi-value post-filtering.
-// Contract match: event matches ANY of the contractIDs
-// Topic match: for each topic position with filters, event's topic at that position matches ANY of the values
-// Uses parallel iterators to overlap RocksDB lookup latency across multiple goroutines.
-func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint32, buckets []uint32, startLedger, endLedger uint32, limit int, contractIDs [][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
+// fetchEventsByLocalIDsV2MultiFilterPerBucket fetches events by per-bucket dense local IDs
+// with multi-value post-filtering. Uses BucketLedgerMap for ID resolution.
+func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilterPerBucket(localIDsByBucket map[uint32][]uint32, buckets []uint32, limit int, contractIDs [][]byte) ([]*query.Event, time.Duration, time.Duration, time.Duration, int64, int) {
 
-	// Group local IDs by bucket and flatten into ordered keys
+	// Build ordered list of keys using ledger maps, capped at limit
 	type keyMeta struct {
 		key      []byte
-		localID  uint32
-		bucketID uint32
+		ledger   uint32
+		eventSeq uint16
 	}
 
-	localIDsByBucket := make(map[uint32][]uint32)
-	for _, localID := range localIDs {
-		ledgerOffset := localID >> 16
-		for _, bucketID := range buckets {
-			bucketStart := bucketID * BucketSize
-			ledger := bucketStart + ledgerOffset
-			_, bucketEnd := BucketRange(bucketID)
-			if ledger >= startLedger && ledger <= endLedger && ledger <= bucketEnd && ledgerOffset < BucketSize {
-				localIDsByBucket[bucketID] = append(localIDsByBucket[bucketID], localID)
-				break
-			}
-		}
+	totalIDs := 0
+	for _, ids := range localIDsByBucket {
+		totalIDs += len(ids)
 	}
-
-	// Build ordered list of keys, capped at limit
-	fetchCap := len(localIDs)
+	fetchCap := totalIDs
 	if limit > 0 && fetchCap > limit {
 		fetchCap = limit
 	}
@@ -1071,16 +1126,22 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint3
 			break
 		}
 		bucketLocalIDs := localIDsByBucket[bucketID]
-		bucketStart := bucketID * BucketSize
+		if len(bucketLocalIDs) == 0 {
+			continue
+		}
+		lm, err := es.LoadBucketLedgerMap(bucketID)
+		if err != nil || lm == nil {
+			continue
+		}
 		for _, localID := range bucketLocalIDs {
 			if len(allKeys) >= fetchCap {
 				break
 			}
-			ledger, eventSeq := event.DecodeLocalIDForBucket(localID, bucketStart)
+			ledger, eventSeq := lm.DenseIDToLedgerAndSeq(localID)
 			allKeys = append(allKeys, keyMeta{
 				key:      event.EncodeKeyV2(ledger, eventSeq),
-				localID:  localID,
-				bucketID: bucketID,
+				ledger:   ledger,
+				eventSeq: eventSeq,
 			})
 		}
 	}
@@ -1183,16 +1244,13 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2MultiFilter(localIDs []uint3
 				r.filterTime += time.Since(filterStart)
 
 				// Decode to query.Event
-				bucketStart := km.bucketID * BucketSize
-				ledger, eventSeq := event.DecodeLocalIDForBucket(km.localID, bucketStart)
-
 				decStart := time.Now()
 				var ev *query.Event
 				var decErr error
 				if es.eventFormat == "binary" {
-					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
+					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, km.ledger, km.eventSeq)
 				} else {
-					ev, decErr = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
+					ev, decErr = parseRawXDRToQueryEvent(valueCopy, km.ledger, 0, 0, km.eventSeq)
 				}
 				r.decodeTime += time.Since(decStart)
 

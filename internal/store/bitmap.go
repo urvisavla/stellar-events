@@ -7,8 +7,6 @@ import (
 
 	"github.com/RoaringBitmap/roaring"
 	"github.com/linxGnu/grocksdb"
-
-	"github.com/urvisavla/stellar-events/internal/event"
 )
 
 // =============================================================================
@@ -39,8 +37,13 @@ func makeIndexKey(termKey [32]byte, bucketID uint32) [IndexKeySize]byte {
 	return key
 }
 
+// ledgerMapLoader loads a BucketLedgerMap for a given bucket from storage.
+type ledgerMapLoader interface {
+	LoadBucketLedgerMap(bucketID uint32) (*BucketLedgerMap, error)
+}
+
 // eventBitmap32Index manages segmented 32-bit roaring bitmap indexes for event-level granularity.
-// Stores local IDs: (ledger_offset << 16) | event_seq within each segment.
+// Uses dense sequential local IDs within each bucket for compact bitmap representation.
 // Uses roaring.Bitmap (32-bit) which supports FromBuffer for near-zero-cost decode.
 type eventBitmap32Index struct {
 	// Hot segment caches - separate maps for contract and topic
@@ -52,26 +55,52 @@ type eventBitmap32Index struct {
 
 	// Segment loader for queries
 	loader bitmap32Loader
+
+	// Dense ID assignment: per-bucket event counters
+	bucketCounters map[uint32]*bucketEventCounter
+
+	// Ledger map loader for queries (range trimming)
+	ledgerMapLoader ledgerMapLoader
 }
 
 // newEventBitmap32Index creates a new event-level bitmap32 index.
-func newEventBitmap32Index(loader bitmap32Loader) *eventBitmap32Index {
+func newEventBitmap32Index(loader bitmap32Loader, lmLoader ledgerMapLoader) *eventBitmap32Index {
 	return &eventBitmap32Index{
 		contractSegments: make(map[[IndexKeySize]byte]*roaring.Bitmap),
 		topicSegments:    make(map[[IndexKeySize]byte]*roaring.Bitmap),
 		loader:           loader,
+		bucketCounters:   make(map[uint32]*bucketEventCounter),
+		ledgerMapLoader:  lmLoader,
 	}
 }
 
-// AddContractEvent adds an event to the contract index.
-func (bi *eventBitmap32Index) AddContractEvent(contractID []byte, ledger uint32, eventSeq uint16) {
-	termKey := ContractTermKey(contractID)
-	segmentID := BucketID(ledger)
-	segmentStart := segmentID * BucketSize
-	ledgerOffset := uint16(ledger - segmentStart)
-	localID := event.EncodeBitmap32LocalID(ledgerOffset, eventSeq)
+// AssignDenseLocalID assigns the next dense local ID for an event within a bucket.
+// Returns the dense ID to use in bitmap/posting list indexes.
+func (bi *eventBitmap32Index) AssignDenseLocalID(bucketID uint32, ledger uint32) uint32 {
+	counter, exists := bi.bucketCounters[bucketID]
+	if !exists {
+		counter = &bucketEventCounter{}
+		bi.bucketCounters[bucketID] = counter
+	}
+	ledgerOffset := uint16(ledger - bucketID*BucketSize)
+	return counter.assignDenseID(ledgerOffset)
+}
 
-	key := makeIndexKey(termKey, segmentID)
+// InitializeDenseCounter loads the ledger map for a bucket from storage and sets
+// the nextDenseID to continue from the persisted state. Called on startup.
+func (bi *eventBitmap32Index) InitializeDenseCounter(bucketID uint32, nextDenseID uint32) {
+	counter, exists := bi.bucketCounters[bucketID]
+	if !exists {
+		counter = &bucketEventCounter{}
+		bi.bucketCounters[bucketID] = counter
+	}
+	counter.nextDenseID = nextDenseID
+}
+
+// AddContractEvent adds an event to the contract index using a dense local ID.
+func (bi *eventBitmap32Index) AddContractEvent(contractID []byte, bucketID uint32, denseLocalID uint32) {
+	termKey := ContractTermKey(contractID)
+	key := makeIndexKey(termKey, bucketID)
 
 	bitmap, exists := bi.contractSegments[key]
 	if !exists {
@@ -79,22 +108,17 @@ func (bi *eventBitmap32Index) AddContractEvent(contractID []byte, ledger uint32,
 		bi.contractSegments[key] = bitmap
 	}
 
-	bitmap.Add(localID)
+	bitmap.Add(denseLocalID)
 
-	if segmentID > bi.currentBucketID {
-		bi.currentBucketID = segmentID
+	if bucketID > bi.currentBucketID {
+		bi.currentBucketID = bucketID
 	}
 }
 
-// AddTopicEvent adds an event to the topic index (positional).
-func (bi *eventBitmap32Index) AddTopicEvent(pos int, topicValue []byte, ledger uint32, eventSeq uint16) {
+// AddTopicEvent adds an event to the topic index (positional) using a dense local ID.
+func (bi *eventBitmap32Index) AddTopicEvent(pos int, topicValue []byte, bucketID uint32, denseLocalID uint32) {
 	termKey := TopicTermKey(pos, topicValue)
-	segmentID := BucketID(ledger)
-	segmentStart := segmentID * BucketSize
-	ledgerOffset := uint16(ledger - segmentStart)
-	localID := event.EncodeBitmap32LocalID(ledgerOffset, eventSeq)
-
-	key := makeIndexKey(termKey, segmentID)
+	key := makeIndexKey(termKey, bucketID)
 
 	bitmap, exists := bi.topicSegments[key]
 	if !exists {
@@ -102,15 +126,16 @@ func (bi *eventBitmap32Index) AddTopicEvent(pos int, topicValue []byte, ledger u
 		bi.topicSegments[key] = bitmap
 	}
 
-	bitmap.Add(localID)
+	bitmap.Add(denseLocalID)
 
-	if segmentID > bi.currentBucketID {
-		bi.currentBucketID = segmentID
+	if bucketID > bi.currentBucketID {
+		bi.currentBucketID = bucketID
 	}
 }
 
 // QueryIndexWithStats returns per-segment bitmaps of local IDs matching a key within a ledger range.
 // Returns map[segmentID]*roaring.Bitmap so caller knows which segment each local ID belongs to.
+// Uses BucketLedgerMap for range trimming with dense sequential IDs.
 func (bi *eventBitmap32Index) QueryIndexWithStats(isContract bool, termKey [32]byte, startLedger, endLedger uint32) (map[uint32]*roaring.Bitmap, int64, int, time.Duration, time.Duration, error) {
 	result := make(map[uint32]*roaring.Bitmap)
 	var bytesRead int64
@@ -137,19 +162,38 @@ func (bi *eventBitmap32Index) QueryIndexWithStats(isContract bool, termKey [32]b
 			continue
 		}
 
-		// Trim to ledger range using local ID boundaries
+		// Trim to ledger range using dense ID boundaries from ledger map
 		segmentStart := segID * BucketSize
 
-		// Compute local ID boundaries for ledger range
-		var startLocalID, endLocalID uint32
+		// Compute ledger offsets within this bucket
+		var startOff uint16
 		if startLedger > segmentStart {
-			startLocalID = event.EncodeBitmap32LocalID(uint16(startLedger-segmentStart), 0)
+			startOff = uint16(startLedger - segmentStart)
 		}
+		endOff := uint16(BucketSize - 1)
 		if endLedger < segmentStart+BucketSize-1 {
-			endOffset := uint16(endLedger - segmentStart)
-			endLocalID = event.EncodeBitmap32LocalID(endOffset, 0xFFFF)
+			endOff = uint16(endLedger - segmentStart)
+		}
+
+		// Load ledger map for this bucket to get dense ID range
+		var startLocalID, endLocalID uint32
+		needsTrim := startOff > 0 || endOff < uint16(BucketSize-1)
+
+		if needsTrim && bi.ledgerMapLoader != nil {
+			lm, err := bi.ledgerMapLoader.LoadBucketLedgerMap(segID)
+			if err != nil {
+				return nil, bytesRead, segmentsRead, totalReadTime, totalDecodeTime,
+					fmt.Errorf("failed to load ledger map for bucket %d: %w", segID, err)
+			}
+			if lm != nil {
+				startLocalID, endLocalID = lm.LedgerRangeToIDRange(startOff, endOff)
+			} else {
+				// No ledger map available — cannot trim, include all
+				endLocalID = bitmap.Maximum()
+			}
 		} else {
-			endLocalID = event.EncodeBitmap32LocalID(uint16(BucketSize-1), 0xFFFF)
+			// Full bucket range — no trimming needed
+			endLocalID = bitmap.Maximum()
 		}
 
 		// Clone and trim to range
@@ -192,16 +236,17 @@ func (bi *eventBitmap32Index) getSegmentWithStats(isContract bool, termKey [32]b
 	return nil, 0, 0, 0, nil
 }
 
-// GetAndClearAllSegments gets and clears all hot segments.
+// GetAndClearAllSegments gets and clears all hot segments and bucket counters.
 // Serializes bitmaps using MarshalBinary (standard format, compatible with FromBuffer).
-func (bi *eventBitmap32Index) GetAndClearAllSegments() ([]eventSegment, error) {
+// Also returns the bucket event counters for ledger map flush.
+func (bi *eventBitmap32Index) GetAndClearAllSegments() ([]eventSegment, map[uint32]*bucketEventCounter, error) {
 	segments := make([]eventSegment, 0, len(bi.contractSegments)+len(bi.topicSegments))
 
 	for key, bitmap := range bi.contractSegments {
 		bitmap.RunOptimize()
 		data, err := bitmap.ToBytes()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		keyCopy := make([]byte, IndexKeySize)
 		copy(keyCopy, key[:])
@@ -216,7 +261,7 @@ func (bi *eventBitmap32Index) GetAndClearAllSegments() ([]eventSegment, error) {
 		bitmap.RunOptimize()
 		data, err := bitmap.ToBytes()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		keyCopy := make([]byte, IndexKeySize)
 		copy(keyCopy, key[:])
@@ -227,16 +272,29 @@ func (bi *eventBitmap32Index) GetAndClearAllSegments() ([]eventSegment, error) {
 		})
 	}
 
+	// Copy bucket counters for ledger map flush, then reset only eventCounts
+	// (nextDenseID must persist to ensure dense IDs continue after flush)
+	counters := make(map[uint32]*bucketEventCounter)
+	for bucketID, counter := range bi.bucketCounters {
+		counters[bucketID] = &bucketEventCounter{
+			eventCounts: counter.eventCounts,
+			nextDenseID: counter.nextDenseID,
+		}
+		// Reset event counts (captured for flush) but keep nextDenseID
+		counter.eventCounts = [BucketSize]uint32{}
+	}
+
 	bi.contractSegments = make(map[[IndexKeySize]byte]*roaring.Bitmap)
 	bi.topicSegments = make(map[[IndexKeySize]byte]*roaring.Bitmap)
 
-	return segments, nil
+	return segments, counters, nil
 }
 
-// ClearAll clears all hot segments.
+// ClearAll clears all hot segments and bucket counters.
 func (bi *eventBitmap32Index) ClearAll() {
 	bi.contractSegments = make(map[[IndexKeySize]byte]*roaring.Bitmap)
 	bi.topicSegments = make(map[[IndexKeySize]byte]*roaring.Bitmap)
+	bi.bucketCounters = make(map[uint32]*bucketEventCounter)
 }
 
 // GetHotSegmentStats returns statistics about hot segments.
@@ -268,6 +326,7 @@ type BitmapEventSeqStore struct {
 	db          *grocksdb.DB
 	cfContracts *grocksdb.ColumnFamilyHandle // Contract ID index CF (bitmap32)
 	cfTopics    *grocksdb.ColumnFamilyHandle // Topic index CF (bitmap32)
+	cfDefault   *grocksdb.ColumnFamilyHandle // Default CF for ledger maps
 
 	// In-memory event bitmap32 index
 	bitmap *eventBitmap32Index
@@ -278,21 +337,46 @@ type BitmapEventSeqStore struct {
 }
 
 // NewBitmapEventSeqStore creates a new RocksDB-backed event index store using 32-bit bitmaps.
-func NewBitmapEventSeqStore(db *grocksdb.DB, cfContracts, cfTopics *grocksdb.ColumnFamilyHandle) (*BitmapEventSeqStore, error) {
+func NewBitmapEventSeqStore(db *grocksdb.DB, cfDefault, cfContracts, cfTopics *grocksdb.ColumnFamilyHandle) (*BitmapEventSeqStore, error) {
 	wo := grocksdb.NewDefaultWriteOptions()
 	wo.DisableWAL(true)
 
 	store := &BitmapEventSeqStore{
 		db:          db,
+		cfDefault:   cfDefault,
 		cfContracts: cfContracts,
 		cfTopics:    cfTopics,
 		wo:          wo,
 		ro:          grocksdb.NewDefaultReadOptions(),
 	}
 
-	store.bitmap = newEventBitmap32Index(store)
+	store.bitmap = newEventBitmap32Index(store, store)
 
 	return store, nil
+}
+
+// LoadBucketLedgerMap implements the ledgerMapLoader interface.
+// Reads the ledger map for a bucket from CFDefault.
+func (s *BitmapEventSeqStore) LoadBucketLedgerMap(bucketID uint32) (*BucketLedgerMap, error) {
+	key := BucketLedgerMapKey(bucketID)
+	data, err := s.db.GetCF(s.ro, s.cfDefault, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load ledger map for bucket %d: %w", bucketID, err)
+	}
+	defer data.Free()
+
+	if data.Size() == 0 {
+		return nil, nil
+	}
+
+	// Copy data since it becomes invalid after Free
+	dataCopy := make([]byte, data.Size())
+	copy(dataCopy, data.Data())
+
+	return &BucketLedgerMap{
+		BucketID: bucketID,
+		Data:     dataCopy,
+	}, nil
 }
 
 // getCF returns the appropriate column family based on isContract flag.
@@ -382,14 +466,14 @@ func (s *BitmapEventSeqStore) loadBitmap32FromCF(cf *grocksdb.ColumnFamilyHandle
 // Write Operations
 // =============================================================================
 
-// AddContractEvent adds an event to the contract index.
-func (s *BitmapEventSeqStore) AddContractEvent(contractID []byte, ledger uint32, eventSeq uint16) {
-	s.bitmap.AddContractEvent(contractID, ledger, eventSeq)
+// AddContractEvent adds an event to the contract index using a dense local ID.
+func (s *BitmapEventSeqStore) AddContractEvent(contractID []byte, bucketID uint32, denseLocalID uint32) {
+	s.bitmap.AddContractEvent(contractID, bucketID, denseLocalID)
 }
 
-// AddTopicEvent adds an event to the topic index (positional).
-func (s *BitmapEventSeqStore) AddTopicEvent(pos int, topic []byte, ledger uint32, eventSeq uint16) {
-	s.bitmap.AddTopicEvent(pos, topic, ledger, eventSeq)
+// AddTopicEvent adds an event to the topic index (positional) using a dense local ID.
+func (s *BitmapEventSeqStore) AddTopicEvent(pos int, topic []byte, bucketID uint32, denseLocalID uint32) {
+	s.bitmap.AddTopicEvent(pos, topic, bucketID, denseLocalID)
 }
 
 // =============================================================================
@@ -609,14 +693,14 @@ func (s *BitmapEventSeqStore) getEventBitmap32Index() *eventBitmap32Index {
 // Lifecycle
 // =============================================================================
 
-// Flush persists all hot segments to RocksDB, merging with existing data.
+// Flush persists all hot segments and ledger maps to RocksDB, merging with existing data.
 func (s *BitmapEventSeqStore) Flush() error {
-	segments, err := s.bitmap.GetAndClearAllSegments()
+	segments, counters, err := s.bitmap.GetAndClearAllSegments()
 	if err != nil {
 		return fmt.Errorf("failed to get event bitmap32 segments: %w", err)
 	}
 
-	if len(segments) == 0 {
+	if len(segments) == 0 && len(counters) == 0 {
 		return nil
 	}
 
@@ -649,6 +733,41 @@ func (s *BitmapEventSeqStore) Flush() error {
 		}
 
 		batch.PutCF(cf, seg.Key, finalData)
+	}
+
+	// Write/merge ledger maps for each bucket that had events
+	for bucketID, counter := range counters {
+		lmKey := BucketLedgerMapKey(bucketID)
+
+		// Read existing ledger map data
+		existingData, err := s.db.GetCF(s.ro, s.cfDefault, lmKey)
+		if err != nil {
+			return fmt.Errorf("failed to read existing ledger map for bucket %d: %w", bucketID, err)
+		}
+
+		var existingBytes []byte
+		if existingData.Size() > 0 {
+			existingBytes = make([]byte, existingData.Size())
+			copy(existingBytes, existingData.Data())
+		}
+		existingData.Free()
+
+		// Build new counts map from the counter
+		newCounts := make(map[uint16]uint32)
+		for i := uint32(0); i < BucketSize; i++ {
+			if counter.eventCounts[i] > 0 {
+				newCounts[uint16(i)] = counter.eventCounts[i]
+			}
+		}
+
+		var finalData []byte
+		if len(existingBytes) > 0 {
+			finalData = MergeBucketLedgerMapData(existingBytes, newCounts)
+		} else {
+			finalData = EncodeBucketLedgerMap(bucketID, counter.eventCounts)
+		}
+
+		batch.PutCF(s.cfDefault, lmKey, finalData)
 	}
 
 	if err := s.db.Write(s.wo, batch); err != nil {

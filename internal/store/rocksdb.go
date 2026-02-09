@@ -373,8 +373,8 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 	}
 
 	// Create event-level bitmap32 index store (32-bit, FromBuffer decode)
-	// cfHandles[3] = contracts_bm32, cfHandles[4] = topics_bm32
-	eventIndex32Store, err := NewBitmapEventSeqStore(db, cfHandles[3], cfHandles[4])
+	// cfHandles[0] = default, cfHandles[3] = contracts_bm32, cfHandles[4] = topics_bm32
+	eventIndex32Store, err := NewBitmapEventSeqStore(db, cfHandles[0], cfHandles[3], cfHandles[4])
 	if err != nil {
 		db.Close()
 		// Note: We intentionally don't destroy cfOpts, bbtoList, or baseOpts here.
@@ -478,25 +478,38 @@ func (es *RocksDBEventStore) StoreEvents(events []*event.IngestEvent, opts *Stor
 		batch.PutCF(es.cfEvents, key, value)
 		totalBytes += int64(len(value))
 
-		// Update 32-bit event-level bitmap indexes (FromBuffer decode)
+		// Assign dense local ID and update bitmap + posting list indexes
 		if eventBitmap32Idx != nil {
-			// Index contract ID -> local ID (32-bit)
+			bucketID := BucketID(ev.LedgerSequence)
+			denseLocalID := eventBitmap32Idx.AssignDenseLocalID(bucketID, ev.LedgerSequence)
+
+			// Index contract ID -> dense local ID (bitmap32)
 			if len(ev.ContractID) > 0 {
-				eventBitmap32Idx.AddContractEvent(ev.ContractID, ev.LedgerSequence, eventSeq)
+				eventBitmap32Idx.AddContractEvent(ev.ContractID, bucketID, denseLocalID)
 			}
 
-			// Index topics -> local ID (32-bit, positional)
+			// Index topics -> dense local ID (bitmap32, positional)
 			for pos, topicBytes := range ev.Topics {
-				eventBitmap32Idx.AddTopicEvent(pos, topicBytes, ev.LedgerSequence, eventSeq)
+				eventBitmap32Idx.AddTopicEvent(pos, topicBytes, bucketID, denseLocalID)
 			}
 		}
 
-		// Accumulate V2 posting list local IDs when bitmap32 mode is active
+		// Accumulate V2 posting list local IDs using dense IDs
 		if opts.V2Indexes {
-			bucketStart := BucketID(ev.LedgerSequence) * BucketSize
-			localID := event.EncodeLocalIDForBucket(ev.LedgerSequence, eventSeq, bucketStart)
+			bucketID := BucketID(ev.LedgerSequence)
+			// Re-use the same dense ID from the bitmap counter
+			// The bitmap index already assigned this ID, so we need to compute
+			// what it was. Since the bitmap assigns IDs sequentially and we're
+			// in the same loop iteration, we can get the last assigned ID.
+			var denseLocalID uint32
+			if eventBitmap32Idx != nil {
+				// The ID was just assigned above; it's nextDenseID - 1
+				counter := eventBitmap32Idx.bucketCounters[bucketID]
+				denseLocalID = counter.nextDenseID - 1
+			}
+
 			localIDBytes := make([]byte, 4)
-			binary.BigEndian.PutUint32(localIDBytes, localID)
+			binary.BigEndian.PutUint32(localIDBytes, denseLocalID)
 
 			if len(ev.ContractID) > 0 {
 				termKey := ContractTermKey(ev.ContractID)
@@ -1158,6 +1171,32 @@ func (es *RocksDBEventStore) GetLastProcessedLedger() (uint32, error) {
 	}
 
 	return binary.BigEndian.Uint32(value.Data()), nil
+}
+
+// LoadBucketLedgerMap reads the ledger map for a bucket from CFDefault.
+func (es *RocksDBEventStore) LoadBucketLedgerMap(bucketID uint32) (*BucketLedgerMap, error) {
+	if es.eventIndex32Store != nil {
+		return es.eventIndex32Store.LoadBucketLedgerMap(bucketID)
+	}
+	return nil, nil
+}
+
+// InitializeDenseCounters loads the ledger map for the current bucket from storage
+// and initializes the dense ID counter so ingestion continues from the correct offset.
+// Should be called on startup after the DB is opened.
+func (es *RocksDBEventStore) InitializeDenseCounters(lastLedger uint32) error {
+	if es.eventIndex32Store == nil {
+		return nil
+	}
+	bucketID := BucketID(lastLedger)
+	lm, err := es.eventIndex32Store.LoadBucketLedgerMap(bucketID)
+	if err != nil {
+		return fmt.Errorf("failed to load ledger map on startup: %w", err)
+	}
+	if lm != nil {
+		es.eventIndex32Store.bitmap.InitializeDenseCounter(bucketID, lm.TotalEvents())
+	}
+	return nil
 }
 
 // =============================================================================
@@ -2056,10 +2095,11 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 		return result, nil, nil
 	}
 
-	// Collect all keys and metadata from bitmap results, capped at limit
+	// Collect all keys and metadata from bitmap results, capped at limit.
+	// Use ledger map to convert dense local IDs to (ledger, eventSeq) pairs.
 	type bitmapEvtMeta struct {
-		segmentStart uint32
-		localID      uint32
+		ledger   uint32
+		eventSeq uint16
 	}
 
 	segIDs := make([]uint32, 0, len(queryResult.PerSegment))
@@ -2075,21 +2115,38 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 	allKeys := make([][]byte, 0, fetchCap)
 	allMetas := make([]bitmapEvtMeta, 0, fetchCap)
 
+	// Cache ledger maps per segment
+	ledgerMaps := make(map[uint32]*BucketLedgerMap)
+
 	for _, segID := range segIDs {
 		if len(allKeys) >= fetchCap {
 			break
 		}
-		bitmap := queryResult.PerSegment[segID]
-		segmentStart := segID * BucketSize
 
+		// Load ledger map for this segment
+		lm, ok := ledgerMaps[segID]
+		if !ok {
+			var lmErr error
+			lm, lmErr = es.eventIndex32Store.LoadBucketLedgerMap(segID)
+			if lmErr != nil {
+				return nil, nil, fmt.Errorf("failed to load ledger map for bucket %d: %w", segID, lmErr)
+			}
+			ledgerMaps[segID] = lm
+		}
+		if lm == nil {
+			continue
+		}
+
+		bitmap := queryResult.PerSegment[segID]
 		bitmapIter := bitmap.Iterator()
 		for bitmapIter.HasNext() {
 			if len(allKeys) >= fetchCap {
 				break
 			}
-			localID := bitmapIter.Next()
-			allKeys = append(allKeys, event.LocalIDToKeyV2(segmentStart, localID))
-			allMetas = append(allMetas, bitmapEvtMeta{segmentStart: segmentStart, localID: localID})
+			denseID := bitmapIter.Next()
+			ledger, eventSeq := lm.DenseIDToLedgerAndSeq(denseID)
+			allKeys = append(allKeys, event.EncodeKeyV2(ledger, eventSeq))
+			allMetas = append(allMetas, bitmapEvtMeta{ledger: ledger, eventSeq: eventSeq})
 		}
 	}
 
@@ -2184,16 +2241,13 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 				r.filterTime += time.Since(filterStart)
 
 				// Decode to query.Event
-				ledgerOffset, eventSeq := event.DecodeBitmap32LocalID(meta.localID)
-				ledger := meta.segmentStart + uint32(ledgerOffset)
-
 				decStart := time.Now()
 				var ev *query.Event
 				var decErr error
 				if es.eventFormat == "binary" {
-					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
+					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, meta.ledger, meta.eventSeq)
 				} else {
-					ev, decErr = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
+					ev, decErr = parseRawXDRToQueryEvent(valueCopy, meta.ledger, 0, 0, meta.eventSeq)
 				}
 				r.decodeTime += time.Since(decStart)
 
@@ -2275,10 +2329,11 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 		return result, nil, nil
 	}
 
-	// Collect all keys and metadata from bitmap results, capped at limit
+	// Collect all keys and metadata from bitmap results, capped at limit.
+	// Use ledger map to convert dense local IDs to (ledger, eventSeq) pairs.
 	type bitmapEvtMeta struct {
-		segmentStart uint32
-		localID      uint32
+		ledger   uint32
+		eventSeq uint16
 	}
 
 	segIDs := make([]uint32, 0, len(queryResult.PerSegment))
@@ -2294,21 +2349,38 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 	allKeys := make([][]byte, 0, fetchCap)
 	allMetas := make([]bitmapEvtMeta, 0, fetchCap)
 
+	// Cache ledger maps per segment
+	ledgerMaps := make(map[uint32]*BucketLedgerMap)
+
 	for _, segID := range segIDs {
 		if len(allKeys) >= fetchCap {
 			break
 		}
-		bitmap := queryResult.PerSegment[segID]
-		segmentStart := segID * BucketSize
 
+		// Load ledger map for this segment
+		lm, ok := ledgerMaps[segID]
+		if !ok {
+			var lmErr error
+			lm, lmErr = es.eventIndex32Store.LoadBucketLedgerMap(segID)
+			if lmErr != nil {
+				return nil, nil, fmt.Errorf("failed to load ledger map for bucket %d: %w", segID, lmErr)
+			}
+			ledgerMaps[segID] = lm
+		}
+		if lm == nil {
+			continue
+		}
+
+		bitmap := queryResult.PerSegment[segID]
 		bitmapIter := bitmap.Iterator()
 		for bitmapIter.HasNext() {
 			if len(allKeys) >= fetchCap {
 				break
 			}
-			localID := bitmapIter.Next()
-			allKeys = append(allKeys, event.LocalIDToKeyV2(segmentStart, localID))
-			allMetas = append(allMetas, bitmapEvtMeta{segmentStart: segmentStart, localID: localID})
+			denseID := bitmapIter.Next()
+			ledger, eventSeq := lm.DenseIDToLedgerAndSeq(denseID)
+			allKeys = append(allKeys, event.EncodeKeyV2(ledger, eventSeq))
+			allMetas = append(allMetas, bitmapEvtMeta{ledger: ledger, eventSeq: eventSeq})
 		}
 	}
 
@@ -2410,16 +2482,13 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 				r.filterTime += time.Since(filterStart)
 
 				// Decode to query.Event
-				ledgerOffset, eventSeq := event.DecodeBitmap32LocalID(meta.localID)
-				ledger := meta.segmentStart + uint32(ledgerOffset)
-
 				decStart := time.Now()
 				var ev *query.Event
 				var decErr error
 				if es.eventFormat == "binary" {
-					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, ledger, eventSeq)
+					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, meta.ledger, meta.eventSeq)
 				} else {
-					ev, decErr = parseRawXDRToQueryEvent(valueCopy, ledger, 0, 0, eventSeq)
+					ev, decErr = parseRawXDRToQueryEvent(valueCopy, meta.ledger, 0, 0, meta.eventSeq)
 				}
 				r.decodeTime += time.Since(decStart)
 
