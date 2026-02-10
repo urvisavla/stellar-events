@@ -789,6 +789,7 @@ type Bitmap32EventQueryResult struct {
 	MatchingLocalIDs int    // Local IDs matching index query
 
 	// Index stats
+	BucketsTouched  int   // Number of buckets (segments) touched
 	SegmentsScanned int   // Number of segments scanned
 	IndexBytesRead  int64 // Bytes read from bitmap index
 
@@ -813,6 +814,7 @@ func (r *Bitmap32EventQueryResult) ToUnified() *UnifiedQueryResult {
 	return &UnifiedQueryResult{
 		IndexType:       "bitmap32-event",
 		LedgerRange:     r.LedgerRange,
+		BucketsTouched:  r.BucketsTouched,
 		IndexMatches:    r.MatchingLocalIDs,
 		MatchUnitName:   "local IDs",
 		EventsScanned:   r.EventsScanned,

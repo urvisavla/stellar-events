@@ -308,9 +308,10 @@ type UnifiedQueryResult struct {
 	IndexType string // "posting-v2", "bitmap32", or "bitmap64"
 
 	// Ledger range
-	LedgerRange   uint32 // endLedger - startLedger + 1
-	IndexMatches  int    // Matches from index (ledgers, keys, or TOIDs depending on type)
-	MatchUnitName string // "ledgers", "event keys", or "TOIDs" - describes what IndexMatches counts
+	LedgerRange    uint32 // endLedger - startLedger + 1
+	BucketsTouched int    // Number of buckets touched by the query
+	IndexMatches   int    // Matches from index (ledgers, keys, or TOIDs depending on type)
+	MatchUnitName  string // "ledgers", "event keys", or "TOIDs" - describes what IndexMatches counts
 
 	// Event stats
 	EventsScanned  int // Events scanned from storage

@@ -470,6 +470,7 @@ func printUnifiedResult(r *store.UnifiedQueryResult) {
 
 	fmt.Fprintf(os.Stderr, "\n=== %s Query Results ===\n", header)
 	fmt.Fprintf(os.Stderr, "  Ledger range:      %d ledgers\n", r.LedgerRange)
+	fmt.Fprintf(os.Stderr, "  Buckets touched:   %d\n", r.BucketsTouched)
 	fmt.Fprintf(os.Stderr, "  Index matches:     %d %s\n", r.IndexMatches, r.MatchUnitName)
 	fmt.Fprintf(os.Stderr, "  Events scanned:    %d\n", r.EventsScanned)
 	fmt.Fprintf(os.Stderr, "  Events returned:   %d\n", r.EventsReturned)

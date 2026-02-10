@@ -356,6 +356,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2Timing(contractID []byt
 
 	// Multi-filter: use parallel reads + guided intersection
 	buckets := GetBucketsForRange(startLedger, endLedger)
+	result.BucketsTouched = len(buckets)
 
 	plStart := time.Now()
 
@@ -514,6 +515,7 @@ func (es *RocksDBEventStore) queryPostingListsV2Parallel(contractID []byte, topi
 // Stops early when limit is reached.
 func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int, result *PostingListV2QueryResult, totalStart time.Time) (*PostingListV2QueryResult, []*query.Event, error) {
 	buckets := GetBucketsForRange(startLedger, endLedger)
+	result.BucketsTouched = len(buckets)
 
 	// Determine which CF and term key to use
 	var cf *grocksdb.ColumnFamilyHandle
@@ -871,7 +873,8 @@ type PostingListV2QueryResult struct {
 	LedgerRange uint32 // endLedger - startLedger + 1
 
 	// Posting list stats
-	BucketsScanned         int   // Number of bucket ranges scanned
+	BucketsTouched         int   // Number of unique buckets touched
+	BucketsScanned         int   // Number of bucket ranges scanned (per-term * per-bucket)
 	PostingListsRead       int   // Number of posting list keys read
 	PostingListBytes       int64 // Total bytes read from posting lists
 	LocalIDsInPostingList  int   // Total local IDs in posting lists
@@ -924,6 +927,7 @@ func (es *RocksDBEventStore) QueryEventsWithPostingListV2MultiFilter(
 	}
 
 	buckets := GetBucketsForRange(startLedger, endLedger)
+	result.BucketsTouched = len(buckets)
 	plStart := time.Now()
 
 	// Count total posting lists to read
@@ -1297,6 +1301,7 @@ func (r *PostingListV2QueryResult) ToUnified() *UnifiedQueryResult {
 	return &UnifiedQueryResult{
 		IndexType:       "posting-v2",
 		LedgerRange:     r.LedgerRange,
+		BucketsTouched:  r.BucketsTouched,
 		IndexMatches:    r.LocalIDsAfterIntersect,
 		MatchUnitName:   "local IDs",
 		EventsScanned:   r.EventsScanned,

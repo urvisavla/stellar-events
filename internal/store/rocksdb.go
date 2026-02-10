@@ -2086,6 +2086,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 	result.MatchingLocalIDs = int(queryResult.TotalCount)
 	result.IndexBytesRead = queryResult.BytesRead
 	result.SegmentsScanned = queryResult.Segments
+	result.BucketsTouched = len(GetBucketsForRange(startLedger, endLedger))
 	result.IndexReadTime = queryResult.ReadTime
 	result.IndexDecodeTime = queryResult.DecodeTime
 	result.IndexIntersectTime = queryResult.IntersectTime
@@ -2320,6 +2321,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 	result.MatchingLocalIDs = int(queryResult.TotalCount)
 	result.IndexBytesRead = queryResult.BytesRead
 	result.SegmentsScanned = queryResult.Segments
+	result.BucketsTouched = len(GetBucketsForRange(startLedger, endLedger))
 	result.IndexReadTime = queryResult.ReadTime
 	result.IndexDecodeTime = queryResult.DecodeTime
 	result.IndexIntersectTime = queryResult.IntersectTime
