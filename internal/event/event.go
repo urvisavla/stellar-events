@@ -69,9 +69,12 @@ type IngestEvent struct {
 const (
 	binaryFormatVersion   = 0x02 // Version 2 with tx_hash and ledger_closed_at
 	binaryFormatVersionV1 = 0x01 // Legacy version 1
+	binaryFormatVersionV3 = 0x03 // Version 3 with tx_index and op_index
 
 	// Header size for v2 format
 	binaryHeaderSizeV2 = 80
+	// Header size for v3 format (v2 + tx_index:4 + op_index:2)
+	binaryHeaderSizeV3 = 86
 
 	// BinaryEventType* constants match XDR ContractEventType
 	// XDR: SYSTEM=0, CONTRACT=1, DIAGNOSTIC=2
@@ -145,6 +148,62 @@ func EncodeBinaryEvent(event *IngestEvent) []byte {
 	return buf
 }
 
+// EncodeBinaryEventV3 encodes an IngestEvent to binary format v3.
+// Same as v2 but adds TransactionIndex (4B) and OperationIndex (2B) at bytes 80-85.
+func EncodeBinaryEventV3(ev *IngestEvent) []byte {
+	headerSize := binaryHeaderSizeV3
+
+	topicsSize := 0
+	for _, topic := range ev.Topics {
+		topicsSize += 2 + len(topic)
+	}
+
+	totalSize := headerSize + topicsSize + len(ev.DataBytes)
+	buf := make([]byte, totalSize)
+
+	// Write header (same as v2 for bytes 0-79)
+	buf[0] = binaryFormatVersionV3
+	buf[1] = byte(ev.EventType)
+
+	flags := byte(0)
+	if len(ev.ContractID) > 0 {
+		flags |= flagHasContractID
+	}
+	if ev.Successful {
+		flags |= flagSuccessful
+	}
+	buf[2] = flags
+	buf[3] = byte(len(ev.Topics))
+
+	if len(ev.ContractID) >= 32 {
+		copy(buf[4:36], ev.ContractID[:32])
+	}
+
+	if len(ev.TxHash) >= 32 {
+		copy(buf[36:68], ev.TxHash[:32])
+	}
+
+	binary.BigEndian.PutUint64(buf[68:76], uint64(ev.LedgerClosedAt.Unix()))
+	binary.BigEndian.PutUint32(buf[76:80], uint32(len(ev.DataBytes)))
+
+	// V3 fields: TransactionIndex and OperationIndex
+	binary.BigEndian.PutUint32(buf[80:84], ev.TransactionIndex)
+	binary.BigEndian.PutUint16(buf[84:86], ev.OperationIndex)
+
+	// Topics
+	offset := headerSize
+	for _, topic := range ev.Topics {
+		binary.BigEndian.PutUint16(buf[offset:offset+2], uint16(len(topic)))
+		copy(buf[offset+2:], topic)
+		offset += 2 + len(topic)
+	}
+
+	// Data/value
+	copy(buf[offset:], ev.DataBytes)
+
+	return buf
+}
+
 // BinaryEventHeader contains pre-parsed header fields for fast filtering.
 type BinaryEventHeader struct {
 	Version        byte
@@ -157,6 +216,10 @@ type BinaryEventHeader struct {
 	DataLen        uint32
 	TopicsData     []byte // Slice containing all topics data
 	Data           []byte // Slice containing the pre-extracted SCVal data bytes
+
+	// V3 fields
+	TransactionIndex uint32 // From v3 header bytes 80-83
+	OperationIndex   uint16 // From v3 header bytes 84-85
 }
 
 // ParseBinaryHeader parses just the header for fast filtering.
@@ -167,6 +230,41 @@ func ParseBinaryHeader(data []byte) *BinaryEventHeader {
 	}
 
 	version := data[0]
+
+	// Handle v3 format
+	if version == binaryFormatVersionV3 {
+		if len(data) < binaryHeaderSizeV3 {
+			return nil
+		}
+
+		h := &BinaryEventHeader{
+			Version:          version,
+			Type:             data[1],
+			Flags:            data[2],
+			NumTopics:        data[3],
+			ContractID:       data[4:36],
+			TxHash:           data[36:68],
+			LedgerClosedAt:   time.Unix(int64(binary.BigEndian.Uint64(data[68:76])), 0).UTC(),
+			DataLen:          binary.BigEndian.Uint32(data[76:80]),
+			TransactionIndex: binary.BigEndian.Uint32(data[80:84]),
+			OperationIndex:   binary.BigEndian.Uint16(data[84:86]),
+		}
+
+		// Calculate topics section size
+		offset := binaryHeaderSizeV3
+		for i := 0; i < int(h.NumTopics); i++ {
+			if offset+2 > len(data) {
+				return nil // Corrupt data
+			}
+			topicLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+			offset += 2 + topicLen
+		}
+
+		h.TopicsData = data[binaryHeaderSizeV3:offset]
+		h.Data = data[offset:]
+
+		return h
+	}
 
 	// Handle v2 format
 	if version == binaryFormatVersion {
@@ -383,10 +481,18 @@ func DecodeBinaryToQueryEvent(data []byte, ledger uint32, tx, op uint32, eventId
 		return nil, fmt.Errorf("invalid binary format")
 	}
 
+	// For v3 format, use native txIndex/opIndex from header
+	txIdx := int(tx)
+	opIdx := int(op)
+	if h.Version == binaryFormatVersionV3 {
+		txIdx = int(h.TransactionIndex)
+		opIdx = int(h.OperationIndex)
+	}
+
 	event := &query.Event{
 		LedgerSequence:   ledger,
-		TransactionIndex: int(tx),
-		OperationIndex:   int(op),
+		TransactionIndex: txIdx,
+		OperationIndex:   opIdx,
 		EventIndex:       int(eventIdx),
 	}
 

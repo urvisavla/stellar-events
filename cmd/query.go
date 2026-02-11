@@ -25,6 +25,7 @@ func runQuery(cfg *config.Config, args []string) {
 	contract := fs.String("contract", "", "Contract ID (C... strkey format)")
 	topics := fs.String("topics", "", "Comma-separated topics (base64), position-independent AND logic")
 	useBitmap := fs.Bool("bitmap", false, "Use 32-bit bitmap index (ledger-level, positional topics)")
+	useSegmentFile := fs.Bool("segment-file", false, "Use segment flat file index (positional topics)")
 	topic0 := fs.String("topic0", "", "Topic0 (base64) - positional filter at position 0")
 	topic1 := fs.String("topic1", "", "Topic1 (base64) - positional filter at position 1")
 	topic2 := fs.String("topic2", "", "Topic2 (base64) - positional filter at position 2")
@@ -41,6 +42,7 @@ func runQuery(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "  [end]             End ledger (default: start + %d from config)\n\n", cfg.Query.MaxLedgerRange)
 		fmt.Fprintf(os.Stderr, "Index options (default: V2 posting list):\n")
 		fmt.Fprintf(os.Stderr, "  --bitmap          Use 32-bit bitmap (ledger-level, positional topics)\n")
+		fmt.Fprintf(os.Stderr, "  --segment-file    Use segment flat file index (positional topics)\n")
 		fmt.Fprintf(os.Stderr, "\nFilter options:\n")
 		fmt.Fprintf(os.Stderr, "  --contract <id>   Filter by contract ID (C... strkey format)\n")
 		fmt.Fprintf(os.Stderr, "  --topics <list>   Comma-separated topics (base64), position-independent AND\n")
@@ -126,10 +128,13 @@ func runQuery(cfg *config.Config, args []string) {
 		queryLimit = cfg.Query.DefaultLimit
 	}
 
-	// Determine index type: posting-v2 (default) or bitmap32
+	// Determine index type: posting-v2 (default), bitmap32, or segment-file
 	indexType := "posting-v2"
 	if *useBitmap {
 		indexType = "bitmap32"
+	}
+	if *useSegmentFile {
+		indexType = "segment-file"
 	}
 
 	cmdQuery(cfg, uint32(startLedger), uint32(endLedger), *contract, *topics, *topic0, *topic1, *topic2, *topic3, queryLimit, indexType, *compareDB, *compareFormat)
@@ -214,6 +219,8 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 			runPostingV2PositionalQuery(eventStore, filter, startLedger, endLedger, limit)
 		case "bitmap32":
 			runBitmap32PositionalQuery(eventStore, filter, startLedger, endLedger, limit)
+		case "segment-file":
+			runSegmentFilePositionalQuery(eventStore, filter, startLedger, endLedger, limit)
 		}
 		return
 	}
@@ -224,6 +231,8 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 		runPostingV2Query(eventStore, contractID, topicsCSV, startLedger, endLedger, limit)
 	case "bitmap32":
 		runBitmap32NonPositionalQuery(eventStore, contractID, topicsCSV, startLedger, endLedger, limit)
+	case "segment-file":
+		runSegmentFileNonPositionalQuery(eventStore, contractID, topicsCSV, startLedger, endLedger, limit)
 	}
 }
 
@@ -396,6 +405,93 @@ func runBitmap32NonPositionalQuery(eventStore *store.RocksDBEventStore, contract
 	fmt.Println(string(output))
 }
 
+// runSegmentFilePositionalQuery runs a query using segment flat file indexes with positional topic filters.
+func runSegmentFilePositionalQuery(eventStore *store.RocksDBEventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) {
+	fmt.Fprintf(os.Stderr, "Querying with segment file index in ledgers %d-%d...\n", startLedger, endLedger)
+
+	topicGroups := filter.TopicGroups()
+	stats, events, err := eventStore.QueryEventsWithSegmentFile(filter.ContractID, topicGroups, startLedger, endLedger, limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	printUnifiedResult(store.SegmentFileToUnified(stats))
+
+	if events == nil {
+		fmt.Println("[]")
+		return
+	}
+
+	output, err := json.MarshalIndent(events, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to marshal events: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(output))
+}
+
+// runSegmentFileNonPositionalQuery runs a query using segment flat file indexes with non-positional topics
+func runSegmentFileNonPositionalQuery(eventStore *store.RocksDBEventStore, contractID, topicsCSV string, startLedger, endLedger uint32, limit int) {
+	fmt.Fprintf(os.Stderr, "Querying with segment file index in ledgers %d-%d...\n", startLedger, endLedger)
+
+	var contractBytes []byte
+	if contractID != "" {
+		var err error
+		contractBytes, err = decodeContractID(contractID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid contract ID (expected C... format): %v\n", err)
+			os.Exit(2)
+		}
+	}
+
+	var topicGroups [4][][]byte
+	hasTopics := false
+	if topicsCSV != "" {
+		for i, t := range strings.Split(topicsCSV, ",") {
+			if i >= 4 {
+				break
+			}
+			t = strings.TrimSpace(t)
+			if t == "" {
+				continue
+			}
+			topicBytes, err := decodeBase64(t)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: invalid topic (expected base64): %v\n", err)
+				os.Exit(2)
+			}
+			topicGroups[i] = [][]byte{topicBytes}
+			hasTopics = true
+		}
+	}
+
+	if len(contractBytes) == 0 && !hasTopics {
+		fmt.Fprintf(os.Stderr, "Error: at least one filter (--contract or --topics) must be specified\n")
+		os.Exit(2)
+	}
+
+	stats, events, err := eventStore.QueryEventsWithSegmentFile(contractBytes, topicGroups, startLedger, endLedger, limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	printUnifiedResult(store.SegmentFileToUnified(stats))
+
+	if events == nil {
+		fmt.Println("[]")
+		return
+	}
+
+	output, err := json.MarshalIndent(events, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to marshal events: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(output))
+}
+
 // runPostingV2Query runs a query using V2 posting list indexes
 func runPostingV2Query(eventStore *store.RocksDBEventStore, contractID, topicsCSV string, startLedger, endLedger uint32, limit int) {
 	fmt.Fprintf(os.Stderr, "Querying with V2 posting list index in ledgers %d-%d...\n", startLedger, endLedger)
@@ -464,6 +560,8 @@ func printUnifiedResult(r *store.UnifiedQueryResult) {
 		header = "V2 Posting List"
 	case "bitmap32":
 		header = "32-bit Bitmap"
+	case "segment-file":
+		header = "Segment File"
 	default:
 		header = r.IndexType
 	}

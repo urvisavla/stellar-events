@@ -71,6 +71,12 @@ type StorageConfig struct {
 	DisableAutoCompaction  bool `toml:"disable_auto_compaction"`     // Disable background compaction during ingestion
 	TargetFileSizeMB       int  `toml:"target_file_size_mb"`         // Target SST file size (default: 256)
 	MaxBytesForLevelBaseMB int  `toml:"max_bytes_for_level_base_mb"` // Max bytes for L1 (default: 1024)
+
+	// Flat file segment indexes
+	SegmentFilePath    string `toml:"segment_file_path"`    // Base directory for segment flat files (empty = disabled)
+	EnableSegmentFiles bool   `toml:"enable_segment_files"` // Enable writing flat file indexes at segment boundaries
+	EnableEventVolume      bool   `toml:"enable_event_volume"`       // Write event data to flat files alongside indexes
+	CompressEventVolume    bool   `toml:"compress_event_volume"`     // Zstd compress per-event blobs in event volume files
 }
 
 // =============================================================================

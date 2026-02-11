@@ -33,6 +33,16 @@ func openEventStore(cfg *config.Config) (*store.RocksDBEventStore, error) {
 		es.SetEventFormat(cfg.Storage.EventFormat)
 	}
 
+	// Set segment file path if configured
+	if cfg.Storage.SegmentFilePath != "" {
+		es.SetSegmentFilePath(cfg.Storage.SegmentFilePath)
+	}
+
+	// Enable event volume if configured
+	if cfg.Storage.EnableEventVolume {
+		es.EnableEventVolume(cfg.Storage.CompressEventVolume)
+	}
+
 	return es, nil
 }
 

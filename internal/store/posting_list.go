@@ -15,9 +15,9 @@ import (
 	"github.com/urvisavla/stellar-events/internal/query"
 )
 
-// Index Key Format (36 bytes):
-//   [term_key:32][bucket_id:4]
-//   - term_key: SHA-256 hash of the indexed value (contract_id or topic_xdr)
+// Index Key Format (20 bytes):
+//   [term_key:16][bucket_id:4]
+//   - term_key: truncated SHA-256 hash (first 16 bytes) of the indexed value
 //   - bucket_id: ledger_seq / BucketSize (groups ~14 hours of ledgers)
 //
 // Used by both posting list and bitmap indexes.
@@ -27,39 +27,48 @@ import (
 // Bitmap value: serialized roaring bitmap of local IDs (32-bit)
 
 const (
-	// IndexKeySize is the size of an index key in bytes.
-	IndexKeySize = 36
+	// TermKeySize is the size of a truncated term hash in bytes (128-bit).
+	TermKeySize = 16
+
+	// IndexKeySize is the size of an index key in bytes (16 hash + 4 bucket ID).
+	IndexKeySize = 20
 )
 
-// EncodeIndexKey creates a 36-byte index key from term key and ledger sequence.
-func EncodeIndexKey(termKey [32]byte, ledgerSeq uint32) []byte {
+// EncodeIndexKey creates a 20-byte index key from term key and ledger sequence.
+func EncodeIndexKey(termKey [16]byte, ledgerSeq uint32) []byte {
 	bucketID := BucketID(ledgerSeq)
 	key := make([]byte, IndexKeySize)
-	copy(key[0:32], termKey[:])
-	binary.BigEndian.PutUint32(key[32:36], bucketID)
+	copy(key[0:16], termKey[:])
+	binary.BigEndian.PutUint32(key[16:20], bucketID)
 	return key
 }
 
-// EncodeIndexKeyWithBucket creates a 36-byte index key from term key and bucket ID directly.
-func EncodeIndexKeyWithBucket(termKey [32]byte, bucketID uint32) []byte {
+// EncodeIndexKeyWithBucket creates a 20-byte index key from term key and bucket ID directly.
+func EncodeIndexKeyWithBucket(termKey [16]byte, bucketID uint32) []byte {
 	key := make([]byte, IndexKeySize)
-	copy(key[0:32], termKey[:])
-	binary.BigEndian.PutUint32(key[32:36], bucketID)
+	copy(key[0:16], termKey[:])
+	binary.BigEndian.PutUint32(key[16:20], bucketID)
 	return key
 }
 
-// ContractTermKey computes the term key (SHA-256) for a contract ID.
-func ContractTermKey(contractID []byte) [32]byte {
-	return sha256.Sum256(contractID)
+// ContractTermKey computes the truncated term key (first 16 bytes of SHA-256) for a contract ID.
+func ContractTermKey(contractID []byte) [16]byte {
+	full := sha256.Sum256(contractID)
+	var key [16]byte
+	copy(key[:], full[:16])
+	return key
 }
 
-// TopicTermKey computes the term key (SHA-256) for a topic XDR value at a given position.
+// TopicTermKey computes the truncated term key (first 16 bytes of SHA-256) for a topic XDR value at a given position.
 // The position byte is prepended before hashing to produce distinct keys per topic position.
-func TopicTermKey(pos int, topicXDR []byte) [32]byte {
+func TopicTermKey(pos int, topicXDR []byte) [16]byte {
 	buf := make([]byte, 1+len(topicXDR))
 	buf[0] = byte(pos)
 	copy(buf[1:], topicXDR)
-	return sha256.Sum256(buf)
+	full := sha256.Sum256(buf)
+	var key [16]byte
+	copy(key[:], full[:16])
+	return key
 }
 
 // =============================================================================
@@ -519,7 +528,7 @@ func (es *RocksDBEventStore) queryPostingListV2Streaming(contractID []byte, topi
 
 	// Determine which CF and term key to use
 	var cf *grocksdb.ColumnFamilyHandle
-	var termKey [32]byte
+	var termKey [16]byte
 
 	if len(contractID) > 0 {
 		cf = es.cfContractsPLV2
@@ -819,7 +828,7 @@ func (es *RocksDBEventStore) fetchEventsByLocalIDsV2ForBucket(localIDs []uint32,
 
 // queryPostingListV2WithStats reads V2 posting lists (32-bit dense local IDs) and returns stats.
 // Returns both a flat list (for stats) and per-bucket map (for correct per-bucket intersection with dense IDs).
-func (es *RocksDBEventStore) queryPostingListV2WithStats(cf *grocksdb.ColumnFamilyHandle, termKey [32]byte, buckets []uint32, startLedger, endLedger uint32) ([]uint32, map[uint32][]uint32, int, int64, time.Duration, time.Duration, time.Duration, error) {
+func (es *RocksDBEventStore) queryPostingListV2WithStats(cf *grocksdb.ColumnFamilyHandle, termKey [16]byte, buckets []uint32, startLedger, endLedger uint32) ([]uint32, map[uint32][]uint32, int, int64, time.Duration, time.Duration, time.Duration, error) {
 	var allLocalIDs []uint32
 	perBucket := make(map[uint32][]uint32)
 	var bytesRead int64

@@ -23,17 +23,17 @@ type eventSegment struct {
 // bitmap32Loader provides segment loading capability for bitmap32 queries.
 type bitmap32Loader interface {
 	// LoadBitmap32Segment loads a 32-bit roaring bitmap segment from storage.
-	LoadBitmap32Segment(isContract bool, termKey [32]byte, segmentID uint32) (*roaring.Bitmap, error)
+	LoadBitmap32Segment(isContract bool, termKey [16]byte, segmentID uint32) (*roaring.Bitmap, error)
 	// LoadBitmap32SegmentWithTiming loads a segment and returns bytes read, read time, and decode time.
-	LoadBitmap32SegmentWithTiming(isContract bool, termKey [32]byte, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, error)
+	LoadBitmap32SegmentWithTiming(isContract bool, termKey [16]byte, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, error)
 }
 
-// makeIndexKey creates a 36-byte index key from a SHA-256 term key and bucket ID.
-// Format: [term_key:32][bucket_id:4]
-func makeIndexKey(termKey [32]byte, bucketID uint32) [IndexKeySize]byte {
+// makeIndexKey creates a 20-byte index key from a truncated term key and bucket ID.
+// Format: [term_key:16][bucket_id:4]
+func makeIndexKey(termKey [16]byte, bucketID uint32) [IndexKeySize]byte {
 	var key [IndexKeySize]byte
-	copy(key[0:32], termKey[:])
-	binary.BigEndian.PutUint32(key[32:36], bucketID)
+	copy(key[0:16], termKey[:])
+	binary.BigEndian.PutUint32(key[16:20], bucketID)
 	return key
 }
 
@@ -61,16 +61,22 @@ type eventBitmap32Index struct {
 
 	// Ledger map loader for queries (range trimming)
 	ledgerMapLoader ledgerMapLoader
+
+	// topicTermPositions tracks which topic position (0-3) each term hash belongs to.
+	// Populated during AddTopicEvent, used by WriteBucketDir to partition topics
+	// into per-position flat files (topic0.idx, topic1.idx, etc.).
+	topicTermPositions map[[16]byte]byte
 }
 
 // newEventBitmap32Index creates a new event-level bitmap32 index.
 func newEventBitmap32Index(loader bitmap32Loader, lmLoader ledgerMapLoader) *eventBitmap32Index {
 	return &eventBitmap32Index{
-		contractSegments: make(map[[IndexKeySize]byte]*roaring.Bitmap),
-		topicSegments:    make(map[[IndexKeySize]byte]*roaring.Bitmap),
-		loader:           loader,
-		bucketCounters:   make(map[uint32]*bucketEventCounter),
-		ledgerMapLoader:  lmLoader,
+		contractSegments:   make(map[[IndexKeySize]byte]*roaring.Bitmap),
+		topicSegments:      make(map[[IndexKeySize]byte]*roaring.Bitmap),
+		loader:             loader,
+		bucketCounters:     make(map[uint32]*bucketEventCounter),
+		ledgerMapLoader:    lmLoader,
+		topicTermPositions: make(map[[16]byte]byte),
 	}
 }
 
@@ -128,6 +134,9 @@ func (bi *eventBitmap32Index) AddTopicEvent(pos int, topicValue []byte, bucketID
 
 	bitmap.Add(denseLocalID)
 
+	// Track term hash → position for flat file partitioning
+	bi.topicTermPositions[termKey] = byte(pos)
+
 	if bucketID > bi.currentBucketID {
 		bi.currentBucketID = bucketID
 	}
@@ -136,7 +145,7 @@ func (bi *eventBitmap32Index) AddTopicEvent(pos int, topicValue []byte, bucketID
 // QueryIndexWithStats returns per-segment bitmaps of local IDs matching a key within a ledger range.
 // Returns map[segmentID]*roaring.Bitmap so caller knows which segment each local ID belongs to.
 // Uses BucketLedgerMap for range trimming with dense sequential IDs.
-func (bi *eventBitmap32Index) QueryIndexWithStats(isContract bool, termKey [32]byte, startLedger, endLedger uint32) (map[uint32]*roaring.Bitmap, int64, int, time.Duration, time.Duration, error) {
+func (bi *eventBitmap32Index) QueryIndexWithStats(isContract bool, termKey [16]byte, startLedger, endLedger uint32) (map[uint32]*roaring.Bitmap, int64, int, time.Duration, time.Duration, error) {
 	result := make(map[uint32]*roaring.Bitmap)
 	var bytesRead int64
 	var segmentsRead int
@@ -216,7 +225,7 @@ func (bi *eventBitmap32Index) QueryIndexWithStats(isContract bool, termKey [32]b
 }
 
 // getSegmentWithStats retrieves a segment and tracks bytes read.
-func (bi *eventBitmap32Index) getSegmentWithStats(isContract bool, termKey [32]byte, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
+func (bi *eventBitmap32Index) getSegmentWithStats(isContract bool, termKey [16]byte, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
 	key := makeIndexKey(termKey, segmentID)
 
 	// Check hot cache first - no disk read
@@ -295,6 +304,17 @@ func (bi *eventBitmap32Index) ClearAll() {
 	bi.contractSegments = make(map[[IndexKeySize]byte]*roaring.Bitmap)
 	bi.topicSegments = make(map[[IndexKeySize]byte]*roaring.Bitmap)
 	bi.bucketCounters = make(map[uint32]*bucketEventCounter)
+	bi.topicTermPositions = make(map[[16]byte]byte)
+}
+
+// GetTopicTermPositions returns the topic term position map.
+func (bi *eventBitmap32Index) GetTopicTermPositions() map[[16]byte]byte {
+	return bi.topicTermPositions
+}
+
+// ClearTopicTermPositions clears the topic term position map (after bucket file write).
+func (bi *eventBitmap32Index) ClearTopicTermPositions() {
+	bi.topicTermPositions = make(map[[16]byte]byte)
 }
 
 // GetHotSegmentStats returns statistics about hot segments.
@@ -399,13 +419,13 @@ func (s *BitmapEventSeqStore) Close() error {
 // =============================================================================
 
 // LoadBitmap32Segment implements bitmap32Loader interface.
-func (s *BitmapEventSeqStore) LoadBitmap32Segment(isContract bool, termKey [32]byte, segmentID uint32) (*roaring.Bitmap, error) {
+func (s *BitmapEventSeqStore) LoadBitmap32Segment(isContract bool, termKey [16]byte, segmentID uint32) (*roaring.Bitmap, error) {
 	bitmap, _, _, _, err := s.LoadBitmap32SegmentWithTiming(isContract, termKey, segmentID)
 	return bitmap, err
 }
 
 // LoadBitmap32SegmentWithTiming loads a segment using FromBuffer for near-zero-cost decode.
-func (s *BitmapEventSeqStore) LoadBitmap32SegmentWithTiming(isContract bool, termKey [32]byte, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
+func (s *BitmapEventSeqStore) LoadBitmap32SegmentWithTiming(isContract bool, termKey [16]byte, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
 	dbKey := EncodeIndexKeyWithBucket(termKey, segmentID)
 	cf := s.getCF(isContract)
 

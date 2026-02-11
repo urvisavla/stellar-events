@@ -28,6 +28,12 @@ type PipelineConfig struct {
 
 	// ExcludeDiagnostic skips diagnostic events during ingestion.
 	ExcludeDiagnostic bool
+
+	// EnableSegmentFiles enables writing flat file indexes at segment boundaries.
+	EnableSegmentFiles bool
+
+	// EnableEventVolume enables writing event data to flat files alongside indexes.
+	EnableEventVolume bool
 }
 
 // PipelineStats tracks pipeline performance
@@ -306,6 +312,50 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 				}
 			}
 
+			// Check for bucket boundary crossing — write flat files for completed bucket
+			if p.config.EnableSegmentFiles && p.config.MaintainV2Idx {
+				prevLedger := nextSeq - 1 // the ledger we just processed
+				prevBucket := store.BucketID(prevLedger)
+				_, bucketEnd := store.BucketRange(prevBucket)
+
+				// Bucket is complete when the last processed ledger equals the bucket's last ledger
+				if prevLedger >= bucketEnd {
+					// Force-write any pending event batch so StoreEvents populates
+					// the in-memory bitmaps for all ledgers up to the boundary.
+					if len(eventBatch) > 0 {
+						writeStart := time.Now()
+						_, err := p.store.StoreEvents(eventBatch, &store.StoreOptions{
+							UniqueIndexes:     p.config.MaintainUniqueIdx,
+							V2Indexes:         p.config.MaintainV2Idx,
+							ExcludeTopic0:     p.config.ExcludeTopic0,
+							ExcludeDiagnostic: p.config.ExcludeDiagnostic,
+						})
+						atomic.AddInt64(&p.stats.WriteTimeNs, time.Since(writeStart).Nanoseconds())
+						if err != nil {
+							return fmt.Errorf("failed to store events at bucket boundary %d: %w", prevBucket, err)
+						}
+						if err := p.store.SetLastProcessedLedger(nextSeq - 1); err != nil {
+							return fmt.Errorf("failed to update last processed ledger: %w", err)
+						}
+						eventBatch = eventBatch[:0]
+						batchRawBytes = 0
+						batchStartSeq = nextSeq
+					}
+
+					// Flush in-memory bitmaps to RocksDB so WriteBucketDir can scan them
+					if err := p.store.FlushBitmapIndexes(); err != nil {
+						return fmt.Errorf("failed to flush bitmap indexes before bucket file write: %w", err)
+					}
+					if _, _, err := p.store.FlushPostingListV2Indexes(); err != nil {
+						return fmt.Errorf("failed to flush V2 posting list indexes before bucket file write: %w", err)
+					}
+
+					if err := p.store.WriteBucketDir(prevBucket); err != nil {
+						return fmt.Errorf("failed to write bucket dir %d: %w", prevBucket, err)
+					}
+				}
+			}
+
 			// Progress callback every 1000 ledgers
 			if p.onProgress != nil && ledgersProcessed%1000 == 0 {
 				p.onProgress(nextSeq-1, ledgersProcessed, totalEvents, aggStats)
@@ -324,6 +374,13 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 	if p.config.MaintainV2Idx {
 		if _, _, err := p.store.FlushPostingListV2Indexes(); err != nil {
 			return fmt.Errorf("failed to flush V2 posting list indexes: %w", err)
+		}
+	}
+
+	// Finalize any active event volume chunk
+	if p.config.EnableEventVolume {
+		if err := p.store.FinalizeEventVolume(); err != nil {
+			return fmt.Errorf("failed to finalize event volume: %w", err)
 		}
 	}
 

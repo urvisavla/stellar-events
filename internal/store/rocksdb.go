@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -264,6 +265,13 @@ type RocksDBEventStore struct {
 	// V2 posting list accumulation (32-bit local IDs)
 	contractPostingsV2 map[string][]byte // index key -> accumulated 4-byte local IDs
 	topicPostingsV2    map[string][]byte // index key -> accumulated 4-byte local IDs
+
+	// Flat file segment directory path (empty = disabled)
+	segmentFilePath   string
+	segmentFileReader *SegmentFileReader // lazily initialized, reused across queries
+
+	// Event volume writer for flat file event storage (nil = disabled)
+	eventVolumeWriter *EventVolumeWriter
 }
 
 // NewEventStoreWithOptions creates a new event store with custom options
@@ -491,6 +499,25 @@ func (es *RocksDBEventStore) StoreEvents(events []*event.IngestEvent, opts *Stor
 			// Index topics -> dense local ID (bitmap32, positional)
 			for pos, topicBytes := range ev.Topics {
 				eventBitmap32Idx.AddTopicEvent(pos, topicBytes, bucketID, denseLocalID)
+			}
+
+			// Write to event volume if enabled
+			if es.eventVolumeWriter != nil {
+				if !es.eventVolumeWriter.IsActive() || bucketID != es.eventVolumeWriter.ChunkID() {
+					// Finalize previous chunk if active
+					if es.eventVolumeWriter.IsActive() {
+						if err := es.eventVolumeWriter.FinalizeChunk(); err != nil {
+							return 0, fmt.Errorf("failed to finalize event volume chunk: %w", err)
+						}
+					}
+					if err := es.eventVolumeWriter.StartChunk(bucketID); err != nil {
+						return 0, fmt.Errorf("failed to start event volume chunk %d: %w", bucketID, err)
+					}
+				}
+				v3Data := event.EncodeBinaryEventV3(ev)
+				if err := es.eventVolumeWriter.AppendEvent(denseLocalID, v3Data); err != nil {
+					return 0, fmt.Errorf("failed to append event to volume: %w", err)
+				}
 			}
 		}
 
@@ -1104,6 +1131,147 @@ func (es *RocksDBEventStore) SetEventFormat(format string) {
 // GetEventFormat returns the current event storage format.
 func (es *RocksDBEventStore) GetEventFormat() string {
 	return es.eventFormat
+}
+
+// SetSegmentFilePath sets the base directory for segment flat files.
+func (es *RocksDBEventStore) SetSegmentFilePath(path string) {
+	es.segmentFilePath = path
+}
+
+// EnableEventVolume initializes the event volume writer for flat file event storage.
+// Uses the same base path as segment files.
+// If compressEvents is true, each event blob is zstd-compressed in events.dat.
+func (es *RocksDBEventStore) EnableEventVolume(compressEvents bool) {
+	if es.segmentFilePath != "" {
+		es.eventVolumeWriter = NewEventVolumeWriter(es.segmentFilePath, compressEvents)
+		if compressEvents {
+			fmt.Fprintf(os.Stderr, "Event volume writer enabled with zstd compression (base: %s)\n", es.segmentFilePath)
+		} else {
+			fmt.Fprintf(os.Stderr, "Event volume writer enabled (base: %s)\n", es.segmentFilePath)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Warning: EnableEventVolume called but segment_file_path not set\n")
+	}
+}
+
+// FinalizeEventVolume finalizes any active event volume chunk.
+// Called at the end of ingestion to flush the last incomplete chunk.
+func (es *RocksDBEventStore) FinalizeEventVolume() error {
+	if es.eventVolumeWriter != nil && es.eventVolumeWriter.IsActive() {
+		return es.eventVolumeWriter.FinalizeChunk()
+	}
+	return nil
+}
+
+// WriteBucketDir writes flat file indexes (.idx + .pack pairs) for a completed bucket.
+// Scans the bitmap32 CFs to collect term data, partitions topics by position,
+// and writes the files atomically using tmp + rename.
+func (es *RocksDBEventStore) WriteBucketDir(bucketID uint32) error {
+	if es.segmentFilePath == "" {
+		return fmt.Errorf("segment file path not configured")
+	}
+
+	// Collect contract terms from cfContractsBM32
+	contractTerms, err := es.collectBitmapTerms(es.cfContractsBM32, bucketID)
+	if err != nil {
+		return fmt.Errorf("failed to collect contract terms: %w", err)
+	}
+
+	// Collect topic terms from cfTopicsBM32
+	topicTerms, err := es.collectBitmapTerms(es.cfTopicsBM32, bucketID)
+	if err != nil {
+		return fmt.Errorf("failed to collect topic terms: %w", err)
+	}
+
+	// Partition topic terms by position using the position map
+	topicsByPos := [4][]BucketTermData{}
+	var combinedTopics []BucketTermData
+
+	posMap := es.eventIndex32Store.getEventBitmap32Index().GetTopicTermPositions()
+	if len(posMap) > 0 {
+		for _, t := range topicTerms {
+			var termHash [16]byte
+			copy(termHash[:], t.TermHash[:])
+			if pos, ok := posMap[termHash]; ok && pos < 4 {
+				topicsByPos[pos] = append(topicsByPos[pos], t)
+			} else {
+				// Unknown position — put in combined fallback
+				combinedTopics = append(combinedTopics, t)
+			}
+		}
+	} else {
+		// No position map (restart fallback) — all topics go to combined
+		combinedTopics = topicTerms
+	}
+
+	// Load ledger map
+	lm, err := es.LoadBucketLedgerMap(bucketID)
+	if err != nil {
+		return fmt.Errorf("failed to load ledger map for bucket %d: %w", bucketID, err)
+	}
+
+	// Write the bucket directory
+	if err := WriteBucketDir(es.segmentFilePath, bucketID, contractTerms, topicsByPos, combinedTopics, lm); err != nil {
+		return err
+	}
+
+	// Finalize event volume chunk if it matches this bucket
+	if es.eventVolumeWriter != nil && es.eventVolumeWriter.IsActive() && es.eventVolumeWriter.ChunkID() == bucketID {
+		if err := es.eventVolumeWriter.FinalizeChunk(); err != nil {
+			return fmt.Errorf("failed to finalize event volume chunk %d: %w", bucketID, err)
+		}
+	}
+
+	return nil
+}
+
+// collectBitmapTerms scans a bitmap32 CF for all entries matching a specific bucket ID.
+// Returns a slice of (termHash, bitmapData) pairs.
+func (es *RocksDBEventStore) collectBitmapTerms(cf *grocksdb.ColumnFamilyHandle, bucketID uint32) ([]BucketTermData, error) {
+	// Create prefix to scan: we need to iterate all keys that end with this bucket ID.
+	// Since keys are [termHash:16][bucketID:4], we must scan the entire CF and filter.
+	// For efficiency, we use an iterator and check the bucket ID suffix.
+
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+
+	iter := es.db.NewIteratorCF(ro, cf)
+	defer iter.Close()
+
+	var results []BucketTermData
+
+	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+		key := iter.Key().Data()
+		if len(key) != IndexKeySize {
+			continue
+		}
+
+		// Extract bucket ID from key suffix
+		keyBucketID := binary.BigEndian.Uint32(key[16:20])
+		if keyBucketID != bucketID {
+			continue
+		}
+
+		// Extract term hash
+		var termHash [16]byte
+		copy(termHash[:], key[0:16])
+
+		// Copy bitmap data
+		valData := iter.Value().Data()
+		dataCopy := make([]byte, len(valData))
+		copy(dataCopy, valData)
+
+		results = append(results, BucketTermData{
+			TermHash:   termHash,
+			BitmapData: dataCopy,
+		})
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("iterator error: %w", err)
+	}
+
+	return results, nil
 }
 
 // Close closes the event store
@@ -2533,4 +2701,53 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 	result.TotalTime = time.Since(totalStart)
 
 	return result, events, nil
+}
+
+// GetSegmentFileReader returns a SegmentFileReader for querying flat file indexes.
+// The reader is created once and reused across queries so file caches persist.
+// Returns nil if segment file path is not configured.
+func (es *RocksDBEventStore) GetSegmentFileReader() *SegmentFileReader {
+	if es.segmentFilePath == "" {
+		return nil
+	}
+	if es.segmentFileReader == nil {
+		es.segmentFileReader = NewSegmentFileReader(es.segmentFilePath, es)
+	}
+	return es.segmentFileReader
+}
+
+// QueryEventsWithSegmentFile queries events using flat file segment indexes (single-value per filter).
+func (es *RocksDBEventStore) QueryEventsWithSegmentFile(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+	reader := es.GetSegmentFileReader()
+	if reader == nil {
+		return nil, nil, fmt.Errorf("segment file path not configured")
+	}
+	return reader.QueryEvents(contractID, topicGroups, startLedger, endLedger, limit)
+}
+
+// QueryEventsWithSegmentFileMultiFilter queries events using flat file segment indexes with multi-value OR/AND filters.
+func (es *RocksDBEventStore) QueryEventsWithSegmentFileMultiFilter(contractIDs [][]byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+	reader := es.GetSegmentFileReader()
+	if reader == nil {
+		return nil, nil, fmt.Errorf("segment file path not configured")
+	}
+	return reader.QueryEventsMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
+}
+
+// QueryEventsWithSegmentVolume queries events using flat file indexes + flat file event volume (no RocksDB event fetches).
+func (es *RocksDBEventStore) QueryEventsWithSegmentVolume(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+	reader := es.GetSegmentFileReader()
+	if reader == nil {
+		return nil, nil, fmt.Errorf("segment file path not configured")
+	}
+	return reader.QueryEventsFromVolume(contractID, topicGroups, startLedger, endLedger, limit)
+}
+
+// QueryEventsWithSegmentVolumeMultiFilter queries events from volume with multi-value OR/AND filters.
+func (es *RocksDBEventStore) QueryEventsWithSegmentVolumeMultiFilter(contractIDs [][]byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+	reader := es.GetSegmentFileReader()
+	if reader == nil {
+		return nil, nil, fmt.Errorf("segment file path not configured")
+	}
+	return reader.QueryEventsFromVolumeMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
 }

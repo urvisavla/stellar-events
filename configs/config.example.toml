@@ -64,6 +64,19 @@ target_file_size_mb = 256
 # Max bytes for level 1 in MB
 max_bytes_for_level_base_mb = 1024
 
+# --- Flat File Segment Indexes ---
+# Base directory for segment flat files (empty = disabled)
+# segment_file_path = "./data/segments"
+
+# Enable writing flat file indexes at segment boundaries
+# enable_segment_files = false
+
+# Write event data to flat files alongside indexes
+# enable_event_volume = false
+
+# Zstd compress per-event blobs in event volume files (experimental)
+# compress_event_volume = false
+
 # =============================================================================
 # Ingestion
 # =============================================================================

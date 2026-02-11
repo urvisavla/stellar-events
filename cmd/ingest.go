@@ -132,6 +132,8 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		IndexFlushInterval: cfg.Ingestion.IndexFlushInterval,
 		ExcludeTopic0:      excludeTopic0,
 		ExcludeDiagnostic:  cfg.Ingestion.ExcludeDiagnostic,
+		EnableSegmentFiles: cfg.Storage.EnableSegmentFiles,
+		EnableEventVolume:  cfg.Storage.EnableEventVolume,
 	}
 
 	pipeline := ingest.NewPipeline(pipelineConfig, eventStore)

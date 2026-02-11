@@ -114,7 +114,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 	fs.SetOutput(os.Stderr)
 
 	dataFile := fs.String("data", "", "Benchmark data file (JSON)")
-	indexTypes := fs.String("index", "all", "Index types to benchmark: posting-v2,bitmap32,all")
+	indexTypes := fs.String("index", "all", "Index types to benchmark: posting-v2,bitmap32,segment-file,segment-volume,all")
 	iterations := fs.Int("iterations", 5, "Number of iterations per query")
 	warmup := fs.Int("warmup", 1, "Warmup iterations (not counted)")
 	outputFormat := fs.String("format", "table", "Output format: table, csv, json")
@@ -181,13 +181,13 @@ func runBenchmark(cfg *config.Config, args []string) {
 	// Parse index types
 	var indexes []string
 	if *indexTypes == "all" {
-		indexes = []string{"posting-v2", "bitmap32"}
+		indexes = []string{"bitmap32", "segment-file", "segment-volume"}
 	} else {
 		indexes = strings.Split(*indexTypes, ",")
 	}
 
 	// Validate index types
-	validIndexes := map[string]bool{"posting-v2": true, "bitmap32": true}
+	validIndexes := map[string]bool{"posting-v2": true, "bitmap32": true, "segment-file": true, "segment-volume": true}
 	for _, idx := range indexes {
 		if !validIndexes[idx] {
 			fmt.Fprintf(os.Stderr, "Error: invalid index type: %s\n", idx)
@@ -998,6 +998,10 @@ func executeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, end
 			return executePostingV2QueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
 		case "bitmap32":
 			return executeBitmap32QueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
+		case "segment-file":
+			return executeSegmentFileQueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
+		case "segment-volume":
+			return executeSegmentVolumeQueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
 		}
 		return nil
 	}
@@ -1008,6 +1012,10 @@ func executeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, end
 		return executePostingV2MultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
 	case "bitmap32":
 		return executeBitmap32MultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
+	case "segment-file":
+		return executeSegmentFileMultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
+	case "segment-volume":
+		return executeSegmentVolumeMultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
 	}
 	return nil
 }
@@ -1088,6 +1096,102 @@ func executePostingV2MultiFilterBenchmark(eventStore *store.RocksDBEventStore, s
 
 func executeBitmap32MultiFilterBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
 	stats, events, err := eventStore.QueryEventsWithBitmap32MultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
+	if err != nil {
+		return &QueryResult{Error: err}
+	}
+
+	return &QueryResult{
+		EventsReturned:     len(events),
+		EventsScanned:      stats.EventsScanned,
+		BucketsTouched:     stats.BucketsTouched,
+		IndexBytes:         stats.IndexBytesRead,
+		EventBytes:         stats.EventBytesRead,
+		IndexMatches:       stats.MatchingLocalIDs,
+		IndexTime:          stats.IndexLookupTime,
+		IndexReadTime:      stats.IndexReadTime,
+		IndexDecodeTime:    stats.IndexDecodeTime,
+		IndexIntersectTime: stats.IndexIntersectTime,
+		EventTime:          stats.EventFetchTime,
+		EventFetchTime:     stats.EventFetchTime,
+		EventDecodeTime:    stats.DecodeTime,
+		EventFilterTime:    stats.FilterTime,
+	}
+}
+
+func executeSegmentFileQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEventsWithSegmentFile(contractID, topicGroups, startLedger, endLedger, limit)
+	if err != nil {
+		return &QueryResult{Error: err}
+	}
+
+	return &QueryResult{
+		EventsReturned:     len(events),
+		EventsScanned:      stats.EventsScanned,
+		BucketsTouched:     stats.BucketsTouched,
+		IndexBytes:         stats.IndexBytesRead,
+		EventBytes:         stats.EventBytesRead,
+		IndexMatches:       stats.MatchingLocalIDs,
+		IndexTime:          stats.IndexLookupTime,
+		IndexReadTime:      stats.IndexReadTime,
+		IndexDecodeTime:    stats.IndexDecodeTime,
+		IndexIntersectTime: stats.IndexIntersectTime,
+		EventTime:          stats.EventFetchTime,
+		EventFetchTime:     stats.EventFetchTime,
+		EventDecodeTime:    stats.DecodeTime,
+		EventFilterTime:    stats.FilterTime,
+	}
+}
+
+func executeSegmentFileMultiFilterBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEventsWithSegmentFileMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
+	if err != nil {
+		return &QueryResult{Error: err}
+	}
+
+	return &QueryResult{
+		EventsReturned:     len(events),
+		EventsScanned:      stats.EventsScanned,
+		BucketsTouched:     stats.BucketsTouched,
+		IndexBytes:         stats.IndexBytesRead,
+		EventBytes:         stats.EventBytesRead,
+		IndexMatches:       stats.MatchingLocalIDs,
+		IndexTime:          stats.IndexLookupTime,
+		IndexReadTime:      stats.IndexReadTime,
+		IndexDecodeTime:    stats.IndexDecodeTime,
+		IndexIntersectTime: stats.IndexIntersectTime,
+		EventTime:          stats.EventFetchTime,
+		EventFetchTime:     stats.EventFetchTime,
+		EventDecodeTime:    stats.DecodeTime,
+		EventFilterTime:    stats.FilterTime,
+	}
+}
+
+func executeSegmentVolumeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEventsWithSegmentVolume(contractID, topicGroups, startLedger, endLedger, limit)
+	if err != nil {
+		return &QueryResult{Error: err}
+	}
+
+	return &QueryResult{
+		EventsReturned:     len(events),
+		EventsScanned:      stats.EventsScanned,
+		BucketsTouched:     stats.BucketsTouched,
+		IndexBytes:         stats.IndexBytesRead,
+		EventBytes:         stats.EventBytesRead,
+		IndexMatches:       stats.MatchingLocalIDs,
+		IndexTime:          stats.IndexLookupTime,
+		IndexReadTime:      stats.IndexReadTime,
+		IndexDecodeTime:    stats.IndexDecodeTime,
+		IndexIntersectTime: stats.IndexIntersectTime,
+		EventTime:          stats.EventFetchTime,
+		EventFetchTime:     stats.EventFetchTime,
+		EventDecodeTime:    stats.DecodeTime,
+		EventFilterTime:    stats.FilterTime,
+	}
+}
+
+func executeSegmentVolumeMultiFilterBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEventsWithSegmentVolumeMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		return &QueryResult{Error: err}
 	}
