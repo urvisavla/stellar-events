@@ -77,6 +77,13 @@ max_bytes_for_level_base_mb = 1024
 # Zstd compress per-event blobs in event volume files (experimental)
 # compress_event_volume = false
 
+# Zstd dictionary compression for event volume (experimental, better ratio than plain zstd)
+# dict_compress_event_volume = false
+
+# Events to buffer before training zstd dictionary (default: 16384)
+# More samples = better dictionary quality, but more memory during ingestion
+# dict_sample_count = 16384
+
 # =============================================================================
 # Ingestion
 # =============================================================================

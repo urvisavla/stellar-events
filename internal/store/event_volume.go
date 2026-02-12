@@ -40,7 +40,14 @@ const (
 	EventOffsetsVersion    = uint16(2)
 
 	// Header flags byte (offset 10)
-	EventVolumeFlagZstd = 0x01 // events.dat contains per-event zstd compressed blobs
+	EventVolumeFlagZstd     = 0x01 // events.dat contains per-event zstd compressed blobs
+	EventVolumeFlagZstdDict = 0x02 // events.dat uses zstd dictionary compression
+
+	EventsDictFileName = "events.dict"
+
+	defaultDictSampleCount = 16_384    // default events to buffer before building dictionary
+	dictMaxSize            = 32 * 1024 // 32KB max dictionary size
+	dictMinSamples         = 128       // minimum events for ZDICT_trainFromBuffer (hangs with fewer)
 )
 
 // =============================================================================
@@ -57,15 +64,31 @@ type EventVolumeWriter struct {
 	active         bool          // true if a chunk is currently open
 	compressEvents bool          // zstd compress each event blob
 	zstdEncoder    *zstd.Encoder // reused across events (nil if compression disabled)
+
+	// Zstd dictionary compression fields
+	dictCompress    bool     // use zstd dictionary compression
+	dictSampleCount int      // events to buffer before training dict
+	dictTrained     bool     // dictionary has been trained for this chunk
+	dictData        []byte   // trained dictionary bytes
+	dictEncoder     *CDict   // CGO dict compressor (nil until trained)
+	sampleBuf       [][]byte // buffered event blobs for dict training
+	sampleDenseIDs  []uint32 // corresponding dense IDs for buffered events
 }
 
 // NewEventVolumeWriter creates a new event volume writer.
-func NewEventVolumeWriter(basePath string, compressEvents bool) *EventVolumeWriter {
-	w := &EventVolumeWriter{
-		basePath:       basePath,
-		compressEvents: compressEvents,
+func NewEventVolumeWriter(basePath string, compressEvents bool, dictCompress bool, dictSampleCount int) *EventVolumeWriter {
+	if dictSampleCount <= 0 {
+		dictSampleCount = defaultDictSampleCount
 	}
-	if compressEvents {
+	w := &EventVolumeWriter{
+		basePath:        basePath,
+		compressEvents:  compressEvents,
+		dictCompress:    dictCompress,
+		dictSampleCount: dictSampleCount,
+	}
+	if dictCompress {
+		// Dict compression takes priority; plain zstd encoder not needed
+	} else if compressEvents {
 		// SpeedFastest for ingestion throughput; small blobs don't benefit from higher levels
 		w.zstdEncoder, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
 	}
@@ -94,6 +117,18 @@ func (w *EventVolumeWriter) StartChunk(chunkID uint32) error {
 	w.writeOffset = 0
 	w.active = true
 
+	// Reset dict state for new chunk
+	if w.dictCompress {
+		w.dictTrained = false
+		w.dictData = nil
+		if w.dictEncoder != nil {
+			w.dictEncoder.Close()
+			w.dictEncoder = nil
+		}
+		w.sampleBuf = nil
+		w.sampleDenseIDs = nil
+	}
+
 	fmt.Fprintf(os.Stderr, "  [event-volume] started chunk %06d\n", chunkID)
 	return nil
 }
@@ -104,6 +139,22 @@ func (w *EventVolumeWriter) AppendEvent(denseID uint32, data []byte) error {
 		return fmt.Errorf("no active chunk")
 	}
 
+	// Dict compression: buffer events until we have enough to train
+	if w.dictCompress && !w.dictTrained {
+		// Make a copy since the caller may reuse the buffer
+		buf := make([]byte, len(data))
+		copy(buf, data)
+		w.sampleBuf = append(w.sampleBuf, buf)
+		w.sampleDenseIDs = append(w.sampleDenseIDs, denseID)
+
+		if len(w.sampleBuf) >= w.dictSampleCount {
+			if err := w.trainAndFlush(); err != nil {
+				return fmt.Errorf("failed to train dict and flush: %w", err)
+			}
+		}
+		return nil
+	}
+
 	// Grow offsets slice if needed (fill gaps with current writeOffset)
 	for uint32(len(w.offsets)) <= denseID {
 		w.offsets = append(w.offsets, w.writeOffset)
@@ -112,7 +163,13 @@ func (w *EventVolumeWriter) AppendEvent(denseID uint32, data []byte) error {
 
 	// Optionally compress
 	writeData := data
-	if w.compressEvents && w.zstdEncoder != nil {
+	if w.dictCompress && w.dictTrained && w.dictEncoder != nil {
+		var err error
+		writeData, err = w.dictEncoder.Compress(data)
+		if err != nil {
+			return fmt.Errorf("failed to compress event with dict: %w", err)
+		}
+	} else if w.compressEvents && w.zstdEncoder != nil {
 		writeData = w.zstdEncoder.EncodeAll(data, nil)
 	}
 
@@ -126,6 +183,89 @@ func (w *EventVolumeWriter) AppendEvent(denseID uint32, data []byte) error {
 	return nil
 }
 
+// trainAndFlush trains a zstd dictionary via CGO from buffered samples and flushes them to disk.
+// If there are too few samples for effective training, writes events uncompressed instead.
+func (w *EventVolumeWriter) trainAndFlush() error {
+	if len(w.sampleBuf) == 0 {
+		return nil
+	}
+
+	// ZDICT_trainFromBuffer hangs or produces poor dicts with too few samples.
+	// Fall back to writing uncompressed when below the minimum.
+	if len(w.sampleBuf) < dictMinSamples {
+		fmt.Fprintf(os.Stderr, "  [event-volume] too few samples (%d < %d) for dict training, writing uncompressed for chunk %06d\n",
+			len(w.sampleBuf), dictMinSamples, w.chunkID)
+
+		w.dictTrained = true
+		w.dictData = nil // no dict → header flag stays 0
+
+		for i, denseID := range w.sampleDenseIDs {
+			data := w.sampleBuf[i]
+			for uint32(len(w.offsets)) <= denseID {
+				w.offsets = append(w.offsets, w.writeOffset)
+			}
+			w.offsets[denseID] = w.writeOffset
+			n, err := w.eventsFile.Write(data)
+			if err != nil {
+				return fmt.Errorf("failed to write buffered event: %w", err)
+			}
+			w.writeOffset += uint32(n)
+		}
+
+		w.sampleBuf = nil
+		w.sampleDenseIDs = nil
+		return nil
+	}
+
+	// Train dictionary using C ZDICT_trainFromBuffer
+	dict, err := trainDictCgo(w.sampleBuf, dictMaxSize)
+	if err != nil {
+		return fmt.Errorf("failed to train dict: %w", err)
+	}
+	w.dictData = dict
+
+	// Create CGO compressor with trained dictionary (level 1 = fast)
+	enc, err := newCDict(w.dictData, 1)
+	if err != nil {
+		return fmt.Errorf("failed to create CDict: %w", err)
+	}
+	w.dictEncoder = enc
+	w.dictTrained = true
+
+	fmt.Fprintf(os.Stderr, "  [event-volume] trained dict (%d bytes) from %d samples for chunk %06d\n",
+		len(w.dictData), len(w.sampleBuf), w.chunkID)
+
+	// Flush all buffered events
+	for i, denseID := range w.sampleDenseIDs {
+		data := w.sampleBuf[i]
+
+		// Grow offsets slice if needed
+		for uint32(len(w.offsets)) <= denseID {
+			w.offsets = append(w.offsets, w.writeOffset)
+		}
+		w.offsets[denseID] = w.writeOffset
+
+		compressed, err := w.dictEncoder.Compress(data)
+		if err != nil {
+			return fmt.Errorf("failed to compress buffered event: %w", err)
+		}
+		n, err := w.eventsFile.Write(compressed)
+		if err != nil {
+			return fmt.Errorf("failed to write buffered event: %w", err)
+		}
+		w.writeOffset += uint32(n)
+	}
+
+	fmt.Fprintf(os.Stderr, "  [event-volume] flushed %d buffered events for chunk %06d\n",
+		len(w.sampleDenseIDs), w.chunkID)
+
+	// Free sample buffers
+	w.sampleBuf = nil
+	w.sampleDenseIDs = nil
+
+	return nil
+}
+
 // FinalizeChunk writes the event_offsets.dat file and closes events.dat.
 func (w *EventVolumeWriter) FinalizeChunk() error {
 	if !w.active {
@@ -133,12 +273,36 @@ func (w *EventVolumeWriter) FinalizeChunk() error {
 	}
 	w.active = false
 
+	// If dict compression is enabled but dict not yet trained (fewer events than sample count),
+	// train on whatever we have and flush
+	if w.dictCompress && !w.dictTrained && len(w.sampleBuf) > 0 {
+		if err := w.trainAndFlush(); err != nil {
+			return fmt.Errorf("failed to train dict on final chunk: %w", err)
+		}
+	}
+
 	// Close events.dat
 	if w.eventsFile != nil {
 		if err := w.eventsFile.Close(); err != nil {
 			return fmt.Errorf("failed to close events.dat: %w", err)
 		}
 		w.eventsFile = nil
+	}
+
+	// Write dictionary file if dict compression was used
+	if w.dictCompress && w.dictData != nil {
+		dirName := fmt.Sprintf("%06d", w.chunkID)
+		dirPath := filepath.Join(w.basePath, dirName)
+		dictPath := filepath.Join(dirPath, EventsDictFileName)
+		if err := writeFileAtomic(dictPath, w.dictData); err != nil {
+			return fmt.Errorf("failed to write events.dict: %w", err)
+		}
+	}
+
+	// Close dict encoder
+	if w.dictEncoder != nil {
+		w.dictEncoder.Close()
+		w.dictEncoder = nil
 	}
 
 	// Build variable-size offsets: header + (eventCount+1) offset entries
@@ -150,7 +314,9 @@ func (w *EventVolumeWriter) FinalizeChunk() error {
 	binary.LittleEndian.PutUint16(offsetsBuf[4:6], EventOffsetsVersion)
 	binary.LittleEndian.PutUint32(offsetsBuf[6:10], eventCount)
 	// Flags byte at offset 10
-	if w.compressEvents {
+	if w.dictCompress && w.dictData != nil {
+		offsetsBuf[10] = EventVolumeFlagZstdDict
+	} else if w.compressEvents {
 		offsetsBuf[10] = EventVolumeFlagZstd
 	}
 	// Bytes 11-15 remain reserved/zero
@@ -192,8 +358,9 @@ func (w *EventVolumeWriter) IsActive() bool {
 
 // eventVolumeHeader holds parsed header info for read operations.
 type eventVolumeHeader struct {
-	dataStart  int64 // byte offset where offset entries begin
-	compressed bool  // events are zstd compressed
+	dataStart      int64 // byte offset where offset entries begin
+	compressed     bool  // events are zstd compressed (plain)
+	dictCompressed bool  // events are zstd dictionary compressed
 }
 
 // parseOffsetsHeader reads and parses the event_offsets.dat header.
@@ -207,8 +374,9 @@ func parseOffsetsHeader(offsetsFile *os.File) (*eventVolumeHeader, error) {
 
 	if string(headerBuf[0:4]) == EventOffsetsMagic {
 		return &eventVolumeHeader{
-			dataStart:  EventOffsetsHeaderSize,
-			compressed: headerBuf[10]&EventVolumeFlagZstd != 0,
+			dataStart:      EventOffsetsHeaderSize,
+			compressed:     headerBuf[10]&EventVolumeFlagZstd != 0,
+			dictCompressed: headerBuf[10]&EventVolumeFlagZstdDict != 0,
 		}, nil
 	}
 
@@ -274,7 +442,22 @@ func ReadEventFromVolume(basePath string, chunkID, denseID uint32) ([]byte, erro
 		return nil, fmt.Errorf("short read: got %d, expected %d", n, eventLen)
 	}
 
-	if hdr.compressed {
+	if hdr.dictCompressed {
+		dictPath := filepath.Join(dirPath, EventsDictFileName)
+		dictBytes, err := os.ReadFile(dictPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read events.dict: %w", err)
+		}
+		dec, err := newDDict(dictBytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create DDict: %w", err)
+		}
+		defer dec.Close()
+		data, err = dec.Decompress(data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress event with dict: %w", err)
+		}
+	} else if hdr.compressed {
 		data, err = zstdDecoder.DecodeAll(data, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decompress event: %w", err)
@@ -316,6 +499,21 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 	}
 	defer eventsFile.Close()
 
+	// Load dictionary if dict-compressed (once for the whole batch)
+	var dictDecoder *DDict
+	if hdr.dictCompressed {
+		dictPath := filepath.Join(dirPath, EventsDictFileName)
+		dictBytes, err := os.ReadFile(dictPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read events.dict: %w", err)
+		}
+		dictDecoder, err = newDDict(dictBytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create DDict: %w", err)
+		}
+		defer dictDecoder.Close()
+	}
+
 	// Sort for sequential I/O
 	sorted := make([]uint32, len(denseIDs))
 	copy(sorted, denseIDs)
@@ -345,7 +543,13 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 			continue // skip on error
 		}
 
-		if hdr.compressed {
+		if hdr.dictCompressed {
+			decompressed, err := dictDecoder.Decompress(data)
+			if err != nil {
+				continue // skip on decompression error
+			}
+			data = decompressed
+		} else if hdr.compressed {
 			decompressed, err := zstdDecoder.DecodeAll(data, nil)
 			if err != nil {
 				continue // skip on decompression error

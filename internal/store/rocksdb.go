@@ -1141,10 +1141,13 @@ func (es *RocksDBEventStore) SetSegmentFilePath(path string) {
 // EnableEventVolume initializes the event volume writer for flat file event storage.
 // Uses the same base path as segment files.
 // If compressEvents is true, each event blob is zstd-compressed in events.dat.
-func (es *RocksDBEventStore) EnableEventVolume(compressEvents bool) {
+// If dictCompress is true, zstd dictionary compression is used (takes priority over plain zstd).
+func (es *RocksDBEventStore) EnableEventVolume(compressEvents bool, dictCompress bool, dictSampleCount int) {
 	if es.segmentFilePath != "" {
-		es.eventVolumeWriter = NewEventVolumeWriter(es.segmentFilePath, compressEvents)
-		if compressEvents {
+		es.eventVolumeWriter = NewEventVolumeWriter(es.segmentFilePath, compressEvents, dictCompress, dictSampleCount)
+		if dictCompress {
+			fmt.Fprintf(os.Stderr, "Event volume writer enabled with zstd dictionary compression (base: %s)\n", es.segmentFilePath)
+		} else if compressEvents {
 			fmt.Fprintf(os.Stderr, "Event volume writer enabled with zstd compression (base: %s)\n", es.segmentFilePath)
 		} else {
 			fmt.Fprintf(os.Stderr, "Event volume writer enabled (base: %s)\n", es.segmentFilePath)
