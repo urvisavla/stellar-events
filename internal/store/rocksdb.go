@@ -2757,3 +2757,12 @@ func (es *RocksDBEventStore) QueryEventsWithSegmentVolumeMultiFilter(contractIDs
 	}
 	return reader.QueryEventsFromVolumeMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
 }
+
+// GetEventsInRangeFromVolume reads all events in a ledger range from flat file volumes (no index, no RocksDB).
+func (es *RocksDBEventStore) GetEventsInRangeFromVolume(startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+	reader := es.GetSegmentFileReader()
+	if reader == nil {
+		return nil, nil, fmt.Errorf("segment file path not configured")
+	}
+	return reader.GetEventsInRange(startLedger, endLedger, limit)
+}

@@ -212,22 +212,33 @@ func (w *EventVolumeWriter) AppendEvent(denseID uint32, data []byte) error {
 }
 
 // flushGroup compresses buffered events as a single group and writes to events.dat.
-// Group blob format: [len0:4 LE][event0_data...][len1:4 LE][event1_data...]...
+// Group blob format (offset table):
+//   [off0:4 LE][off1:4 LE]...[off_{N-1}:4 LE][event0_data][event1_data]...
+// where off_i is the byte offset of event i from the start of the blob.
 func (w *EventVolumeWriter) flushGroup() error {
 	if len(w.groupBuf) == 0 {
 		return nil
 	}
 
-	// Build uncompressed group blob: length-prefixed events
-	totalSize := 0
+	// Build uncompressed group blob: offset table + concatenated event data
+	n := len(w.groupBuf)
+	headerSize := n * 4 // offset table: one uint32 per event
+	totalSize := headerSize
 	for _, ev := range w.groupBuf {
-		totalSize += 4 + len(ev) // 4-byte length prefix + data
+		totalSize += len(ev)
 	}
 	blob := make([]byte, totalSize)
-	pos := 0
+
+	// Compute and write offset table
+	offset := uint32(headerSize)
+	for i, ev := range w.groupBuf {
+		binary.LittleEndian.PutUint32(blob[i*4:i*4+4], offset)
+		offset += uint32(len(ev))
+	}
+
+	// Write concatenated event data after the offset table
+	pos := headerSize
 	for _, ev := range w.groupBuf {
-		binary.LittleEndian.PutUint32(blob[pos:pos+4], uint32(len(ev)))
-		pos += 4
 		copy(blob[pos:pos+len(ev)], ev)
 		pos += len(ev)
 	}
@@ -558,7 +569,13 @@ func ReadEventFromVolume(basePath string, chunkID, denseID uint32) ([]byte, erro
 			return nil, fmt.Errorf("failed to decompress group: %w", err)
 		}
 
-		return extractEventFromGroup(decompressed, posInGroup)
+		// Compute how many events are in this group (last group may be partial)
+		eventsInGroup := hdr.groupSize
+		if remaining := hdr.eventCount - groupIdx*hdr.groupSize; remaining < hdr.groupSize {
+			eventsInGroup = remaining
+		}
+
+		return extractEventFromGroup(decompressed, posInGroup, eventsInGroup)
 	}
 
 	// Read offsets[denseID] and offsets[denseID+1]
@@ -619,26 +636,35 @@ func ReadEventFromVolume(basePath string, chunkID, denseID uint32) ([]byte, erro
 }
 
 // extractEventFromGroup extracts a single event at the given position from a
-// decompressed group blob. Group blob format: [len:4 LE][data]... repeated.
-func extractEventFromGroup(groupBlob []byte, posInGroup uint32) ([]byte, error) {
-	pos := 0
-	for i := uint32(0); i <= posInGroup; i++ {
-		if pos+4 > len(groupBlob) {
-			return nil, fmt.Errorf("group blob too short at event %d (pos=%d, len=%d)", i, pos, len(groupBlob))
-		}
-		evLen := binary.LittleEndian.Uint32(groupBlob[pos : pos+4])
-		pos += 4
-		if pos+int(evLen) > len(groupBlob) {
-			return nil, fmt.Errorf("group blob too short for event data at %d (need %d, have %d)", i, evLen, len(groupBlob)-pos)
-		}
-		if i == posInGroup {
-			result := make([]byte, evLen)
-			copy(result, groupBlob[pos:pos+int(evLen)])
-			return result, nil
-		}
-		pos += int(evLen)
+// decompressed group blob using the offset table. O(1) random access.
+// Group blob format: [off0:4 LE][off1:4 LE]...[off_{N-1}:4 LE][event0_data][event1_data]...
+func extractEventFromGroup(groupBlob []byte, posInGroup, eventsInGroup uint32) ([]byte, error) {
+	if posInGroup >= eventsInGroup {
+		return nil, fmt.Errorf("posInGroup %d >= eventsInGroup %d", posInGroup, eventsInGroup)
 	}
-	return nil, fmt.Errorf("event %d not found in group", posInGroup)
+
+	// Read start offset from the offset table
+	offPos := posInGroup * 4
+	if int(offPos+4) > len(groupBlob) {
+		return nil, fmt.Errorf("group blob too short for offset at pos %d (len=%d)", posInGroup, len(groupBlob))
+	}
+	start := binary.LittleEndian.Uint32(groupBlob[offPos : offPos+4])
+
+	// Read end: next event's offset, or end of blob for the last event
+	var end uint32
+	if posInGroup+1 < eventsInGroup {
+		end = binary.LittleEndian.Uint32(groupBlob[(posInGroup+1)*4 : (posInGroup+1)*4+4])
+	} else {
+		end = uint32(len(groupBlob))
+	}
+
+	if start > end || int(end) > len(groupBlob) {
+		return nil, fmt.Errorf("invalid event bounds: start=%d end=%d blobLen=%d", start, end, len(groupBlob))
+	}
+
+	result := make([]byte, end-start)
+	copy(result, groupBlob[start:end])
+	return result, nil
 }
 
 // ReadEventsFromVolume reads multiple events from flat files in batch.
@@ -721,10 +747,16 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 				continue
 			}
 
+			// Compute how many events are in this group (last group may be partial)
+			eventsInGroup := hdr.groupSize
+			if remaining := hdr.eventCount - gIdx*hdr.groupSize; remaining < hdr.groupSize {
+				eventsInGroup = remaining
+			}
+
 			// Extract each requested event from the decompressed group
 			for _, denseID := range groupedIDs[gIdx] {
 				posInGroup := denseID % hdr.groupSize
-				eventData, err := extractEventFromGroup(decompressed, posInGroup)
+				eventData, err := extractEventFromGroup(decompressed, posInGroup, eventsInGroup)
 				if err != nil {
 					continue
 				}

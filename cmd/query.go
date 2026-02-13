@@ -165,6 +165,11 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 			return
 		}
 
+		if indexType == "segment-file" {
+			runSegmentFileUnfilteredQuery(eventStore, startLedger, endLedger, limit)
+			return
+		}
+
 		fmt.Fprintf(os.Stderr, "Querying all events in ledgers %d-%d...\n", startLedger, endLedger)
 		startTime := time.Now()
 		rangeResult, err := eventStore.GetEventsInRangeWithTiming(startLedger, endLedger, limit)
@@ -410,13 +415,38 @@ func runSegmentFilePositionalQuery(eventStore *store.RocksDBEventStore, filter *
 	fmt.Fprintf(os.Stderr, "Querying with segment file index in ledgers %d-%d...\n", startLedger, endLedger)
 
 	topicGroups := filter.TopicGroups()
-	stats, events, err := eventStore.QueryEventsWithSegmentFile(filter.ContractID, topicGroups, startLedger, endLedger, limit)
+	stats, events, err := eventStore.QueryEventsWithSegmentVolume(filter.ContractID, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	printUnifiedResult(store.SegmentFileToUnified(stats))
+	printUnifiedResult(store.SegmentVolumeToUnified(stats))
+
+	if events == nil {
+		fmt.Println("[]")
+		return
+	}
+
+	output, err := json.MarshalIndent(events, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to marshal events: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(output))
+}
+
+// runSegmentFileUnfilteredQuery runs an unfiltered range query using flat file volumes (no index, no RocksDB).
+func runSegmentFileUnfilteredQuery(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, limit int) {
+	fmt.Fprintf(os.Stderr, "Querying all events from segment volume in ledgers %d-%d...\n", startLedger, endLedger)
+
+	stats, events, err := eventStore.GetEventsInRangeFromVolume(startLedger, endLedger, limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	printUnifiedResult(store.SegmentVolumeToUnified(stats))
 
 	if events == nil {
 		fmt.Println("[]")
@@ -471,13 +501,13 @@ func runSegmentFileNonPositionalQuery(eventStore *store.RocksDBEventStore, contr
 		os.Exit(2)
 	}
 
-	stats, events, err := eventStore.QueryEventsWithSegmentFile(contractBytes, topicGroups, startLedger, endLedger, limit)
+	stats, events, err := eventStore.QueryEventsWithSegmentVolume(contractBytes, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	printUnifiedResult(store.SegmentFileToUnified(stats))
+	printUnifiedResult(store.SegmentVolumeToUnified(stats))
 
 	if events == nil {
 		fmt.Println("[]")
@@ -562,6 +592,8 @@ func printUnifiedResult(r *store.UnifiedQueryResult) {
 		header = "32-bit Bitmap"
 	case "segment-file":
 		header = "Segment File"
+	case "segment-volume":
+		header = "Segment Volume"
 	default:
 		header = r.IndexType
 	}

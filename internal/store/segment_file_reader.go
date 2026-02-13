@@ -799,6 +799,104 @@ func (r *SegmentFileReader) QueryEventsFromVolumeMultiFilter(contractIDs [][]byt
 	return result, events, nil
 }
 
+// GetEventsInRange reads all events in a ledger range from flat file volumes (no index, no RocksDB).
+// Uses the ledger map to determine the dense ID range per bucket and reads sequentially.
+func (r *SegmentFileReader) GetEventsInRange(startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+	totalStart := time.Now()
+	result := &Bitmap32EventQueryResult{
+		LedgerRange: endLedger - startLedger + 1,
+	}
+
+	buckets := GetBucketsForRange(startLedger, endLedger)
+	result.BucketsTouched = len(buckets)
+
+	fetchCap := 0
+	if limit > 0 {
+		fetchCap = limit
+	}
+	events := make([]*query.Event, 0)
+
+	for _, segID := range buckets {
+		if fetchCap > 0 && len(events) >= fetchCap {
+			break
+		}
+
+		lm, err := r.loadLedgerMapFromFile(segID)
+		if err != nil {
+			continue // segment may not exist
+		}
+
+		segmentStart := segID * BucketSize
+
+		var startOff uint16
+		if startLedger > segmentStart {
+			startOff = uint16(startLedger - segmentStart)
+		}
+		endOff := uint16(BucketSize - 1)
+		if endLedger < segmentStart+BucketSize-1 {
+			endOff = uint16(endLedger - segmentStart)
+		}
+
+		startID, endID := lm.LedgerRangeToIDRange(startOff, endOff)
+		if endID < startID {
+			continue
+		}
+
+		// Build sequential dense IDs slice
+		count := int(endID - startID + 1)
+		if fetchCap > 0 && count > fetchCap-len(events) {
+			count = fetchCap - len(events)
+		}
+		denseIDs := make([]uint32, count)
+		for i := 0; i < count; i++ {
+			denseIDs[i] = startID + uint32(i)
+		}
+
+		result.MatchingLocalIDs += count
+
+		// Batch read events from volume
+		readStart := time.Now()
+		eventBlobs, err := ReadEventsFromVolume(r.basePath, segID, denseIDs)
+		readTime := time.Since(readStart)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read events from volume for segment %d: %w", segID, err)
+		}
+
+		result.EventFetchTime += readTime
+
+		// Decode events
+		for _, denseID := range denseIDs {
+			blob, ok := eventBlobs[denseID]
+			if !ok {
+				continue
+			}
+
+			result.EventBytesRead += int64(len(blob))
+			result.EventsScanned++
+
+			ledger, eventSeq := lm.DenseIDToLedgerAndSeq(denseID)
+
+			decStart := time.Now()
+			ev, err := event.DecodeBinaryToQueryEvent(blob, ledger, 0, 0, eventSeq)
+			result.DecodeTime += time.Since(decStart)
+
+			if err != nil {
+				continue
+			}
+
+			events = append(events, ev)
+		}
+	}
+
+	if fetchCap > 0 && len(events) > fetchCap {
+		events = events[:fetchCap]
+	}
+
+	result.EventsReturned = len(events)
+	result.TotalTime = time.Since(totalStart)
+	return result, events, nil
+}
+
 // fetchEventsFromVolume reads events from flat file event volumes (no RocksDB).
 // Uses O(1) positional lookup per event via the offset array.
 func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring.Bitmap, limit int, result *Bitmap32EventQueryResult) ([]*query.Event, error) {
