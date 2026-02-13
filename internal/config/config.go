@@ -77,8 +77,9 @@ type StorageConfig struct {
 	EnableSegmentFiles bool   `toml:"enable_segment_files"` // Enable writing flat file indexes at segment boundaries
 	EnableEventVolume       bool   `toml:"enable_event_volume"`        // Write event data to flat files alongside indexes
 	CompressEventVolume     bool   `toml:"compress_event_volume"`      // Zstd compress per-event blobs in event volume files
-	DictCompressEventVolume bool   `toml:"dict_compress_event_volume"` // Zstd dictionary compression for event volume
-	DictSampleCount         int    `toml:"dict_sample_count"`          // Events to buffer before training dict (default: 16384)
+	DictCompressEventVolume  bool `toml:"dict_compress_event_volume"`  // Zstd dictionary compression for event volume
+	DictSampleCount          int  `toml:"dict_sample_count"`           // Events to buffer before training dict (default: 16384)
+	EventCompressGroupSize   int  `toml:"event_compress_group_size"`   // Events per compression group (default: 1 = per-event)
 }
 
 // =============================================================================

@@ -44,7 +44,7 @@ func openEventStore(cfg *config.Config) (*store.RocksDBEventStore, error) {
 		if dictSamples <= 0 {
 			dictSamples = 16_384 // default
 		}
-		es.EnableEventVolume(cfg.Storage.CompressEventVolume, cfg.Storage.DictCompressEventVolume, dictSamples)
+		es.EnableEventVolume(cfg.Storage.CompressEventVolume, cfg.Storage.DictCompressEventVolume, dictSamples, cfg.Storage.EventCompressGroupSize)
 	}
 
 	return es, nil

@@ -42,6 +42,7 @@ const (
 	// Header flags byte (offset 10)
 	EventVolumeFlagZstd     = 0x01 // events.dat contains per-event zstd compressed blobs
 	EventVolumeFlagZstdDict = 0x02 // events.dat uses zstd dictionary compression
+	EventVolumeFlagGrouped  = 0x04 // events.dat contains grouped compression blobs
 
 	EventsDictFileName = "events.dict"
 
@@ -73,18 +74,28 @@ type EventVolumeWriter struct {
 	dictEncoder     *CDict   // CGO dict compressor (nil until trained)
 	sampleBuf       [][]byte // buffered event blobs for dict training
 	sampleDenseIDs  []uint32 // corresponding dense IDs for buffered events
+
+	// Grouped compression fields
+	groupSize  int      // events per compression group (0 or 1 = per-event)
+	groupBuf   [][]byte // buffered event data within current group
+	eventCount uint32   // total events written (needed when offsets are per-group)
 }
 
 // NewEventVolumeWriter creates a new event volume writer.
-func NewEventVolumeWriter(basePath string, compressEvents bool, dictCompress bool, dictSampleCount int) *EventVolumeWriter {
+func NewEventVolumeWriter(basePath string, compressEvents bool, dictCompress bool, dictSampleCount int, groupSize int) *EventVolumeWriter {
 	if dictSampleCount <= 0 {
 		dictSampleCount = defaultDictSampleCount
+	}
+	// Grouped compression only applies when plain zstd is active (not dict mode)
+	if dictCompress || !compressEvents {
+		groupSize = 0
 	}
 	w := &EventVolumeWriter{
 		basePath:        basePath,
 		compressEvents:  compressEvents,
 		dictCompress:    dictCompress,
 		dictSampleCount: dictSampleCount,
+		groupSize:       groupSize,
 	}
 	if dictCompress {
 		// Dict compression takes priority; plain zstd encoder not needed
@@ -116,6 +127,8 @@ func (w *EventVolumeWriter) StartChunk(chunkID uint32) error {
 	w.offsets = w.offsets[:0] // reset but keep capacity
 	w.writeOffset = 0
 	w.active = true
+	w.eventCount = 0
+	w.groupBuf = w.groupBuf[:0]
 
 	// Reset dict state for new chunk
 	if w.dictCompress {
@@ -155,6 +168,21 @@ func (w *EventVolumeWriter) AppendEvent(denseID uint32, data []byte) error {
 		return nil
 	}
 
+	// Grouped compression: buffer events, flush when group is full
+	if w.groupSize > 1 {
+		buf := make([]byte, len(data))
+		copy(buf, data)
+		w.groupBuf = append(w.groupBuf, buf)
+		w.eventCount++
+
+		if len(w.groupBuf) >= w.groupSize {
+			if err := w.flushGroup(); err != nil {
+				return fmt.Errorf("failed to flush group: %w", err)
+			}
+		}
+		return nil
+	}
+
 	// Grow offsets slice if needed (fill gaps with current writeOffset)
 	for uint32(len(w.offsets)) <= denseID {
 		w.offsets = append(w.offsets, w.writeOffset)
@@ -180,6 +208,45 @@ func (w *EventVolumeWriter) AppendEvent(denseID uint32, data []byte) error {
 	}
 	w.writeOffset += uint32(n)
 
+	return nil
+}
+
+// flushGroup compresses buffered events as a single group and writes to events.dat.
+// Group blob format: [len0:4 LE][event0_data...][len1:4 LE][event1_data...]...
+func (w *EventVolumeWriter) flushGroup() error {
+	if len(w.groupBuf) == 0 {
+		return nil
+	}
+
+	// Build uncompressed group blob: length-prefixed events
+	totalSize := 0
+	for _, ev := range w.groupBuf {
+		totalSize += 4 + len(ev) // 4-byte length prefix + data
+	}
+	blob := make([]byte, totalSize)
+	pos := 0
+	for _, ev := range w.groupBuf {
+		binary.LittleEndian.PutUint32(blob[pos:pos+4], uint32(len(ev)))
+		pos += 4
+		copy(blob[pos:pos+len(ev)], ev)
+		pos += len(ev)
+	}
+
+	// Compress the entire group blob
+	compressed := w.zstdEncoder.EncodeAll(blob, nil)
+
+	// Record group offset
+	w.offsets = append(w.offsets, w.writeOffset)
+
+	// Write compressed group to events.dat
+	n, err := w.eventsFile.Write(compressed)
+	if err != nil {
+		return fmt.Errorf("failed to write group data: %w", err)
+	}
+	w.writeOffset += uint32(n)
+
+	// Clear group buffer
+	w.groupBuf = w.groupBuf[:0]
 	return nil
 }
 
@@ -281,6 +348,13 @@ func (w *EventVolumeWriter) FinalizeChunk() error {
 		}
 	}
 
+	// Flush partial group if grouped compression is active
+	if w.groupSize > 1 && len(w.groupBuf) > 0 {
+		if err := w.flushGroup(); err != nil {
+			return fmt.Errorf("failed to flush final group: %w", err)
+		}
+	}
+
 	// Close events.dat
 	if w.eventsFile != nil {
 		if err := w.eventsFile.Close(); err != nil {
@@ -305,21 +379,35 @@ func (w *EventVolumeWriter) FinalizeChunk() error {
 		w.dictEncoder = nil
 	}
 
-	// Build variable-size offsets: header + (eventCount+1) offset entries
-	eventCount := uint32(len(w.offsets))
-	offsetsBuf := make([]byte, EventOffsetsHeaderSize+(eventCount+1)*OffsetEntrySize)
+	// Determine event count and number of offset entries
+	grouped := w.groupSize > 1
+	var totalEvents uint32
+	var numOffsetEntries uint32
+	if grouped {
+		totalEvents = w.eventCount
+		numOffsetEntries = uint32(len(w.offsets)) // one per group (sentinel added below)
+	} else {
+		totalEvents = uint32(len(w.offsets))
+		numOffsetEntries = totalEvents // one per event (sentinel added below)
+	}
+
+	// Build variable-size offsets: header + (numOffsetEntries+1) offset entries
+	offsetsBuf := make([]byte, EventOffsetsHeaderSize+(numOffsetEntries+1)*OffsetEntrySize)
 
 	// Write header
 	copy(offsetsBuf[0:4], EventOffsetsMagic)
 	binary.LittleEndian.PutUint16(offsetsBuf[4:6], EventOffsetsVersion)
-	binary.LittleEndian.PutUint32(offsetsBuf[6:10], eventCount)
+	binary.LittleEndian.PutUint32(offsetsBuf[6:10], totalEvents)
 	// Flags byte at offset 10
 	if w.dictCompress && w.dictData != nil {
 		offsetsBuf[10] = EventVolumeFlagZstdDict
+	} else if grouped {
+		offsetsBuf[10] = EventVolumeFlagGrouped | EventVolumeFlagZstd
+		offsetsBuf[11] = byte(w.groupSize) // GroupSize at byte 11
 	} else if w.compressEvents {
 		offsetsBuf[10] = EventVolumeFlagZstd
 	}
-	// Bytes 11-15 remain reserved/zero
+	// Bytes 12-15 remain reserved/zero
 
 	// Write offset entries after header
 	dataStart := EventOffsetsHeaderSize
@@ -327,7 +415,7 @@ func (w *EventVolumeWriter) FinalizeChunk() error {
 		binary.LittleEndian.PutUint32(offsetsBuf[dataStart+i*OffsetEntrySize:], off)
 	}
 	// Sentinel entry: total events.dat size
-	binary.LittleEndian.PutUint32(offsetsBuf[dataStart+int(eventCount)*OffsetEntrySize:], w.writeOffset)
+	binary.LittleEndian.PutUint32(offsetsBuf[dataStart+int(numOffsetEntries)*OffsetEntrySize:], w.writeOffset)
 
 	// Write event_offsets.dat atomically (tmp + rename)
 	dirName := fmt.Sprintf("%06d", w.chunkID)
@@ -338,7 +426,11 @@ func (w *EventVolumeWriter) FinalizeChunk() error {
 		return fmt.Errorf("failed to write event_offsets.dat: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "  [event-volume] finalized chunk %06d (%d events, %d bytes)\n", w.chunkID, len(w.offsets), w.writeOffset)
+	if grouped {
+		fmt.Fprintf(os.Stderr, "  [event-volume] finalized chunk %06d (%d events, %d groups, %d bytes)\n", w.chunkID, totalEvents, len(w.offsets), w.writeOffset)
+	} else {
+		fmt.Fprintf(os.Stderr, "  [event-volume] finalized chunk %06d (%d events, %d bytes)\n", w.chunkID, totalEvents, w.writeOffset)
+	}
 	return nil
 }
 
@@ -358,9 +450,12 @@ func (w *EventVolumeWriter) IsActive() bool {
 
 // eventVolumeHeader holds parsed header info for read operations.
 type eventVolumeHeader struct {
-	dataStart      int64 // byte offset where offset entries begin
-	compressed     bool  // events are zstd compressed (plain)
-	dictCompressed bool  // events are zstd dictionary compressed
+	dataStart      int64  // byte offset where offset entries begin
+	compressed     bool   // events are zstd compressed (plain)
+	dictCompressed bool   // events are zstd dictionary compressed
+	grouped        bool   // events are grouped compressed
+	groupSize      uint32 // events per group (0 or 1 = per-event)
+	eventCount     uint32 // total number of events
 }
 
 // parseOffsetsHeader reads and parses the event_offsets.dat header.
@@ -373,10 +468,23 @@ func parseOffsetsHeader(offsetsFile *os.File) (*eventVolumeHeader, error) {
 	}
 
 	if string(headerBuf[0:4]) == EventOffsetsMagic {
+		flags := headerBuf[10]
+		grouped := flags&EventVolumeFlagGrouped != 0
+		var groupSize uint32
+		if grouped {
+			groupSize = uint32(headerBuf[11])
+			if groupSize == 0 {
+				groupSize = 1
+			}
+		}
+		eventCount := binary.LittleEndian.Uint32(headerBuf[6:10])
 		return &eventVolumeHeader{
 			dataStart:      EventOffsetsHeaderSize,
-			compressed:     headerBuf[10]&EventVolumeFlagZstd != 0,
-			dictCompressed: headerBuf[10]&EventVolumeFlagZstdDict != 0,
+			compressed:     flags&EventVolumeFlagZstd != 0,
+			dictCompressed: flags&EventVolumeFlagZstdDict != 0,
+			grouped:        grouped,
+			groupSize:      groupSize,
+			eventCount:     eventCount,
 		}, nil
 	}
 
@@ -408,6 +516,49 @@ func ReadEventFromVolume(basePath string, chunkID, denseID uint32) ([]byte, erro
 	hdr, err := parseOffsetsHeader(offsetsFile)
 	if err != nil {
 		return nil, err
+	}
+
+	// Grouped compression: read the group, decompress, extract the event
+	if hdr.grouped && hdr.groupSize > 1 {
+		groupIdx := denseID / hdr.groupSize
+		posInGroup := denseID % hdr.groupSize
+
+		// Read offsets[groupIdx] and offsets[groupIdx+1]
+		buf := make([]byte, 8)
+		_, err = offsetsFile.ReadAt(buf, hdr.dataStart+int64(groupIdx)*int64(OffsetEntrySize))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read group offsets: %w", err)
+		}
+		startOff := binary.LittleEndian.Uint32(buf[0:4])
+		endOff := binary.LittleEndian.Uint32(buf[4:8])
+		if endOff <= startOff {
+			return nil, fmt.Errorf("invalid group offset range: start=%d end=%d for groupIdx=%d", startOff, endOff, groupIdx)
+		}
+
+		// Read compressed group blob
+		eventsPath := filepath.Join(dirPath, EventsFileName)
+		eventsFile, err := os.Open(eventsPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open events.dat: %w", err)
+		}
+		defer eventsFile.Close()
+
+		groupData := make([]byte, endOff-startOff)
+		n, err := eventsFile.ReadAt(groupData, int64(startOff))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read group data: %w", err)
+		}
+		if uint32(n) != endOff-startOff {
+			return nil, fmt.Errorf("short read: got %d, expected %d", n, endOff-startOff)
+		}
+
+		// Decompress group
+		decompressed, err := zstdDecoder.DecodeAll(groupData, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress group: %w", err)
+		}
+
+		return extractEventFromGroup(decompressed, posInGroup)
 	}
 
 	// Read offsets[denseID] and offsets[denseID+1]
@@ -467,6 +618,29 @@ func ReadEventFromVolume(basePath string, chunkID, denseID uint32) ([]byte, erro
 	return data, nil
 }
 
+// extractEventFromGroup extracts a single event at the given position from a
+// decompressed group blob. Group blob format: [len:4 LE][data]... repeated.
+func extractEventFromGroup(groupBlob []byte, posInGroup uint32) ([]byte, error) {
+	pos := 0
+	for i := uint32(0); i <= posInGroup; i++ {
+		if pos+4 > len(groupBlob) {
+			return nil, fmt.Errorf("group blob too short at event %d (pos=%d, len=%d)", i, pos, len(groupBlob))
+		}
+		evLen := binary.LittleEndian.Uint32(groupBlob[pos : pos+4])
+		pos += 4
+		if pos+int(evLen) > len(groupBlob) {
+			return nil, fmt.Errorf("group blob too short for event data at %d (need %d, have %d)", i, evLen, len(groupBlob)-pos)
+		}
+		if i == posInGroup {
+			result := make([]byte, evLen)
+			copy(result, groupBlob[pos:pos+int(evLen)])
+			return result, nil
+		}
+		pos += int(evLen)
+	}
+	return nil, fmt.Errorf("event %d not found in group", posInGroup)
+}
+
 // ReadEventsFromVolume reads multiple events from flat files in batch.
 // Opens files once and reads all requested events. Sorts denseIDs for sequential I/O.
 // Returns a map from denseID to raw binary event data.
@@ -499,6 +673,68 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 	}
 	defer eventsFile.Close()
 
+	// Sort for sequential I/O
+	sorted := make([]uint32, len(denseIDs))
+	copy(sorted, denseIDs)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	result := make(map[uint32][]byte, len(sorted))
+
+	// Grouped compression: batch by group to decompress each group only once
+	if hdr.grouped && hdr.groupSize > 1 {
+		// Group denseIDs by their group index
+		groupedIDs := make(map[uint32][]uint32) // groupIdx -> list of denseIDs
+		for _, denseID := range sorted {
+			gIdx := denseID / hdr.groupSize
+			groupedIDs[gIdx] = append(groupedIDs[gIdx], denseID)
+		}
+
+		// Sort group indices for sequential I/O
+		groupIndices := make([]uint32, 0, len(groupedIDs))
+		for gIdx := range groupedIDs {
+			groupIndices = append(groupIndices, gIdx)
+		}
+		sort.Slice(groupIndices, func(i, j int) bool { return groupIndices[i] < groupIndices[j] })
+
+		offsetBuf := make([]byte, 8)
+		for _, gIdx := range groupIndices {
+			// Read group offsets
+			_, err := offsetsFile.ReadAt(offsetBuf, hdr.dataStart+int64(gIdx)*int64(OffsetEntrySize))
+			if err != nil {
+				continue
+			}
+			startOff := binary.LittleEndian.Uint32(offsetBuf[0:4])
+			endOff := binary.LittleEndian.Uint32(offsetBuf[4:8])
+			if endOff <= startOff {
+				continue
+			}
+
+			// Read and decompress the group
+			groupData := make([]byte, endOff-startOff)
+			n, err := eventsFile.ReadAt(groupData, int64(startOff))
+			if err != nil || uint32(n) != endOff-startOff {
+				continue
+			}
+
+			decompressed, err := zstdDecoder.DecodeAll(groupData, nil)
+			if err != nil {
+				continue
+			}
+
+			// Extract each requested event from the decompressed group
+			for _, denseID := range groupedIDs[gIdx] {
+				posInGroup := denseID % hdr.groupSize
+				eventData, err := extractEventFromGroup(decompressed, posInGroup)
+				if err != nil {
+					continue
+				}
+				result[denseID] = eventData
+			}
+		}
+
+		return result, nil
+	}
+
 	// Load dictionary if dict-compressed (once for the whole batch)
 	var dictDecoder *DDict
 	if hdr.dictCompressed {
@@ -514,12 +750,6 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 		defer dictDecoder.Close()
 	}
 
-	// Sort for sequential I/O
-	sorted := make([]uint32, len(denseIDs))
-	copy(sorted, denseIDs)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-
-	result := make(map[uint32][]byte, len(sorted))
 	offsetBuf := make([]byte, 8) // two uint32s
 
 	for _, denseID := range sorted {
