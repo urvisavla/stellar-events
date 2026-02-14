@@ -6,9 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
+
+// VolumeReadTiming holds timing breakdown for event volume read operations.
+type VolumeReadTiming struct {
+	DiskReadTime   time.Duration
+	DecompressTime time.Duration
+}
 
 // =============================================================================
 // Event Volume Flat Files
@@ -669,10 +676,12 @@ func extractEventFromGroup(groupBlob []byte, posInGroup, eventsInGroup uint32) (
 
 // ReadEventsFromVolume reads multiple events from flat files in batch.
 // Opens files once and reads all requested events. Sorts denseIDs for sequential I/O.
-// Returns a map from denseID to raw binary event data.
-func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (map[uint32][]byte, error) {
+// Returns a map from denseID to raw binary event data and timing breakdown.
+func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (map[uint32][]byte, *VolumeReadTiming, error) {
+	timing := &VolumeReadTiming{}
+
 	if len(denseIDs) == 0 {
-		return nil, nil
+		return nil, timing, nil
 	}
 
 	dirName := fmt.Sprintf("%06d", chunkID)
@@ -682,20 +691,20 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 	offsetsPath := filepath.Join(dirPath, EventOffsetsFileName)
 	offsetsFile, err := os.Open(offsetsPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open event_offsets.dat: %w", err)
+		return nil, timing, fmt.Errorf("failed to open event_offsets.dat: %w", err)
 	}
 	defer offsetsFile.Close()
 
 	hdr, err := parseOffsetsHeader(offsetsFile)
 	if err != nil {
-		return nil, err
+		return nil, timing, err
 	}
 
 	// Open events file
 	eventsPath := filepath.Join(dirPath, EventsFileName)
 	eventsFile, err := os.Open(eventsPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open events.dat: %w", err)
+		return nil, timing, fmt.Errorf("failed to open events.dat: %w", err)
 	}
 	defer eventsFile.Close()
 
@@ -735,14 +744,19 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 				continue
 			}
 
-			// Read and decompress the group
+			// Read compressed group data (disk I/O)
 			groupData := make([]byte, endOff-startOff)
+			diskStart := time.Now()
 			n, err := eventsFile.ReadAt(groupData, int64(startOff))
+			timing.DiskReadTime += time.Since(diskStart)
 			if err != nil || uint32(n) != endOff-startOff {
 				continue
 			}
 
+			// Decompress group
+			decompStart := time.Now()
 			decompressed, err := zstdDecoder.DecodeAll(groupData, nil)
+			timing.DecompressTime += time.Since(decompStart)
 			if err != nil {
 				continue
 			}
@@ -764,7 +778,7 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 			}
 		}
 
-		return result, nil
+		return result, timing, nil
 	}
 
 	// Load dictionary if dict-compressed (once for the whole batch)
@@ -773,11 +787,11 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 		dictPath := filepath.Join(dirPath, EventsDictFileName)
 		dictBytes, err := os.ReadFile(dictPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read events.dict: %w", err)
+			return nil, timing, fmt.Errorf("failed to read events.dict: %w", err)
 		}
 		dictDecoder, err = newDDict(dictBytes)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create DDict: %w", err)
+			return nil, timing, fmt.Errorf("failed to create DDict: %w", err)
 		}
 		defer dictDecoder.Close()
 	}
@@ -800,19 +814,25 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 
 		eventLen := endOff - startOff
 		data := make([]byte, eventLen)
+		diskStart := time.Now()
 		n, err := eventsFile.ReadAt(data, int64(startOff))
+		timing.DiskReadTime += time.Since(diskStart)
 		if err != nil || uint32(n) != eventLen {
 			continue // skip on error
 		}
 
 		if hdr.dictCompressed {
+			decompStart := time.Now()
 			decompressed, err := dictDecoder.Decompress(data)
+			timing.DecompressTime += time.Since(decompStart)
 			if err != nil {
 				continue // skip on decompression error
 			}
 			data = decompressed
 		} else if hdr.compressed {
+			decompStart := time.Now()
 			decompressed, err := zstdDecoder.DecodeAll(data, nil)
+			timing.DecompressTime += time.Since(decompStart)
 			if err != nil {
 				continue // skip on decompression error
 			}
@@ -822,7 +842,7 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 		result[denseID] = data
 	}
 
-	return result, nil
+	return result, timing, nil
 }
 
 // EventVolumeExists checks if event volume files exist for a given chunk.

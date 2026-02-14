@@ -824,6 +824,8 @@ type Bitmap32EventQueryResult struct {
 	IndexDecodeTime    time.Duration // Time decoding bitmap segments (CPU - near zero with FromBuffer)
 	IndexIntersectTime time.Duration // Time spent on bitmap OR/AND operations
 	EventFetchTime     time.Duration // Time fetching events
+	DecompressTime     time.Duration // Time spent decompressing event blobs (zstd/dict)
+	EventDiskReadTime  time.Duration // Time spent on disk I/O for event data
 	DecodeTime         time.Duration // Time decoding events
 	FilterTime         time.Duration // Time filtering events
 	TotalTime          time.Duration // Total query time
@@ -832,19 +834,21 @@ type Bitmap32EventQueryResult struct {
 // ToUnified converts Bitmap32EventQueryResult to UnifiedQueryResult
 func (r *Bitmap32EventQueryResult) ToUnified() *UnifiedQueryResult {
 	return &UnifiedQueryResult{
-		IndexType:       "bitmap32-event",
-		LedgerRange:     r.LedgerRange,
-		BucketsTouched:  r.BucketsTouched,
-		IndexMatches:    r.MatchingLocalIDs,
-		MatchUnitName:   "local IDs",
-		EventsScanned:   r.EventsScanned,
-		EventsReturned:  r.EventsReturned,
-		IndexBytesRead:  r.IndexBytesRead,
-		EventBytesRead:  r.EventBytesRead,
-		IndexLookupTime: r.IndexLookupTime,
-		EventFetchTime:  r.EventFetchTime,
-		DecodeTime:      r.DecodeTime,
-		FilterTime:      r.FilterTime,
-		TotalTime:       r.TotalTime,
+		IndexType:         "bitmap32-event",
+		LedgerRange:       r.LedgerRange,
+		BucketsTouched:    r.BucketsTouched,
+		IndexMatches:      r.MatchingLocalIDs,
+		MatchUnitName:     "local IDs",
+		EventsScanned:     r.EventsScanned,
+		EventsReturned:    r.EventsReturned,
+		IndexBytesRead:    r.IndexBytesRead,
+		EventBytesRead:    r.EventBytesRead,
+		IndexLookupTime:   r.IndexLookupTime,
+		EventFetchTime:    r.EventFetchTime,
+		DecompressTime:    r.DecompressTime,
+		EventDiskReadTime: r.EventDiskReadTime,
+		DecodeTime:        r.DecodeTime,
+		FilterTime:        r.FilterTime,
+		TotalTime:         r.TotalTime,
 	}
 }

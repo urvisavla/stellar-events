@@ -856,13 +856,17 @@ func (r *SegmentFileReader) GetEventsInRange(startLedger, endLedger uint32, limi
 
 		// Batch read events from volume
 		readStart := time.Now()
-		eventBlobs, err := ReadEventsFromVolume(r.basePath, segID, denseIDs)
+		eventBlobs, volTiming, err := ReadEventsFromVolume(r.basePath, segID, denseIDs)
 		readTime := time.Since(readStart)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to read events from volume for segment %d: %w", segID, err)
 		}
 
 		result.EventFetchTime += readTime
+		if volTiming != nil {
+			result.DecompressTime += volTiming.DecompressTime
+			result.EventDiskReadTime += volTiming.DiskReadTime
+		}
 
 		// Decode events
 		for _, denseID := range denseIDs {
@@ -941,13 +945,17 @@ func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring
 
 		// Batch read events from volume
 		readStart := time.Now()
-		eventBlobs, err := ReadEventsFromVolume(r.basePath, segID, denseIDs)
+		eventBlobs, volTiming, err := ReadEventsFromVolume(r.basePath, segID, denseIDs)
 		readTime := time.Since(readStart)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read events from volume for segment %d: %w", segID, err)
 		}
 
 		result.EventFetchTime += readTime
+		if volTiming != nil {
+			result.DecompressTime += volTiming.DecompressTime
+			result.EventDiskReadTime += volTiming.DiskReadTime
+		}
 
 		// Decode events
 		for _, denseID := range denseIDs {
@@ -984,39 +992,43 @@ func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring
 // SegmentFileToUnified converts a Bitmap32EventQueryResult from segment-file queries to UnifiedQueryResult.
 func SegmentFileToUnified(r *Bitmap32EventQueryResult) *UnifiedQueryResult {
 	return &UnifiedQueryResult{
-		IndexType:       "segment-file",
-		LedgerRange:     r.LedgerRange,
-		BucketsTouched:  r.BucketsTouched,
-		IndexMatches:    r.MatchingLocalIDs,
-		MatchUnitName:   "local IDs",
-		EventsScanned:   r.EventsScanned,
-		EventsReturned:  r.EventsReturned,
-		IndexBytesRead:  r.IndexBytesRead,
-		EventBytesRead:  r.EventBytesRead,
-		IndexLookupTime: r.IndexLookupTime,
-		EventFetchTime:  r.EventFetchTime,
-		DecodeTime:      r.DecodeTime,
-		FilterTime:      r.FilterTime,
-		TotalTime:       r.TotalTime,
+		IndexType:         "segment-file",
+		LedgerRange:       r.LedgerRange,
+		BucketsTouched:    r.BucketsTouched,
+		IndexMatches:      r.MatchingLocalIDs,
+		MatchUnitName:     "local IDs",
+		EventsScanned:     r.EventsScanned,
+		EventsReturned:    r.EventsReturned,
+		IndexBytesRead:    r.IndexBytesRead,
+		EventBytesRead:    r.EventBytesRead,
+		IndexLookupTime:   r.IndexLookupTime,
+		EventFetchTime:    r.EventFetchTime,
+		DecompressTime:    r.DecompressTime,
+		EventDiskReadTime: r.EventDiskReadTime,
+		DecodeTime:        r.DecodeTime,
+		FilterTime:        r.FilterTime,
+		TotalTime:         r.TotalTime,
 	}
 }
 
 // SegmentVolumeToUnified converts a Bitmap32EventQueryResult from segment-volume queries to UnifiedQueryResult.
 func SegmentVolumeToUnified(r *Bitmap32EventQueryResult) *UnifiedQueryResult {
 	return &UnifiedQueryResult{
-		IndexType:       "segment-volume",
-		LedgerRange:     r.LedgerRange,
-		BucketsTouched:  r.BucketsTouched,
-		IndexMatches:    r.MatchingLocalIDs,
-		MatchUnitName:   "local IDs",
-		EventsScanned:   r.EventsScanned,
-		EventsReturned:  r.EventsReturned,
-		IndexBytesRead:  r.IndexBytesRead,
-		EventBytesRead:  r.EventBytesRead,
-		IndexLookupTime: r.IndexLookupTime,
-		EventFetchTime:  r.EventFetchTime,
-		DecodeTime:      r.DecodeTime,
-		FilterTime:      r.FilterTime,
-		TotalTime:       r.TotalTime,
+		IndexType:         "segment-volume",
+		LedgerRange:       r.LedgerRange,
+		BucketsTouched:    r.BucketsTouched,
+		IndexMatches:      r.MatchingLocalIDs,
+		MatchUnitName:     "local IDs",
+		EventsScanned:     r.EventsScanned,
+		EventsReturned:    r.EventsReturned,
+		IndexBytesRead:    r.IndexBytesRead,
+		EventBytesRead:    r.EventBytesRead,
+		IndexLookupTime:   r.IndexLookupTime,
+		EventFetchTime:    r.EventFetchTime,
+		DecompressTime:    r.DecompressTime,
+		EventDiskReadTime: r.EventDiskReadTime,
+		DecodeTime:        r.DecodeTime,
+		FilterTime:        r.FilterTime,
+		TotalTime:         r.TotalTime,
 	}
 }

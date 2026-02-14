@@ -613,6 +613,12 @@ func printUnifiedResult(r *store.UnifiedQueryResult) {
 	fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
 	fmt.Fprintf(os.Stderr, "  Index lookup:      %s\n", formatDuration(r.IndexLookupTime))
 	fmt.Fprintf(os.Stderr, "  Event fetch:       %s\n", formatDuration(r.EventFetchTime))
+	if r.EventDiskReadTime > 0 {
+		fmt.Fprintf(os.Stderr, "  Event disk read:   %s\n", formatDuration(r.EventDiskReadTime))
+	}
+	if r.DecompressTime > 0 {
+		fmt.Fprintf(os.Stderr, "  Decompress:        %s\n", formatDuration(r.DecompressTime))
+	}
 	fmt.Fprintf(os.Stderr, "  Event decode:      %s\n", formatDuration(r.DecodeTime))
 	if r.FilterTime > 0 {
 		fmt.Fprintf(os.Stderr, "  Event filter:      %s\n", formatDuration(r.FilterTime))
