@@ -958,11 +958,9 @@ func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring
 		}
 
 		// Decode events
-		var notInMap, decodeFailed int
 		for _, denseID := range denseIDs {
 			blob, ok := eventBlobs[denseID]
 			if !ok {
-				notInMap++
 				continue
 			}
 
@@ -976,27 +974,10 @@ func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring
 			result.DecodeTime += time.Since(decStart)
 
 			if err != nil {
-				decodeFailed++
-				if decodeFailed <= 5 {
-					var firstBytes string
-					if len(blob) >= 4 {
-						firstBytes = fmt.Sprintf("0x%02x%02x%02x%02x", blob[0], blob[1], blob[2], blob[3])
-					} else if len(blob) > 0 {
-						firstBytes = fmt.Sprintf("0x%02x (len=%d)", blob[0], len(blob))
-					} else {
-						firstBytes = "empty"
-					}
-					fmt.Fprintf(os.Stderr, "  [fetchEventsFromVolume] decode failed: seg=%d denseID=%d ledger=%d seq=%d blobLen=%d first=%s err=%v\n",
-						segID, denseID, ledger, eventSeq, len(blob), firstBytes, err)
-				}
 				continue
 			}
 
 			events = append(events, ev)
-		}
-		if notInMap > 0 || decodeFailed > 0 {
-			fmt.Fprintf(os.Stderr, "  [fetchEventsFromVolume] seg=%d: requested=%d blobsReturned=%d notInMap=%d decodeFailed=%d decoded=%d\n",
-				segID, len(denseIDs), len(eventBlobs), notInMap, decodeFailed, len(events))
 		}
 	}
 

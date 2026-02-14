@@ -650,14 +650,22 @@ func extractEventFromGroup(groupBlob []byte, posInGroup, eventsInGroup uint32) (
 		return nil, fmt.Errorf("posInGroup %d >= eventsInGroup %d", posInGroup, eventsInGroup)
 	}
 
-	// Read start offset from the offset table
+	// Detect format: new offset-table format has offset[0] == eventsInGroup * 4
+	// Old length-delimited format has offset[0] == first event's byte length
+	if len(groupBlob) >= 4 {
+		offset0 := binary.LittleEndian.Uint32(groupBlob[0:4])
+		if offset0 != eventsInGroup*4 {
+			return extractEventFromGroupLenDelimited(groupBlob, posInGroup)
+		}
+	}
+
+	// New offset-table format: O(1) random access
 	offPos := posInGroup * 4
 	if int(offPos+4) > len(groupBlob) {
 		return nil, fmt.Errorf("group blob too short for offset at pos %d (len=%d)", posInGroup, len(groupBlob))
 	}
 	start := binary.LittleEndian.Uint32(groupBlob[offPos : offPos+4])
 
-	// Read end: next event's offset, or end of blob for the last event
 	var end uint32
 	if posInGroup+1 < eventsInGroup {
 		end = binary.LittleEndian.Uint32(groupBlob[(posInGroup+1)*4 : (posInGroup+1)*4+4])
@@ -672,6 +680,30 @@ func extractEventFromGroup(groupBlob []byte, posInGroup, eventsInGroup uint32) (
 	result := make([]byte, end-start)
 	copy(result, groupBlob[start:end])
 	return result, nil
+}
+
+// extractEventFromGroupLenDelimited extracts a single event from the old
+// length-delimited group format: [len0:4 LE][event0_data][len1:4 LE][event1_data]...
+// O(N) sequential scan to reach the target position.
+func extractEventFromGroupLenDelimited(groupBlob []byte, posInGroup uint32) ([]byte, error) {
+	pos := 0
+	for i := uint32(0); i <= posInGroup; i++ {
+		if pos+4 > len(groupBlob) {
+			return nil, fmt.Errorf("group blob too short at event %d (pos=%d, len=%d)", i, pos, len(groupBlob))
+		}
+		evLen := binary.LittleEndian.Uint32(groupBlob[pos : pos+4])
+		pos += 4
+		if pos+int(evLen) > len(groupBlob) {
+			return nil, fmt.Errorf("group blob too short for event data at %d (need %d, have %d)", i, evLen, len(groupBlob)-pos)
+		}
+		if i == posInGroup {
+			result := make([]byte, evLen)
+			copy(result, groupBlob[pos:pos+int(evLen)])
+			return result, nil
+		}
+		pos += int(evLen)
+	}
+	return nil, fmt.Errorf("event %d not found in group", posInGroup)
 }
 
 // ReadEventsFromVolume reads multiple events from flat files in batch.
@@ -714,9 +746,6 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 
 	result := make(map[uint32][]byte, len(sorted))
-
-	fmt.Fprintf(os.Stderr, "  [ReadEventsFromVolume] chunk=%d eventCount=%d grouped=%v groupSize=%d compressed=%v dict=%v requested=%d\n",
-		chunkID, hdr.eventCount, hdr.grouped, hdr.groupSize, hdr.compressed, hdr.dictCompressed, len(denseIDs))
 
 	// Grouped compression: batch by group to decompress each group only once
 	if hdr.grouped && hdr.groupSize > 1 {
@@ -771,29 +800,10 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 			}
 
 			// Extract each requested event from the decompressed group
-			extractFailed := false
 			for _, denseID := range groupedIDs[gIdx] {
 				posInGroup := denseID % hdr.groupSize
 				eventData, err := extractEventFromGroup(decompressed, posInGroup, eventsInGroup)
 				if err != nil {
-					if !extractFailed {
-						extractFailed = true
-						// Dump first 64 bytes of decompressed group + first 4 "offsets"
-						hexLen := 64
-						if hexLen > len(decompressed) {
-							hexLen = len(decompressed)
-						}
-						fmt.Fprintf(os.Stderr, "  [ReadEventsFromVolume] FIRST extract fail in group: chunk=%d gIdx=%d eventsInGroup=%d decompLen=%d compressedLen=%d\n",
-							chunkID, gIdx, eventsInGroup, len(decompressed), endOff-startOff)
-						fmt.Fprintf(os.Stderr, "    first %d bytes of decompressed: %x\n", hexLen, decompressed[:hexLen])
-						// Read what should be offset[0] and offset[1]
-						if len(decompressed) >= 8 {
-							off0 := binary.LittleEndian.Uint32(decompressed[0:4])
-							off1 := binary.LittleEndian.Uint32(decompressed[4:8])
-							fmt.Fprintf(os.Stderr, "    offset[0]=%d offset[1]=%d (expected offset[0] ~ %d for %d events)\n",
-								off0, off1, eventsInGroup*4, eventsInGroup)
-						}
-					}
 					continue
 				}
 				result[denseID] = eventData
