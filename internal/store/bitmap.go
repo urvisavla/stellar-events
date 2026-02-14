@@ -823,9 +823,10 @@ type Bitmap32EventQueryResult struct {
 	IndexReadTime      time.Duration // Time reading bitmap segments from storage (I/O)
 	IndexDecodeTime    time.Duration // Time decoding bitmap segments (CPU - near zero with FromBuffer)
 	IndexIntersectTime time.Duration // Time spent on bitmap OR/AND operations
-	EventFetchTime     time.Duration // Time fetching events
-	DecompressTime     time.Duration // Time spent decompressing event blobs (zstd/dict)
-	EventDiskReadTime  time.Duration // Time spent on disk I/O for event data
+	EventFetchTime      time.Duration // Time fetching events
+	DecompressTime      time.Duration // Time spent decompressing event blobs (zstd/dict)
+	EventDiskReadTime   time.Duration // Time spent on disk I/O for event data
+	GroupsDecompressed  int           // Number of group blocks decompressed
 	DecodeTime         time.Duration // Time decoding events
 	FilterTime         time.Duration // Time filtering events
 	TotalTime          time.Duration // Total query time
@@ -845,8 +846,9 @@ func (r *Bitmap32EventQueryResult) ToUnified() *UnifiedQueryResult {
 		EventBytesRead:    r.EventBytesRead,
 		IndexLookupTime:   r.IndexLookupTime,
 		EventFetchTime:    r.EventFetchTime,
-		DecompressTime:    r.DecompressTime,
-		EventDiskReadTime: r.EventDiskReadTime,
+		DecompressTime:     r.DecompressTime,
+		EventDiskReadTime:  r.EventDiskReadTime,
+		GroupsDecompressed: r.GroupsDecompressed,
 		DecodeTime:        r.DecodeTime,
 		FilterTime:        r.FilterTime,
 		TotalTime:         r.TotalTime,

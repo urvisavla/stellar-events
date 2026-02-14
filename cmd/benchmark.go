@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/urvisavla/stellar-events/internal/config"
@@ -85,7 +84,6 @@ type BenchmarkResult struct {
 	P99IndexTime          time.Duration // P99 time for index lookup
 	P99IndexReadTime      time.Duration // P99 time reading index from storage (I/O)
 	P99IndexDecodeTime    time.Duration // P99 time decoding index (CPU)
-	P99IndexFilterTime    time.Duration // P99 time filtering index results by ledger range (CPU)
 	P99IndexIntersectTime time.Duration // P99 time intersecting index results
 	P99EventTime          time.Duration // P99 time for event operations (total)
 	P99EventFetchTime  time.Duration // P99 time fetching events from storage (I/O)
@@ -97,8 +95,6 @@ type BenchmarkResult struct {
 	// Resource stats (P99, populated when --track-resources is enabled)
 	P99TotalAllocBytes uint64
 	P99HeapInUseBytes  uint64
-	P99IOBlocksRead    int64
-	P99IOBlocksWritten int64
 
 	// Index stats
 	BucketsTouched   int   // Number of buckets touched by the query
@@ -108,9 +104,10 @@ type BenchmarkResult struct {
 	LargestListSize  int   // Size of largest posting list (posting list only)
 
 	// Event stats
-	EventsReturned int   // Events returned after filtering
-	EventsScanned  int   // Events scanned from storage
-	EventBytes     int64 // Bytes read from event storage
+	EventsReturned     int   // Events returned after filtering
+	EventsScanned      int   // Events scanned from storage
+	EventBytes         int64 // Bytes read from event storage
+	GroupsDecompressed int   // Number of group blocks decompressed
 
 	Error string
 }
@@ -124,7 +121,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 	fs.SetOutput(os.Stderr)
 
 	dataFile := fs.String("data", "", "Benchmark data file (JSON)")
-	indexTypes := fs.String("index", "all", "Index types to benchmark: posting-v2,bitmap32,segment-file,segment-volume,all")
+	indexTypes := fs.String("index", "all", "Index types to benchmark: rocksdb,flat-idx,flat-all,all")
 	iterations := fs.Int("iterations", 5, "Number of iterations per query")
 	warmup := fs.Int("warmup", 1, "Warmup iterations (not counted)")
 	outputFormat := fs.String("format", "table", "Output format: table, csv, json")
@@ -136,7 +133,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 	fixedRange := fs.Bool("fixed-range", false, "Use fixed ledger range for all queries (no random sampling)")
 	logFile := fs.String("log", "benchmark.log", "Log file for query details (use 'none' to disable)")
 	outputFile := fs.String("output", "", "Output file for results (writes incrementally; use 'none' to disable)")
-	trackResources := fs.Bool("track-resources", false, "Track memory allocation and OS I/O stats per query (adds ~100µs overhead)")
+	trackResources := fs.Bool("track-resources", false, "Track memory allocation stats per query (adds ~100µs overhead)")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: benchmark [options]\n\n")
@@ -190,20 +187,36 @@ func runBenchmark(cfg *config.Config, args []string) {
 	}
 
 	// Parse index types
+	// Map user-facing names to internal names
+	indexNameToInternal := map[string]string{
+		"rocksdb":  "bitmap32",
+		"flat-idx": "segment-file",
+		"flat-all": "segment-volume",
+	}
+	internalToDisplay := map[string]string{
+		"bitmap32":       "rocksdb",
+		"segment-file":   "flat-idx",
+		"segment-volume": "flat-all",
+	}
+
 	var indexes []string
 	if *indexTypes == "all" {
 		indexes = []string{"bitmap32", "segment-file", "segment-volume"}
 	} else {
-		indexes = strings.Split(*indexTypes, ",")
+		for _, name := range strings.Split(*indexTypes, ",") {
+			internal, ok := indexNameToInternal[name]
+			if !ok {
+				fmt.Fprintf(os.Stderr, "Error: invalid index type: %s (valid: rocksdb, flat-idx, flat-all)\n", name)
+				os.Exit(2)
+			}
+			indexes = append(indexes, internal)
+		}
 	}
 
-	// Validate index types
-	validIndexes := map[string]bool{"posting-v2": true, "bitmap32": true, "segment-file": true, "segment-volume": true}
-	for _, idx := range indexes {
-		if !validIndexes[idx] {
-			fmt.Fprintf(os.Stderr, "Error: invalid index type: %s\n", idx)
-			os.Exit(2)
-		}
+	// Build display names for each index
+	displayIndexes := make([]string, len(indexes))
+	for i, idx := range indexes {
+		displayIndexes[i] = internalToDisplay[idx]
 	}
 
 	// Set random seed
@@ -230,7 +243,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		}
 		defer logWriter.Close()
 		// Write CSV header
-		fmt.Fprintln(logWriter, "timestamp,query_name,index_type,events_returned,index_matches,buckets_touched,index_bytes,event_bytes,p99_idx_read_ms,p99_idx_decode_ms,p99_idx_filter_ms,p99_idx_intersect_ms,p99_idx_ms,p99_total_ms,evt_decompress_ms,evt_disk_read_ms,total_alloc_bytes,heap_inuse_bytes,io_blocks_read,io_blocks_written,error")
+		fmt.Fprintln(logWriter, "timestamp,query_name,index_type,events_returned,index_matches,buckets_touched,index_bytes,event_bytes,groups_decompressed,p99_idx_read_ms,p99_idx_decode_ms,p99_idx_intersect_ms,p99_idx_ms,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,p99_total_ms,total_alloc,heap_inuse,error")
 		logWriter.Sync()
 	}
 
@@ -256,7 +269,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		defer outputWriter.Close()
 		// Write CSV header for results
 		if outputFileFormat == "csv" {
-			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,index_type,start_ledger,end_ledger,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_filter_ms,idx_intersect_ms,buckets_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,total_alloc_bytes,heap_inuse_bytes,io_blocks_read,io_blocks_written,iterations,error")
+			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,index_type,start_ledger,end_ledger,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,buckets_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,groups_decompressed,total_alloc_bytes,heap_inuse_bytes,iterations,error")
 			outputWriter.Sync()
 		}
 		fmt.Fprintf(os.Stderr, "Output file: %s (format: %s)\n", *outputFile, outputFileFormat)
@@ -318,20 +331,21 @@ func runBenchmark(cfg *config.Config, args []string) {
 
 		for _, idxType := range indexes {
 			completed++
-			fmt.Fprintf(os.Stderr, "\r[%d/%d] Running: %s (%s) [%d-%d]...    ", completed, totalQueries, q.Name, idxType, queryStart, queryEnd)
+			displayName := internalToDisplay[idxType]
+			fmt.Fprintf(os.Stderr, "\r[%d/%d] Running: %s (%s) [%d-%d]...    ", completed, totalQueries, q.Name, displayName, queryStart, queryEnd)
 
 			// Create a temporary data struct with the random range
 			queryData := &BenchmarkData{
 				StartLedger: queryStart,
 				EndLedger:   queryEnd,
 			}
-			result := runQueryBenchmark(eventStore, queryData, q, idxType, *iterations, *warmup, *limit, *timeout, *trackResources)
+			result := runQueryBenchmark(eventStore, queryData, q, idxType, displayName, *iterations, *warmup, *limit, *timeout, *trackResources)
 			results = append(results, result)
 
 			// Log query result
 			if logWriter != nil {
 				errStr := result.Error
-				fmt.Fprintf(logWriter, "%s,%s,%s,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%s\n",
+				fmt.Fprintf(logWriter, "%s,%s,%s,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%s,%s\n",
 					time.Now().Format(time.RFC3339),
 					result.Query.Name,
 					result.IndexType,
@@ -340,18 +354,20 @@ func runBenchmark(cfg *config.Config, args []string) {
 					result.BucketsTouched,
 					result.IndexBytes,
 					result.EventBytes,
+					result.GroupsDecompressed,
 					float64(result.P99IndexReadTime.Microseconds())/1000.0,
 					float64(result.P99IndexDecodeTime.Microseconds())/1000.0,
-					float64(result.P99IndexFilterTime.Microseconds())/1000.0,
 					float64(result.P99IndexIntersectTime.Microseconds())/1000.0,
 					float64(result.P99IndexTime.Microseconds())/1000.0,
-					float64(result.P99Time.Microseconds())/1000.0,
+					float64(result.P99EventTime.Microseconds())/1000.0,
+					float64(result.P99EventFetchTime.Microseconds())/1000.0,
+					float64(result.P99EventDecodeTime.Microseconds())/1000.0,
+					float64(result.P99EventFilterTime.Microseconds())/1000.0,
 					float64(result.P99EventDecompressTime.Microseconds())/1000.0,
 					float64(result.P99EventDiskReadTime.Microseconds())/1000.0,
-					result.P99TotalAllocBytes,
-					result.P99HeapInUseBytes,
-					result.P99IOBlocksRead,
-					result.P99IOBlocksWritten,
+					float64(result.P99Time.Microseconds())/1000.0,
+					formatBytes(int64(result.P99TotalAllocBytes)),
+					formatBytes(int64(result.P99HeapInUseBytes)),
 					errStr,
 				)
 				logWriter.Sync() // Flush to disk immediately
@@ -380,7 +396,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		case "json":
 			outputJSON(results)
 		default:
-			outputTable(results, indexes)
+			outputTable(results, displayIndexes)
 		}
 	}
 }
@@ -808,10 +824,10 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 // Benchmark Execution
 // =============================================================================
 
-func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData, spec QuerySpec, indexType string, iterations, warmup, limit int, timeout time.Duration, trackResources bool) BenchmarkResult {
+func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData, spec QuerySpec, indexType, displayName string, iterations, warmup, limit int, timeout time.Duration, trackResources bool) BenchmarkResult {
 	result := BenchmarkResult{
 		Query:       spec,
-		IndexType:   indexType,
+		IndexType:   displayName,
 		StartLedger: data.StartLedger,
 		EndLedger:   data.EndLedger,
 		Iterations:  iterations,
@@ -823,7 +839,6 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 		index          time.Duration
 		indexRead      time.Duration
 		indexDecode    time.Duration
-		indexFilter    time.Duration
 		indexIntersect time.Duration
 		event          time.Duration
 		eventFetch     time.Duration
@@ -833,8 +848,6 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 		eventDiskRead   time.Duration
 		totalAlloc      uint64
 		heapInUse       uint64
-		ioBlocksRead    int64
-		ioBlocksWritten int64
 	}
 	var timings []iterationTiming
 
@@ -886,10 +899,8 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 
 		// Capture resource stats before query if tracking is enabled
 		var mBefore, mAfter runtime.MemStats
-		var ruBefore, ruAfter syscall.Rusage
 		if trackResources {
 			runtime.ReadMemStats(&mBefore)
-			syscall.Getrusage(syscall.RUSAGE_SELF, &ruBefore)
 		}
 
 		resultChan := make(chan *QueryResult, 1)
@@ -911,7 +922,6 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 		// Capture resource stats after query
 		if trackResources {
 			runtime.ReadMemStats(&mAfter)
-			syscall.Getrusage(syscall.RUSAGE_SELF, &ruAfter)
 		}
 
 		elapsed := time.Since(start)
@@ -919,20 +929,17 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 		// Build resource fields
 		var resAlloc uint64
 		var resHeap uint64
-		var resIORead, resIOWrite int64
 		if trackResources {
 			resAlloc = mAfter.TotalAlloc - mBefore.TotalAlloc
 			resHeap = mAfter.HeapInuse
-			resIORead = ruAfter.Inblock - ruBefore.Inblock
-			resIOWrite = ruAfter.Oublock - ruBefore.Oublock
 		}
 
 		makeIterTiming := func(qr *QueryResult) iterationTiming {
 			return iterationTiming{
-				total: elapsed, index: qr.IndexTime, indexRead: qr.IndexReadTime, indexDecode: qr.IndexDecodeTime, indexFilter: qr.IndexFilterTime, indexIntersect: qr.IndexIntersectTime,
+				total: elapsed, index: qr.IndexTime, indexRead: qr.IndexReadTime, indexDecode: qr.IndexDecodeTime, indexIntersect: qr.IndexIntersectTime,
 				event: qr.EventTime, eventFetch: qr.EventFetchTime, eventDecode: qr.EventDecodeTime, eventFilter: qr.EventFilterTime,
 				eventDecompress: qr.EventDecompressTime, eventDiskRead: qr.EventDiskReadTime,
-				totalAlloc: resAlloc, heapInUse: resHeap, ioBlocksRead: resIORead, ioBlocksWritten: resIOWrite,
+				totalAlloc: resAlloc, heapInUse: resHeap,
 			}
 		}
 
@@ -943,14 +950,14 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 				populateQueryStats(&result, qr)
 				timings = append(timings, makeIterTiming(qr))
 			} else {
-				timings = append(timings, iterationTiming{total: elapsed, totalAlloc: resAlloc, heapInUse: resHeap, ioBlocksRead: resIORead, ioBlocksWritten: resIOWrite})
+				timings = append(timings, iterationTiming{total: elapsed, totalAlloc: resAlloc, heapInUse: resHeap})
 			}
 			// Stop further iterations - this query is too slow
 			break
 		} else if qr != nil {
 			if qr.Error != nil {
 				result.Error = qr.Error.Error()
-				timings = append(timings, iterationTiming{total: elapsed, totalAlloc: resAlloc, heapInUse: resHeap, ioBlocksRead: resIORead, ioBlocksWritten: resIOWrite})
+				timings = append(timings, iterationTiming{total: elapsed, totalAlloc: resAlloc, heapInUse: resHeap})
 			} else {
 				populateQueryStats(&result, qr)
 				timings = append(timings, makeIterTiming(qr))
@@ -970,7 +977,6 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 		result.P99IndexTime = timings[p99Idx].index
 		result.P99IndexReadTime = timings[p99Idx].indexRead
 		result.P99IndexDecodeTime = timings[p99Idx].indexDecode
-		result.P99IndexFilterTime = timings[p99Idx].indexFilter
 		result.P99IndexIntersectTime = timings[p99Idx].indexIntersect
 		result.P99EventTime = timings[p99Idx].event
 		result.P99EventFetchTime = timings[p99Idx].eventFetch
@@ -980,8 +986,6 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 		result.P99EventDiskReadTime = timings[p99Idx].eventDiskRead
 		result.P99TotalAllocBytes = timings[p99Idx].totalAlloc
 		result.P99HeapInUseBytes = timings[p99Idx].heapInUse
-		result.P99IOBlocksRead = timings[p99Idx].ioBlocksRead
-		result.P99IOBlocksWritten = timings[p99Idx].ioBlocksWritten
 	}
 
 	return result
@@ -995,6 +999,7 @@ func populateQueryStats(result *BenchmarkResult, qr *QueryResult) {
 	result.IndexMatches = qr.IndexMatches
 	result.IndexBytes = qr.IndexBytes
 	result.EventBytes = qr.EventBytes
+	result.GroupsDecompressed = qr.GroupsDecompressed
 	result.SmallestListSize = qr.SmallestListSize
 	result.LargestListSize = qr.LargestListSize
 }
@@ -1019,7 +1024,6 @@ type QueryResult struct {
 	IndexTime          time.Duration // Time spent on index operations (total)
 	IndexReadTime      time.Duration // Time spent reading index from storage (I/O)
 	IndexDecodeTime    time.Duration // Time spent decoding index (CPU)
-	IndexFilterTime    time.Duration // Time spent filtering index results by ledger range (CPU)
 	IndexIntersectTime time.Duration // Time spent intersecting index results
 
 	// Event timing
@@ -1029,12 +1033,11 @@ type QueryResult struct {
 	EventFilterTime      time.Duration // Time spent filtering events (CPU)
 	EventDecompressTime  time.Duration // Time spent decompressing event blobs (zstd/dict)
 	EventDiskReadTime    time.Duration // Time spent on disk I/O for event data
+	GroupsDecompressed   int           // Number of group blocks decompressed
 
 	// Resource stats (populated when --track-resources is enabled)
 	TotalAllocBytes uint64 // runtime.MemStats.TotalAlloc delta
 	HeapInUseBytes  uint64 // runtime.MemStats.HeapInuse snapshot after query
-	IOBlocksRead    int64  // getrusage ru_inblock delta
-	IOBlocksWritten int64  // getrusage ru_oublock delta
 
 	Error error
 }
@@ -1101,7 +1104,6 @@ func executePostingV2QueryBenchmark(eventStore *store.RocksDBEventStore, startLe
 		IndexTime:          stats.PostingListTime + stats.IntersectTime,
 		IndexReadTime:      stats.PostingListReadTime,
 		IndexDecodeTime:    stats.PostingListDecodeTime,
-		IndexFilterTime:    stats.PostingListFilterTime,
 		IndexIntersectTime: stats.IntersectTime,
 		EventTime:          stats.EventFetchTime + stats.DecodeTime + stats.FilterTime,
 		EventFetchTime:     stats.EventFetchTime,
@@ -1150,7 +1152,6 @@ func executePostingV2MultiFilterBenchmark(eventStore *store.RocksDBEventStore, s
 		IndexTime:          stats.PostingListTime + stats.IntersectTime,
 		IndexReadTime:      stats.PostingListReadTime,
 		IndexDecodeTime:    stats.PostingListDecodeTime,
-		IndexFilterTime:    stats.PostingListFilterTime,
 		IndexIntersectTime: stats.IntersectTime,
 		EventTime:          stats.EventFetchTime + stats.DecodeTime + stats.FilterTime,
 		EventFetchTime:     stats.EventFetchTime,
@@ -1200,12 +1201,14 @@ func executeSegmentFileQueryBenchmark(eventStore *store.RocksDBEventStore, start
 		IndexReadTime:       stats.IndexReadTime,
 		IndexDecodeTime:     stats.IndexDecodeTime,
 		IndexIntersectTime:  stats.IndexIntersectTime,
+
 		EventTime:           stats.EventFetchTime,
 		EventFetchTime:      stats.EventFetchTime,
 		EventDecodeTime:     stats.DecodeTime,
 		EventFilterTime:     stats.FilterTime,
 		EventDecompressTime: stats.DecompressTime,
 		EventDiskReadTime:   stats.EventDiskReadTime,
+		GroupsDecompressed:  stats.GroupsDecompressed,
 	}
 }
 
@@ -1226,12 +1229,14 @@ func executeSegmentFileMultiFilterBenchmark(eventStore *store.RocksDBEventStore,
 		IndexReadTime:       stats.IndexReadTime,
 		IndexDecodeTime:     stats.IndexDecodeTime,
 		IndexIntersectTime:  stats.IndexIntersectTime,
+
 		EventTime:           stats.EventFetchTime,
 		EventFetchTime:      stats.EventFetchTime,
 		EventDecodeTime:     stats.DecodeTime,
 		EventFilterTime:     stats.FilterTime,
 		EventDecompressTime: stats.DecompressTime,
 		EventDiskReadTime:   stats.EventDiskReadTime,
+		GroupsDecompressed:  stats.GroupsDecompressed,
 	}
 }
 
@@ -1252,12 +1257,14 @@ func executeSegmentVolumeQueryBenchmark(eventStore *store.RocksDBEventStore, sta
 		IndexReadTime:       stats.IndexReadTime,
 		IndexDecodeTime:     stats.IndexDecodeTime,
 		IndexIntersectTime:  stats.IndexIntersectTime,
+
 		EventTime:           stats.EventFetchTime,
 		EventFetchTime:      stats.EventFetchTime,
 		EventDecodeTime:     stats.DecodeTime,
 		EventFilterTime:     stats.FilterTime,
 		EventDecompressTime: stats.DecompressTime,
 		EventDiskReadTime:   stats.EventDiskReadTime,
+		GroupsDecompressed:  stats.GroupsDecompressed,
 	}
 }
 
@@ -1278,12 +1285,14 @@ func executeSegmentVolumeMultiFilterBenchmark(eventStore *store.RocksDBEventStor
 		IndexReadTime:       stats.IndexReadTime,
 		IndexDecodeTime:     stats.IndexDecodeTime,
 		IndexIntersectTime:  stats.IndexIntersectTime,
+
 		EventTime:           stats.EventFetchTime,
 		EventFetchTime:      stats.EventFetchTime,
 		EventDecodeTime:     stats.DecodeTime,
 		EventFilterTime:     stats.FilterTime,
 		EventDecompressTime: stats.DecompressTime,
 		EventDiskReadTime:   stats.EventDiskReadTime,
+		GroupsDecompressed:  stats.GroupsDecompressed,
 	}
 }
 
@@ -1375,7 +1384,7 @@ func printSummaryStats(results []BenchmarkResult, indexes []string) {
 
 func outputCSV(results []BenchmarkResult) {
 	// Header: query | timing | index | event | test
-	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,index_type,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_filter_ms,idx_intersect_ms,buckets_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,total_alloc_bytes,heap_inuse_bytes,io_blocks_read,io_blocks_written,iterations,error")
+	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,index_type,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,buckets_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,groups_decompressed,total_alloc_bytes,heap_inuse_bytes,iterations,error")
 
 	for _, r := range results {
 		contractID := strings.Join(r.Query.ContractIDs, "|")
@@ -1392,7 +1401,7 @@ func outputCSV(results []BenchmarkResult) {
 			}
 		}
 
-		fmt.Printf("%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%d,%d,%d,%s\n",
+		fmt.Printf("%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%d,%d,%s\n",
 			r.Query.Name,
 			contractID,
 			topics[0], topics[1], topics[2], topics[3],
@@ -1402,7 +1411,6 @@ func outputCSV(results []BenchmarkResult) {
 			float64(r.P99IndexTime.Microseconds())/1000.0,
 			float64(r.P99IndexReadTime.Microseconds())/1000.0,
 			float64(r.P99IndexDecodeTime.Microseconds())/1000.0,
-			float64(r.P99IndexFilterTime.Microseconds())/1000.0,
 			float64(r.P99IndexIntersectTime.Microseconds())/1000.0,
 			r.BucketsTouched,
 			r.IndexMatches,
@@ -1418,10 +1426,9 @@ func outputCSV(results []BenchmarkResult) {
 			r.EventsReturned,
 			r.EventsScanned,
 			formatBytes(r.EventBytes),
+			r.GroupsDecompressed,
 			r.P99TotalAllocBytes,
 			r.P99HeapInUseBytes,
-			r.P99IOBlocksRead,
-			r.P99IOBlocksWritten,
 			r.Iterations,
 			r.Error,
 		)
@@ -1444,7 +1451,6 @@ func outputJSON(results []BenchmarkResult) {
 		P99IndexMs       float64 `json:"p99_idx_ms"`
 		IdxReadMs        float64 `json:"idx_read_ms"`
 		IdxDecodeMs      float64 `json:"idx_decode_ms"`
-		IdxFilterMs      float64 `json:"idx_filter_ms"`
 		IdxIntersectMs   float64 `json:"idx_intersect_ms"`
 		BucketsTouched   int     `json:"buckets_touched"`
 		IndexMatches     int     `json:"index_matches"`
@@ -1457,17 +1463,16 @@ func outputJSON(results []BenchmarkResult) {
 		EvtFetchMs        float64 `json:"evt_fetch_ms"`
 		EvtDecodeMs       float64 `json:"evt_decode_ms"`
 		EvtFilterMs       float64 `json:"evt_filter_ms"`
-		EvtDecompressMs   float64 `json:"evt_decompress_ms"`
-		EvtDiskReadMs     float64 `json:"evt_disk_read_ms"`
-		EventsReturned    int     `json:"events_returned"`
-		EventsScanned     int     `json:"events_scanned"`
-		EventBytes        string  `json:"event_bytes"`
+		EvtDecompressMs    float64 `json:"evt_decompress_ms"`
+		EvtDiskReadMs      float64 `json:"evt_disk_read_ms"`
+		EventsReturned     int     `json:"events_returned"`
+		EventsScanned      int     `json:"events_scanned"`
+		EventBytes         string  `json:"event_bytes"`
+		GroupsDecompressed int     `json:"groups_decompressed"`
 
 		// Resource stats
 		TotalAllocBytes uint64 `json:"total_alloc_bytes,omitempty"`
 		HeapInUseBytes  uint64 `json:"heap_inuse_bytes,omitempty"`
-		IOBlocksRead    int64  `json:"io_blocks_read,omitempty"`
-		IOBlocksWritten int64  `json:"io_blocks_written,omitempty"`
 
 		// Test config
 		Iterations int    `json:"iterations"`
@@ -1486,7 +1491,6 @@ func outputJSON(results []BenchmarkResult) {
 			P99IndexMs:       float64(r.P99IndexTime.Microseconds()) / 1000.0,
 			IdxReadMs:        float64(r.P99IndexReadTime.Microseconds()) / 1000.0,
 			IdxDecodeMs:      float64(r.P99IndexDecodeTime.Microseconds()) / 1000.0,
-			IdxFilterMs:      float64(r.P99IndexFilterTime.Microseconds()) / 1000.0,
 			IdxIntersectMs:   float64(r.P99IndexIntersectTime.Microseconds()) / 1000.0,
 			BucketsTouched:   r.BucketsTouched,
 			IndexMatches:     r.IndexMatches,
@@ -1497,17 +1501,16 @@ func outputJSON(results []BenchmarkResult) {
 			EvtFetchMs:       float64(r.P99EventFetchTime.Microseconds()) / 1000.0,
 			EvtDecodeMs:      float64(r.P99EventDecodeTime.Microseconds()) / 1000.0,
 			EvtFilterMs:      float64(r.P99EventFilterTime.Microseconds()) / 1000.0,
-			EvtDecompressMs:  float64(r.P99EventDecompressTime.Microseconds()) / 1000.0,
-			EvtDiskReadMs:    float64(r.P99EventDiskReadTime.Microseconds()) / 1000.0,
-			EventsReturned:   r.EventsReturned,
-			EventsScanned:    r.EventsScanned,
-			EventBytes:       formatBytes(r.EventBytes),
-			TotalAllocBytes:  r.P99TotalAllocBytes,
-			HeapInUseBytes:   r.P99HeapInUseBytes,
-			IOBlocksRead:     r.P99IOBlocksRead,
-			IOBlocksWritten:  r.P99IOBlocksWritten,
-			Iterations:       r.Iterations,
-			Error:            r.Error,
+			EvtDecompressMs:    float64(r.P99EventDecompressTime.Microseconds()) / 1000.0,
+			EvtDiskReadMs:      float64(r.P99EventDiskReadTime.Microseconds()) / 1000.0,
+			EventsReturned:     r.EventsReturned,
+			EventsScanned:      r.EventsScanned,
+			EventBytes:         formatBytes(r.EventBytes),
+			GroupsDecompressed: r.GroupsDecompressed,
+			TotalAllocBytes:    r.P99TotalAllocBytes,
+			HeapInUseBytes:     r.P99HeapInUseBytes,
+			Iterations:         r.Iterations,
+			Error:              r.Error,
 		}
 		jsonResults = append(jsonResults, jr)
 	}
@@ -1537,7 +1540,6 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			P99IndexMs       float64 `json:"p99_idx_ms"`
 			IdxReadMs        float64 `json:"idx_read_ms"`
 			IdxDecodeMs      float64 `json:"idx_decode_ms"`
-			IdxFilterMs      float64 `json:"idx_filter_ms"`
 			IdxIntersectMs   float64 `json:"idx_intersect_ms"`
 			BucketsTouched   int     `json:"buckets_touched"`
 			IndexMatches     int     `json:"index_matches"`
@@ -1550,17 +1552,16 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			EvtFetchMs      float64 `json:"evt_fetch_ms"`
 			EvtDecodeMs     float64 `json:"evt_decode_ms"`
 			EvtFilterMs     float64 `json:"evt_filter_ms"`
-			EvtDecompressMs float64 `json:"evt_decompress_ms"`
-			EvtDiskReadMs   float64 `json:"evt_disk_read_ms"`
-			EventsReturned  int     `json:"events_returned"`
-			EventsScanned   int     `json:"events_scanned"`
-			EventBytes      string  `json:"event_bytes"`
+			EvtDecompressMs    float64 `json:"evt_decompress_ms"`
+			EvtDiskReadMs      float64 `json:"evt_disk_read_ms"`
+			EventsReturned     int     `json:"events_returned"`
+			EventsScanned      int     `json:"events_scanned"`
+			EventBytes         string  `json:"event_bytes"`
+			GroupsDecompressed int     `json:"groups_decompressed"`
 
 			// Resource stats
 			TotalAllocBytes uint64 `json:"total_alloc_bytes,omitempty"`
 			HeapInUseBytes  uint64 `json:"heap_inuse_bytes,omitempty"`
-			IOBlocksRead    int64  `json:"io_blocks_read,omitempty"`
-			IOBlocksWritten int64  `json:"io_blocks_written,omitempty"`
 
 			// Test config
 			Iterations int    `json:"iterations"`
@@ -1577,7 +1578,6 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			P99IndexMs:       float64(r.P99IndexTime.Microseconds()) / 1000.0,
 			IdxReadMs:        float64(r.P99IndexReadTime.Microseconds()) / 1000.0,
 			IdxDecodeMs:      float64(r.P99IndexDecodeTime.Microseconds()) / 1000.0,
-			IdxFilterMs:      float64(r.P99IndexFilterTime.Microseconds()) / 1000.0,
 			IdxIntersectMs:   float64(r.P99IndexIntersectTime.Microseconds()) / 1000.0,
 			BucketsTouched:   r.BucketsTouched,
 			IndexMatches:     r.IndexMatches,
@@ -1588,17 +1588,16 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			EvtFetchMs:       float64(r.P99EventFetchTime.Microseconds()) / 1000.0,
 			EvtDecodeMs:      float64(r.P99EventDecodeTime.Microseconds()) / 1000.0,
 			EvtFilterMs:      float64(r.P99EventFilterTime.Microseconds()) / 1000.0,
-			EvtDecompressMs:  float64(r.P99EventDecompressTime.Microseconds()) / 1000.0,
-			EvtDiskReadMs:    float64(r.P99EventDiskReadTime.Microseconds()) / 1000.0,
-			EventsReturned:   r.EventsReturned,
-			EventsScanned:    r.EventsScanned,
-			EventBytes:       formatBytes(r.EventBytes),
-			TotalAllocBytes:  r.P99TotalAllocBytes,
-			HeapInUseBytes:   r.P99HeapInUseBytes,
-			IOBlocksRead:     r.P99IOBlocksRead,
-			IOBlocksWritten:  r.P99IOBlocksWritten,
-			Iterations:       r.Iterations,
-			Error:            r.Error,
+			EvtDecompressMs:    float64(r.P99EventDecompressTime.Microseconds()) / 1000.0,
+			EvtDiskReadMs:      float64(r.P99EventDiskReadTime.Microseconds()) / 1000.0,
+			EventsReturned:     r.EventsReturned,
+			EventsScanned:      r.EventsScanned,
+			EventBytes:         formatBytes(r.EventBytes),
+			GroupsDecompressed: r.GroupsDecompressed,
+			TotalAllocBytes:    r.P99TotalAllocBytes,
+			HeapInUseBytes:     r.P99HeapInUseBytes,
+			Iterations:         r.Iterations,
+			Error:              r.Error,
 		}
 		line, _ := json.Marshal(jr)
 		fmt.Fprintln(w, string(line))
@@ -1616,7 +1615,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 				topics[i] = "-"
 			}
 		}
-		fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%d,%d,%d,%s\n",
+		fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%d,%d,%s\n",
 			r.Query.Name,
 			contractID,
 			topics[0], topics[1], topics[2], topics[3],
@@ -1628,7 +1627,6 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			float64(r.P99IndexTime.Microseconds())/1000.0,
 			float64(r.P99IndexReadTime.Microseconds())/1000.0,
 			float64(r.P99IndexDecodeTime.Microseconds())/1000.0,
-			float64(r.P99IndexFilterTime.Microseconds())/1000.0,
 			float64(r.P99IndexIntersectTime.Microseconds())/1000.0,
 			r.BucketsTouched,
 			r.IndexMatches,
@@ -1644,10 +1642,9 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			r.EventsReturned,
 			r.EventsScanned,
 			formatBytes(r.EventBytes),
+			r.GroupsDecompressed,
 			r.P99TotalAllocBytes,
 			r.P99HeapInUseBytes,
-			r.P99IOBlocksRead,
-			r.P99IOBlocksWritten,
 			r.Iterations,
 			r.Error,
 		)

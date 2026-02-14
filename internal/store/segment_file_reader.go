@@ -99,26 +99,29 @@ func (r *SegmentFileReader) QueryEvents(contractID []byte, topicGroups [4][][]by
 		}
 	}
 
-	// Intersect per-segment bitmaps, trim to ledger range
+	// Intersect per-segment bitmaps
 	intersectStart := time.Now()
-	perSegment := make(map[uint32]*roaring.Bitmap)
+	intersected := make(map[uint32]*roaring.Bitmap)
 	for segID, sb := range allSegments {
 		if len(sb.bitmaps) < expectedTerms {
 			continue
 		}
-		intersected := roaring.FastAnd(sb.bitmaps...)
-		if intersected.IsEmpty() {
-			continue
+		bm := roaring.FastAnd(sb.bitmaps...)
+		if !bm.IsEmpty() {
+			intersected[segID] = bm
 		}
+	}
+	result.IndexIntersectTime = time.Since(intersectStart)
 
-		// Trim to ledger range
-		trimmed := r.trimToLedgerRange(segID, intersected, startLedger, endLedger)
+	// Trim to ledger range (separate from intersect to match bitmap32 measurement)
+	perSegment := make(map[uint32]*roaring.Bitmap)
+	for segID, bm := range intersected {
+		trimmed := r.trimToLedgerRange(segID, bm, startLedger, endLedger)
 		if trimmed != nil && !trimmed.IsEmpty() {
 			perSegment[segID] = trimmed
 			result.MatchingLocalIDs += int(trimmed.GetCardinality())
 		}
 	}
-	result.IndexIntersectTime = time.Since(intersectStart)
 	result.IndexLookupTime = time.Since(indexStart)
 
 	if result.MatchingLocalIDs == 0 {
@@ -212,9 +215,9 @@ func (r *SegmentFileReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGr
 		}
 	}
 
-	// For each segment: OR within each group, then AND across groups, trim to range
+	// For each segment: OR within each group, then AND across groups
 	intersectStart := time.Now()
-	perSegment := make(map[uint32]*roaring.Bitmap)
+	intersectedMap := make(map[uint32]*roaring.Bitmap)
 	for segID := range allSegIDs {
 		var groupUnions []*roaring.Bitmap
 
@@ -236,17 +239,21 @@ func (r *SegmentFileReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGr
 		}
 
 		intersected := roaring.FastAnd(groupUnions...)
-		if intersected.IsEmpty() {
-			continue
+		if !intersected.IsEmpty() {
+			intersectedMap[segID] = intersected
 		}
+	}
+	result.IndexIntersectTime = time.Since(intersectStart)
 
-		trimmed := r.trimToLedgerRange(segID, intersected, startLedger, endLedger)
+	// Trim to ledger range
+	perSegment := make(map[uint32]*roaring.Bitmap)
+	for segID, bm := range intersectedMap {
+		trimmed := r.trimToLedgerRange(segID, bm, startLedger, endLedger)
 		if trimmed != nil && !trimmed.IsEmpty() {
 			perSegment[segID] = trimmed
 			result.MatchingLocalIDs += int(trimmed.GetCardinality())
 		}
 	}
-	result.IndexIntersectTime = time.Since(intersectStart)
 	result.IndexLookupTime = time.Since(indexStart)
 
 	if result.MatchingLocalIDs == 0 {
@@ -650,22 +657,26 @@ func (r *SegmentFileReader) QueryEventsFromVolume(contractID []byte, topicGroups
 	}
 
 	intersectStart := time.Now()
-	perSegment := make(map[uint32]*roaring.Bitmap)
+	intersected := make(map[uint32]*roaring.Bitmap)
 	for segID, sb := range allSegments {
 		if len(sb.bitmaps) < expectedTerms {
 			continue
 		}
-		intersected := roaring.FastAnd(sb.bitmaps...)
-		if intersected.IsEmpty() {
-			continue
+		bm := roaring.FastAnd(sb.bitmaps...)
+		if !bm.IsEmpty() {
+			intersected[segID] = bm
 		}
-		trimmed := r.trimToLedgerRange(segID, intersected, startLedger, endLedger)
+	}
+	result.IndexIntersectTime = time.Since(intersectStart)
+
+	perSegment := make(map[uint32]*roaring.Bitmap)
+	for segID, bm := range intersected {
+		trimmed := r.trimToLedgerRange(segID, bm, startLedger, endLedger)
 		if trimmed != nil && !trimmed.IsEmpty() {
 			perSegment[segID] = trimmed
 			result.MatchingLocalIDs += int(trimmed.GetCardinality())
 		}
 	}
-	result.IndexIntersectTime = time.Since(intersectStart)
 	result.IndexLookupTime = time.Since(indexStart)
 
 	if result.MatchingLocalIDs == 0 {
@@ -754,7 +765,7 @@ func (r *SegmentFileReader) QueryEventsFromVolumeMultiFilter(contractIDs [][]byt
 	}
 
 	intersectStart := time.Now()
-	perSegment := make(map[uint32]*roaring.Bitmap)
+	intersectedMap := make(map[uint32]*roaring.Bitmap)
 	for segID := range allSegIDs {
 		var groupUnions []*roaring.Bitmap
 		for _, g := range groups {
@@ -773,16 +784,20 @@ func (r *SegmentFileReader) QueryEventsFromVolumeMultiFilter(contractIDs [][]byt
 			continue
 		}
 		intersected := roaring.FastAnd(groupUnions...)
-		if intersected.IsEmpty() {
-			continue
+		if !intersected.IsEmpty() {
+			intersectedMap[segID] = intersected
 		}
-		trimmed := r.trimToLedgerRange(segID, intersected, startLedger, endLedger)
+	}
+	result.IndexIntersectTime = time.Since(intersectStart)
+
+	perSegment := make(map[uint32]*roaring.Bitmap)
+	for segID, bm := range intersectedMap {
+		trimmed := r.trimToLedgerRange(segID, bm, startLedger, endLedger)
 		if trimmed != nil && !trimmed.IsEmpty() {
 			perSegment[segID] = trimmed
 			result.MatchingLocalIDs += int(trimmed.GetCardinality())
 		}
 	}
-	result.IndexIntersectTime = time.Since(intersectStart)
 	result.IndexLookupTime = time.Since(indexStart)
 
 	if result.MatchingLocalIDs == 0 {
@@ -866,6 +881,7 @@ func (r *SegmentFileReader) GetEventsInRange(startLedger, endLedger uint32, limi
 		if volTiming != nil {
 			result.DecompressTime += volTiming.DecompressTime
 			result.EventDiskReadTime += volTiming.DiskReadTime
+			result.GroupsDecompressed += volTiming.GroupsDecompressed
 		}
 
 		// Decode events
@@ -955,6 +971,7 @@ func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring
 		if volTiming != nil {
 			result.DecompressTime += volTiming.DecompressTime
 			result.EventDiskReadTime += volTiming.DiskReadTime
+			result.GroupsDecompressed += volTiming.GroupsDecompressed
 		}
 
 		// Decode events
@@ -1003,8 +1020,9 @@ func SegmentFileToUnified(r *Bitmap32EventQueryResult) *UnifiedQueryResult {
 		EventBytesRead:    r.EventBytesRead,
 		IndexLookupTime:   r.IndexLookupTime,
 		EventFetchTime:    r.EventFetchTime,
-		DecompressTime:    r.DecompressTime,
-		EventDiskReadTime: r.EventDiskReadTime,
+		DecompressTime:     r.DecompressTime,
+		EventDiskReadTime:  r.EventDiskReadTime,
+		GroupsDecompressed: r.GroupsDecompressed,
 		DecodeTime:        r.DecodeTime,
 		FilterTime:        r.FilterTime,
 		TotalTime:         r.TotalTime,
@@ -1025,8 +1043,9 @@ func SegmentVolumeToUnified(r *Bitmap32EventQueryResult) *UnifiedQueryResult {
 		EventBytesRead:    r.EventBytesRead,
 		IndexLookupTime:   r.IndexLookupTime,
 		EventFetchTime:    r.EventFetchTime,
-		DecompressTime:    r.DecompressTime,
-		EventDiskReadTime: r.EventDiskReadTime,
+		DecompressTime:     r.DecompressTime,
+		EventDiskReadTime:  r.EventDiskReadTime,
+		GroupsDecompressed: r.GroupsDecompressed,
 		DecodeTime:        r.DecodeTime,
 		FilterTime:        r.FilterTime,
 		TotalTime:         r.TotalTime,

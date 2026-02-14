@@ -13,8 +13,9 @@ import (
 
 // VolumeReadTiming holds timing breakdown for event volume read operations.
 type VolumeReadTiming struct {
-	DiskReadTime   time.Duration
-	DecompressTime time.Duration
+	DiskReadTime       time.Duration
+	DecompressTime     time.Duration
+	GroupsDecompressed int // Number of group blocks decompressed
 }
 
 // =============================================================================
@@ -792,6 +793,7 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 			if err != nil {
 				continue
 			}
+			timing.GroupsDecompressed++
 
 			// Compute how many events are in this group (last group may be partial)
 			eventsInGroup := hdr.groupSize

@@ -324,9 +324,10 @@ type UnifiedQueryResult struct {
 	// Timing breakdown
 	IndexLookupTime   time.Duration // Time querying index
 	EventFetchTime    time.Duration // Time fetching events from storage
-	DecompressTime    time.Duration // Time decompressing event blobs
-	EventDiskReadTime time.Duration // Time on event disk I/O (separate from decompress)
-	DecodeTime        time.Duration // Time decoding/unmarshalling events
+	DecompressTime     time.Duration // Time decompressing event blobs
+	EventDiskReadTime  time.Duration // Time on event disk I/O (separate from decompress)
+	GroupsDecompressed int           // Number of group blocks decompressed
+	DecodeTime         time.Duration // Time decoding/unmarshalling events
 	FilterTime        time.Duration // Time filtering events (post-fetch)
 	TotalTime         time.Duration // Total query time
 }

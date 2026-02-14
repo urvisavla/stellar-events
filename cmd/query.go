@@ -605,6 +605,10 @@ func printUnifiedResult(r *store.UnifiedQueryResult) {
 	fmt.Fprintf(os.Stderr, "  Events scanned:    %d\n", r.EventsScanned)
 	fmt.Fprintf(os.Stderr, "  Events returned:   %d\n", r.EventsReturned)
 
+	if r.GroupsDecompressed > 0 {
+		fmt.Fprintf(os.Stderr, "  Groups decompressed: %d\n", r.GroupsDecompressed)
+	}
+
 	fmt.Fprintf(os.Stderr, "\n=== I/O Stats ===\n")
 	fmt.Fprintf(os.Stderr, "  Index bytes read:  %s\n", formatBytes(r.IndexBytesRead))
 	fmt.Fprintf(os.Stderr, "  Event bytes read:  %s\n", formatBytes(r.EventBytesRead))
