@@ -715,6 +715,9 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 
 	result := make(map[uint32][]byte, len(sorted))
 
+	fmt.Fprintf(os.Stderr, "  [ReadEventsFromVolume] chunk=%d eventCount=%d grouped=%v groupSize=%d compressed=%v dict=%v requested=%d\n",
+		chunkID, hdr.eventCount, hdr.grouped, hdr.groupSize, hdr.compressed, hdr.dictCompressed, len(denseIDs))
+
 	// Grouped compression: batch by group to decompress each group only once
 	if hdr.grouped && hdr.groupSize > 1 {
 		// Group denseIDs by their group index
@@ -768,10 +771,29 @@ func ReadEventsFromVolume(basePath string, chunkID uint32, denseIDs []uint32) (m
 			}
 
 			// Extract each requested event from the decompressed group
+			extractFailed := false
 			for _, denseID := range groupedIDs[gIdx] {
 				posInGroup := denseID % hdr.groupSize
 				eventData, err := extractEventFromGroup(decompressed, posInGroup, eventsInGroup)
 				if err != nil {
+					if !extractFailed {
+						extractFailed = true
+						// Dump first 64 bytes of decompressed group + first 4 "offsets"
+						hexLen := 64
+						if hexLen > len(decompressed) {
+							hexLen = len(decompressed)
+						}
+						fmt.Fprintf(os.Stderr, "  [ReadEventsFromVolume] FIRST extract fail in group: chunk=%d gIdx=%d eventsInGroup=%d decompLen=%d compressedLen=%d\n",
+							chunkID, gIdx, eventsInGroup, len(decompressed), endOff-startOff)
+						fmt.Fprintf(os.Stderr, "    first %d bytes of decompressed: %x\n", hexLen, decompressed[:hexLen])
+						// Read what should be offset[0] and offset[1]
+						if len(decompressed) >= 8 {
+							off0 := binary.LittleEndian.Uint32(decompressed[0:4])
+							off1 := binary.LittleEndian.Uint32(decompressed[4:8])
+							fmt.Fprintf(os.Stderr, "    offset[0]=%d offset[1]=%d (expected offset[0] ~ %d for %d events)\n",
+								off0, off1, eventsInGroup*4, eventsInGroup)
+						}
+					}
 					continue
 				}
 				result[denseID] = eventData
