@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -16,19 +15,48 @@ import (
 )
 
 // SegmentFileReader reads flat file indexes (.idx/.pack) for queries.
-// Events are still fetched from RocksDB.
-// Relies on the OS page cache for repeated file reads rather than application-level caching.
+// Uses mmap to avoid repeated syscalls; mapped files are cached for reuse.
 type SegmentFileReader struct {
 	basePath string
 	es       *RocksDBEventStore
+
+	mu        sync.Mutex
+	mmapCache map[string]*MmapFile // path -> mmap'd file, reused across queries
 }
 
 // NewSegmentFileReader creates a new reader for segment flat file indexes.
 func NewSegmentFileReader(basePath string, es *RocksDBEventStore) *SegmentFileReader {
 	return &SegmentFileReader{
-		basePath: basePath,
-		es:       es,
+		basePath:  basePath,
+		es:        es,
+		mmapCache: make(map[string]*MmapFile),
 	}
+}
+
+// Close releases all mmap'd files held by this reader.
+func (r *SegmentFileReader) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, mm := range r.mmapCache {
+		mm.Close()
+	}
+	r.mmapCache = nil
+	return nil
+}
+
+// getMmap returns a cached mmap for the given path, opening it on first access.
+func (r *SegmentFileReader) getMmap(path string) (*MmapFile, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if mm, ok := r.mmapCache[path]; ok {
+		return mm, nil
+	}
+	mm, err := OpenMmap(path)
+	if err != nil {
+		return nil, err
+	}
+	r.mmapCache[path] = mm
+	return mm, nil
 }
 
 // QueryEvents queries events using flat file segment indexes (single-value per filter).
@@ -269,27 +297,27 @@ func (r *SegmentFileReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGr
 	return result, events, nil
 }
 
-// loadLedgerMapFromFile reads a ledger map from segment flat files (no caching).
+// loadLedgerMapFromFile reads a ledger map from segment flat files via mmap cache.
 func (r *SegmentFileReader) loadLedgerMapFromFile(segmentID uint32) (*BucketLedgerMap, error) {
 	dirName := fmt.Sprintf("%06d", segmentID)
 	path := filepath.Join(r.basePath, dirName, LedgerMapFileName)
 
-	data, err := os.ReadFile(path)
+	mm, err := r.getMmap(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read ledger map: %w", err)
+		return nil, fmt.Errorf("failed to mmap ledger map: %w", err)
 	}
 
-	if len(data) != BucketLedgerMapSize {
-		return nil, fmt.Errorf("invalid ledger map size: got %d, expected %d", len(data), BucketLedgerMapSize)
+	if mm.Len() != BucketLedgerMapSize {
+		return nil, fmt.Errorf("invalid ledger map size: got %d, expected %d", mm.Len(), BucketLedgerMapSize)
 	}
 
-	return &BucketLedgerMap{BucketID: segmentID, Data: data}, nil
+	// Data points directly into the mmap region (zero-copy).
+	return &BucketLedgerMap{BucketID: segmentID, Data: mm.data}, nil
 }
 
-// loadBitmapFromFile loads a bitmap from segment flat files.
+// loadBitmapFromFile loads a bitmap from segment flat files via mmap cache.
 // For contracts: reads contracts.idx/.pack
 // For topics: reads topic{pos}.idx/.pack, falls back to topics.idx/.pack
-// Relies on OS page cache for repeated reads.
 func (r *SegmentFileReader) loadBitmapFromFile(segmentID uint32, isContract bool, termKey [16]byte, pos int) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
 	dirName := fmt.Sprintf("%06d", segmentID)
 	dirPath := filepath.Join(r.basePath, dirName)
@@ -306,17 +334,22 @@ func (r *SegmentFileReader) loadBitmapFromFile(segmentID uint32, isContract bool
 
 	// Try per-position file first; fall back to combined topics
 	readStart := time.Now()
-	idxFile, err := OpenIndexFile(idxPath)
-	readTime := time.Since(readStart)
+	var idxFile *IndexFile
+	idxMm, err := r.getMmap(idxPath)
+	if err == nil {
+		idxFile, err = OpenIndexFileMmap(idxMm)
+	}
 	if err != nil && !isContract {
 		// Fall back to combined topics.idx
 		idxName = "topics"
 		idxPath = filepath.Join(dirPath, idxName+".idx")
 		packPath = filepath.Join(dirPath, idxName+".pack")
-		fallbackStart := time.Now()
-		idxFile, err = OpenIndexFile(idxPath)
-		readTime += time.Since(fallbackStart)
+		idxMm, err = r.getMmap(idxPath)
+		if err == nil {
+			idxFile, err = OpenIndexFileMmap(idxMm)
+		}
 	}
+	readTime := time.Since(readStart)
 	if err != nil {
 		return nil, 0, 0, 0, err
 	}
@@ -327,20 +360,23 @@ func (r *SegmentFileReader) loadBitmapFromFile(segmentID uint32, isContract bool
 		return nil, 0, readTime, 0, nil
 	}
 
-	// Read bitmap data from pack file (targeted read, OS caches pages)
+	// Read bitmap data from pack file (zero-copy slice from mmap)
 	packStart := time.Now()
-	data, err := ReadBitmapFromPack(packPath, entry.PackOffset, entry.PackLength)
+	packMm, err := r.getMmap(packPath)
+	if err != nil {
+		return nil, 0, readTime, 0, err
+	}
+	data, err := ReadBitmapFromPackMmap(packMm, entry.PackOffset, entry.PackLength)
 	packReadTime := time.Since(packStart)
 	if err != nil {
 		return nil, 0, readTime, 0, err
 	}
 	bytesRead := int64(entry.PackLength)
 
-	// Decode bitmap
+	// Decode bitmap (UnmarshalBinary copies data, safe with read-only mmap)
 	decodeStart := time.Now()
 	bm := roaring.New()
-	_, err = bm.FromBuffer(data)
-	if err != nil {
+	if err = bm.UnmarshalBinary(data); err != nil {
 		return nil, bytesRead, readTime + packReadTime, 0, fmt.Errorf("failed to decode bitmap: %w", err)
 	}
 	decodeTime := time.Since(decodeStart)
@@ -868,9 +904,9 @@ func (r *SegmentFileReader) GetEventsInRange(startLedger, endLedger uint32, limi
 
 		result.MatchingLocalIDs += count
 
-		// Batch read events from volume
+		// Batch read events from volume (via mmap cache)
 		readStart := time.Now()
-		eventBlobs, volTiming, err := ReadEventsFromVolume(r.basePath, segID, denseIDs)
+		eventBlobs, volTiming, err := r.readEventsFromVolumeMmap(segID, denseIDs)
 		readTime := time.Since(readStart)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to read events from volume for segment %d: %w", segID, err)
@@ -958,9 +994,9 @@ func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring
 			return nil, fmt.Errorf("failed to load ledger map for segment %d: %w", segID, err)
 		}
 
-		// Batch read events from volume
+		// Batch read events from volume (via mmap cache)
 		readStart := time.Now()
-		eventBlobs, volTiming, err := ReadEventsFromVolume(r.basePath, segID, denseIDs)
+		eventBlobs, volTiming, err := r.readEventsFromVolumeMmap(segID, denseIDs)
 		readTime := time.Since(readStart)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read events from volume for segment %d: %w", segID, err)
@@ -1003,6 +1039,41 @@ func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring
 
 	result.EventsReturned = len(events)
 	return events, nil
+}
+
+// readEventsFromVolumeMmap reads events from mmap'd volume files via the cache.
+func (r *SegmentFileReader) readEventsFromVolumeMmap(segID uint32, denseIDs []uint32) (map[uint32][]byte, *VolumeReadTiming, error) {
+	dirName := fmt.Sprintf("%06d", segID)
+	dirPath := filepath.Join(r.basePath, dirName)
+
+	offsetsPath := filepath.Join(dirPath, EventOffsetsFileName)
+	eventsPath := filepath.Join(dirPath, EventsFileName)
+
+	offsetsMm, err := r.getMmap(offsetsPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to mmap event_offsets.dat: %w", err)
+	}
+	eventsMm, err := r.getMmap(eventsPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to mmap events.dat: %w", err)
+	}
+
+	hdr, err := parseOffsetsHeaderMmap(offsetsMm)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Load dictionary for dict-compressed volumes
+	var dictMm *MmapFile
+	if hdr.dictCompressed {
+		dictPath := filepath.Join(dirPath, EventsDictFileName)
+		dictMm, err = r.getMmap(dictPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to mmap events.dict: %w", err)
+		}
+	}
+
+	return ReadEventsFromVolumeMmap(offsetsMm, eventsMm, hdr, dictMm, denseIDs)
 }
 
 // SegmentFileToUnified converts a Bitmap32EventQueryResult from segment-file queries to UnifiedQueryResult.

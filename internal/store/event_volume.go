@@ -886,3 +886,166 @@ func EventVolumeExists(basePath string, chunkID uint32) bool {
 	_, err := os.Stat(offsetsPath)
 	return err == nil
 }
+
+// =============================================================================
+// Mmap Read Path
+// =============================================================================
+
+// parseOffsetsHeaderMmap parses an event_offsets.dat header from mmap'd data.
+func parseOffsetsHeaderMmap(mm *MmapFile) (*eventVolumeHeader, error) {
+	if mm.Len() < EventOffsetsHeaderSize {
+		return nil, fmt.Errorf("offsets file too small: %d bytes", mm.Len())
+	}
+	headerBuf := mm.data[:EventOffsetsHeaderSize]
+
+	if string(headerBuf[0:4]) == EventOffsetsMagic {
+		flags := headerBuf[10]
+		grouped := flags&EventVolumeFlagGrouped != 0
+		var groupSize uint32
+		if grouped {
+			groupSize = uint32(headerBuf[11])
+			if groupSize == 0 {
+				groupSize = 1
+			}
+		}
+		eventCount := binary.LittleEndian.Uint32(headerBuf[6:10])
+		return &eventVolumeHeader{
+			dataStart:      EventOffsetsHeaderSize,
+			compressed:     flags&EventVolumeFlagZstd != 0,
+			dictCompressed: flags&EventVolumeFlagZstdDict != 0,
+			grouped:        grouped,
+			groupSize:      groupSize,
+			eventCount:     eventCount,
+		}, nil
+	}
+
+	// V1 legacy format (no header)
+	return &eventVolumeHeader{dataStart: 0, compressed: false}, nil
+}
+
+// ReadEventsFromVolumeMmap reads multiple events from mmap'd volume files.
+// Zero-copy where possible: slices point directly into the mmap regions.
+// Compressed data is decompressed into new allocations.
+// dictMm is the mmap'd dictionary file (nil if not dict-compressed).
+func ReadEventsFromVolumeMmap(offsetsMm, eventsMm *MmapFile, hdr *eventVolumeHeader, dictMm *MmapFile, denseIDs []uint32) (map[uint32][]byte, *VolumeReadTiming, error) {
+	timing := &VolumeReadTiming{}
+
+	if len(denseIDs) == 0 {
+		return nil, timing, nil
+	}
+
+	offsetsData := offsetsMm.data
+	eventsData := eventsMm.data
+
+	// Sort for sequential access
+	sorted := make([]uint32, len(denseIDs))
+	copy(sorted, denseIDs)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	result := make(map[uint32][]byte, len(sorted))
+
+	// Grouped compression: batch by group to decompress each group only once
+	if hdr.grouped && hdr.groupSize > 1 {
+		groupedIDs := make(map[uint32][]uint32)
+		for _, denseID := range sorted {
+			gIdx := denseID / hdr.groupSize
+			groupedIDs[gIdx] = append(groupedIDs[gIdx], denseID)
+		}
+
+		groupIndices := make([]uint32, 0, len(groupedIDs))
+		for gIdx := range groupedIDs {
+			groupIndices = append(groupIndices, gIdx)
+		}
+		sort.Slice(groupIndices, func(i, j int) bool { return groupIndices[i] < groupIndices[j] })
+
+		for _, gIdx := range groupIndices {
+			// Read two consecutive offsets from mmap
+			offPos := int(hdr.dataStart) + int(gIdx)*OffsetEntrySize
+			if offPos+8 > len(offsetsData) {
+				continue
+			}
+			startOff := binary.LittleEndian.Uint32(offsetsData[offPos : offPos+4])
+			endOff := binary.LittleEndian.Uint32(offsetsData[offPos+4 : offPos+8])
+			if endOff <= startOff || int(endOff) > len(eventsData) {
+				continue
+			}
+
+			// Slice compressed group data directly from mmap (zero-copy)
+			groupData := eventsData[startOff:endOff]
+
+			// Decompress group
+			decompStart := time.Now()
+			decompressed, err := zstdDecoder.DecodeAll(groupData, nil)
+			timing.DecompressTime += time.Since(decompStart)
+			if err != nil {
+				continue
+			}
+			timing.GroupsDecompressed++
+
+			eventsInGroup := hdr.groupSize
+			if remaining := hdr.eventCount - gIdx*hdr.groupSize; remaining < hdr.groupSize {
+				eventsInGroup = remaining
+			}
+
+			for _, denseID := range groupedIDs[gIdx] {
+				posInGroup := denseID % hdr.groupSize
+				eventData, err := extractEventFromGroup(decompressed, posInGroup, eventsInGroup)
+				if err != nil {
+					continue
+				}
+				result[denseID] = eventData
+			}
+		}
+
+		return result, timing, nil
+	}
+
+	// Load dictionary decoder if dict-compressed
+	var dictDecoder *DDict
+	if hdr.dictCompressed && dictMm != nil && dictMm.Len() > 0 {
+		var err error
+		dictDecoder, err = newDDict(dictMm.data)
+		if err != nil {
+			return nil, timing, fmt.Errorf("failed to create DDict: %w", err)
+		}
+		defer dictDecoder.Close()
+	}
+
+	// Per-event reads from mmap
+	for _, denseID := range sorted {
+		offPos := int(hdr.dataStart) + int(denseID)*OffsetEntrySize
+		if offPos+8 > len(offsetsData) {
+			continue
+		}
+		startOff := binary.LittleEndian.Uint32(offsetsData[offPos : offPos+4])
+		endOff := binary.LittleEndian.Uint32(offsetsData[offPos+4 : offPos+8])
+		if endOff <= startOff || int(endOff) > len(eventsData) {
+			continue
+		}
+
+		// Zero-copy slice from mmap
+		data := eventsData[startOff:endOff]
+
+		if hdr.dictCompressed && dictDecoder != nil {
+			decompStart := time.Now()
+			decompressed, err := dictDecoder.Decompress(data)
+			timing.DecompressTime += time.Since(decompStart)
+			if err != nil {
+				continue
+			}
+			data = decompressed
+		} else if hdr.compressed {
+			decompStart := time.Now()
+			decompressed, err := zstdDecoder.DecodeAll(data, nil)
+			timing.DecompressTime += time.Since(decompStart)
+			if err != nil {
+				continue
+			}
+			data = decompressed
+		}
+
+		result[denseID] = data
+	}
+
+	return result, timing, nil
+}

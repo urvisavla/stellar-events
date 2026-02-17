@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"syscall"
 )
 
 // =============================================================================
@@ -266,6 +267,88 @@ func ReadBitmapFromPack(packPath string, offset, length uint32) ([]byte, error) 
 	}
 
 	return data, nil
+}
+
+// =============================================================================
+// Mmap Support
+// =============================================================================
+
+// MmapFile wraps a memory-mapped file region for zero-copy reads.
+type MmapFile struct {
+	data []byte // mmap'd region (nil for empty files)
+}
+
+// OpenMmap memory-maps a file for reading. The returned MmapFile must be
+// closed when no longer needed. Empty files return a valid MmapFile with nil data.
+func OpenMmap(path string) (*MmapFile, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := int(fi.Size())
+	if size == 0 {
+		return &MmapFile{}, nil
+	}
+
+	data, err := syscall.Mmap(int(f.Fd()), 0, size, syscall.PROT_READ, syscall.MAP_PRIVATE)
+	if err != nil {
+		return nil, fmt.Errorf("mmap %s: %w", path, err)
+	}
+	return &MmapFile{data: data}, nil
+}
+
+// Close unmaps the memory-mapped region.
+func (m *MmapFile) Close() error {
+	if m.data != nil {
+		return syscall.Munmap(m.data)
+	}
+	return nil
+}
+
+// Len returns the size of the mapped region.
+func (m *MmapFile) Len() int {
+	return len(m.data)
+}
+
+// OpenIndexFileMmap creates an IndexFile from a memory-mapped .idx file.
+// The IndexFile.data points directly into the mmap region (zero-copy).
+func OpenIndexFileMmap(mm *MmapFile) (*IndexFile, error) {
+	data := mm.data
+	if len(data) < IdxHeaderSize {
+		return nil, fmt.Errorf("index file too small: %d bytes", len(data))
+	}
+
+	if string(data[0:4]) != IdxMagic {
+		return nil, fmt.Errorf("invalid magic: %x", data[0:4])
+	}
+
+	version := binary.BigEndian.Uint16(data[4:6])
+	if version != IdxVersion {
+		return nil, fmt.Errorf("unsupported version: %d", version)
+	}
+
+	entryCount := binary.BigEndian.Uint32(data[6:10])
+	expectedSize := IdxHeaderSize + int(entryCount)*IdxEntrySize
+	if len(data) != expectedSize {
+		return nil, fmt.Errorf("size mismatch: got %d, expected %d (%d entries)", len(data), expectedSize, entryCount)
+	}
+
+	return &IndexFile{data: data, entryCount: entryCount}, nil
+}
+
+// ReadBitmapFromPackMmap returns a zero-copy slice from a mmap'd .pack file.
+func ReadBitmapFromPackMmap(mm *MmapFile, offset, length uint32) ([]byte, error) {
+	end := offset + length
+	if int(end) > len(mm.data) {
+		return nil, fmt.Errorf("pack read out of bounds: offset=%d length=%d fileSize=%d", offset, length, len(mm.data))
+	}
+	return mm.data[offset:end], nil
 }
 
 // ValidateLedgerMapFile validates a ledgermap.dat file by checking its size.

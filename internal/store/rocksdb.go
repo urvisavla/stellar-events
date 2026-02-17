@@ -1287,6 +1287,11 @@ func (es *RocksDBEventStore) Close() {
 		es.eventIndex32Store.Close()
 	}
 
+	// Close segment file reader (releases mmap'd files)
+	if es.segmentFileReader != nil {
+		es.segmentFileReader.Close()
+	}
+
 	// Destroy read/write options first
 	es.wo.Destroy()
 	es.ro.Destroy()
