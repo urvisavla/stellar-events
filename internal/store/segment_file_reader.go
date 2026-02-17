@@ -63,6 +63,11 @@ func (r *SegmentFileReader) QueryEvents(contractID []byte, topicGroups [4][][]by
 			result.IndexReadTime += readTime
 			result.IndexDecodeTime += decodeTime
 			if bm != nil && !bm.IsEmpty() {
+				// Trim to ledger range before intersection (matches bitmap32 behavior)
+				bm = r.trimToLedgerRange(segID, bm, startLedger, endLedger)
+				if bm == nil || bm.IsEmpty() {
+					continue
+				}
 				result.SegmentsScanned++
 				if _, ok := allSegments[segID]; !ok {
 					allSegments[segID] = &segmentBitmaps{}
@@ -89,6 +94,10 @@ func (r *SegmentFileReader) QueryEvents(contractID []byte, topicGroups [4][][]by
 				result.IndexReadTime += readTime
 				result.IndexDecodeTime += decodeTime
 				if bm != nil && !bm.IsEmpty() {
+					bm = r.trimToLedgerRange(segID, bm, startLedger, endLedger)
+					if bm == nil || bm.IsEmpty() {
+						continue
+					}
 					result.SegmentsScanned++
 					if _, ok := allSegments[segID]; !ok {
 						allSegments[segID] = &segmentBitmaps{}
@@ -99,29 +108,20 @@ func (r *SegmentFileReader) QueryEvents(contractID []byte, topicGroups [4][][]by
 		}
 	}
 
-	// Intersect per-segment bitmaps
+	// Intersect per-segment bitmaps (bitmaps already trimmed to ledger range)
 	intersectStart := time.Now()
-	intersected := make(map[uint32]*roaring.Bitmap)
+	perSegment := make(map[uint32]*roaring.Bitmap)
 	for segID, sb := range allSegments {
 		if len(sb.bitmaps) < expectedTerms {
 			continue
 		}
 		bm := roaring.FastAnd(sb.bitmaps...)
 		if !bm.IsEmpty() {
-			intersected[segID] = bm
+			perSegment[segID] = bm
+			result.MatchingLocalIDs += int(bm.GetCardinality())
 		}
 	}
 	result.IndexIntersectTime = time.Since(intersectStart)
-
-	// Trim to ledger range (separate from intersect to match bitmap32 measurement)
-	perSegment := make(map[uint32]*roaring.Bitmap)
-	for segID, bm := range intersected {
-		trimmed := r.trimToLedgerRange(segID, bm, startLedger, endLedger)
-		if trimmed != nil && !trimmed.IsEmpty() {
-			perSegment[segID] = trimmed
-			result.MatchingLocalIDs += int(trimmed.GetCardinality())
-		}
-	}
 	result.IndexLookupTime = time.Since(indexStart)
 
 	if result.MatchingLocalIDs == 0 {
@@ -172,6 +172,10 @@ func (r *SegmentFileReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGr
 				result.IndexReadTime += readTime
 				result.IndexDecodeTime += decodeTime
 				if bm != nil && !bm.IsEmpty() {
+					bm = r.trimToLedgerRange(segID, bm, startLedger, endLedger)
+					if bm == nil || bm.IsEmpty() {
+						continue
+					}
 					result.SegmentsScanned++
 					groups[0].bitmaps[segID] = append(groups[0].bitmaps[segID], bm)
 				}
@@ -200,6 +204,10 @@ func (r *SegmentFileReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGr
 				result.IndexReadTime += readTime
 				result.IndexDecodeTime += decodeTime
 				if bm != nil && !bm.IsEmpty() {
+					bm = r.trimToLedgerRange(segID, bm, startLedger, endLedger)
+					if bm == nil || bm.IsEmpty() {
+						continue
+					}
 					result.SegmentsScanned++
 					groups[groupIdx].bitmaps[segID] = append(groups[groupIdx].bitmaps[segID], bm)
 				}
@@ -215,9 +223,9 @@ func (r *SegmentFileReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGr
 		}
 	}
 
-	// For each segment: OR within each group, then AND across groups
+	// For each segment: OR within each group, then AND across groups (bitmaps already trimmed)
 	intersectStart := time.Now()
-	intersectedMap := make(map[uint32]*roaring.Bitmap)
+	perSegment := make(map[uint32]*roaring.Bitmap)
 	for segID := range allSegIDs {
 		var groupUnions []*roaring.Bitmap
 
@@ -240,20 +248,11 @@ func (r *SegmentFileReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGr
 
 		intersected := roaring.FastAnd(groupUnions...)
 		if !intersected.IsEmpty() {
-			intersectedMap[segID] = intersected
+			perSegment[segID] = intersected
+			result.MatchingLocalIDs += int(intersected.GetCardinality())
 		}
 	}
 	result.IndexIntersectTime = time.Since(intersectStart)
-
-	// Trim to ledger range
-	perSegment := make(map[uint32]*roaring.Bitmap)
-	for segID, bm := range intersectedMap {
-		trimmed := r.trimToLedgerRange(segID, bm, startLedger, endLedger)
-		if trimmed != nil && !trimmed.IsEmpty() {
-			perSegment[segID] = trimmed
-			result.MatchingLocalIDs += int(trimmed.GetCardinality())
-		}
-	}
 	result.IndexLookupTime = time.Since(indexStart)
 
 	if result.MatchingLocalIDs == 0 {
@@ -621,6 +620,10 @@ func (r *SegmentFileReader) QueryEventsFromVolume(contractID []byte, topicGroups
 			result.IndexReadTime += readTime
 			result.IndexDecodeTime += decodeTime
 			if bm != nil && !bm.IsEmpty() {
+				bm = r.trimToLedgerRange(segID, bm, startLedger, endLedger)
+				if bm == nil || bm.IsEmpty() {
+					continue
+				}
 				result.SegmentsScanned++
 				if _, ok := allSegments[segID]; !ok {
 					allSegments[segID] = &segmentBitmaps{}
@@ -646,6 +649,10 @@ func (r *SegmentFileReader) QueryEventsFromVolume(contractID []byte, topicGroups
 				result.IndexReadTime += readTime
 				result.IndexDecodeTime += decodeTime
 				if bm != nil && !bm.IsEmpty() {
+					bm = r.trimToLedgerRange(segID, bm, startLedger, endLedger)
+					if bm == nil || bm.IsEmpty() {
+						continue
+					}
 					result.SegmentsScanned++
 					if _, ok := allSegments[segID]; !ok {
 						allSegments[segID] = &segmentBitmaps{}
@@ -657,26 +664,18 @@ func (r *SegmentFileReader) QueryEventsFromVolume(contractID []byte, topicGroups
 	}
 
 	intersectStart := time.Now()
-	intersected := make(map[uint32]*roaring.Bitmap)
+	perSegment := make(map[uint32]*roaring.Bitmap)
 	for segID, sb := range allSegments {
 		if len(sb.bitmaps) < expectedTerms {
 			continue
 		}
 		bm := roaring.FastAnd(sb.bitmaps...)
 		if !bm.IsEmpty() {
-			intersected[segID] = bm
+			perSegment[segID] = bm
+			result.MatchingLocalIDs += int(bm.GetCardinality())
 		}
 	}
 	result.IndexIntersectTime = time.Since(intersectStart)
-
-	perSegment := make(map[uint32]*roaring.Bitmap)
-	for segID, bm := range intersected {
-		trimmed := r.trimToLedgerRange(segID, bm, startLedger, endLedger)
-		if trimmed != nil && !trimmed.IsEmpty() {
-			perSegment[segID] = trimmed
-			result.MatchingLocalIDs += int(trimmed.GetCardinality())
-		}
-	}
 	result.IndexLookupTime = time.Since(indexStart)
 
 	if result.MatchingLocalIDs == 0 {
@@ -723,6 +722,10 @@ func (r *SegmentFileReader) QueryEventsFromVolumeMultiFilter(contractIDs [][]byt
 				result.IndexReadTime += readTime
 				result.IndexDecodeTime += decodeTime
 				if bm != nil && !bm.IsEmpty() {
+					bm = r.trimToLedgerRange(segID, bm, startLedger, endLedger)
+					if bm == nil || bm.IsEmpty() {
+						continue
+					}
 					result.SegmentsScanned++
 					groups[0].bitmaps[segID] = append(groups[0].bitmaps[segID], bm)
 				}
@@ -750,6 +753,10 @@ func (r *SegmentFileReader) QueryEventsFromVolumeMultiFilter(contractIDs [][]byt
 				result.IndexReadTime += readTime
 				result.IndexDecodeTime += decodeTime
 				if bm != nil && !bm.IsEmpty() {
+					bm = r.trimToLedgerRange(segID, bm, startLedger, endLedger)
+					if bm == nil || bm.IsEmpty() {
+						continue
+					}
 					result.SegmentsScanned++
 					groups[groupIdx].bitmaps[segID] = append(groups[groupIdx].bitmaps[segID], bm)
 				}
@@ -765,7 +772,7 @@ func (r *SegmentFileReader) QueryEventsFromVolumeMultiFilter(contractIDs [][]byt
 	}
 
 	intersectStart := time.Now()
-	intersectedMap := make(map[uint32]*roaring.Bitmap)
+	perSegment := make(map[uint32]*roaring.Bitmap)
 	for segID := range allSegIDs {
 		var groupUnions []*roaring.Bitmap
 		for _, g := range groups {
@@ -785,19 +792,11 @@ func (r *SegmentFileReader) QueryEventsFromVolumeMultiFilter(contractIDs [][]byt
 		}
 		intersected := roaring.FastAnd(groupUnions...)
 		if !intersected.IsEmpty() {
-			intersectedMap[segID] = intersected
+			perSegment[segID] = intersected
+			result.MatchingLocalIDs += int(intersected.GetCardinality())
 		}
 	}
 	result.IndexIntersectTime = time.Since(intersectStart)
-
-	perSegment := make(map[uint32]*roaring.Bitmap)
-	for segID, bm := range intersectedMap {
-		trimmed := r.trimToLedgerRange(segID, bm, startLedger, endLedger)
-		if trimmed != nil && !trimmed.IsEmpty() {
-			perSegment[segID] = trimmed
-			result.MatchingLocalIDs += int(trimmed.GetCardinality())
-		}
-	}
 	result.IndexLookupTime = time.Since(indexStart)
 
 	if result.MatchingLocalIDs == 0 {
