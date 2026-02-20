@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"os/exec"
 	"runtime"
 	"sort"
 	"strings"
@@ -134,6 +135,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 	logFile := fs.String("log", "benchmark.log", "Log file for query details (use 'none' to disable)")
 	outputFile := fs.String("output", "", "Output file for results (writes incrementally; use 'none' to disable)")
 	trackResources := fs.Bool("track-resources", false, "Track memory allocation stats per query (adds ~100µs overhead)")
+	coldCache := fs.Bool("cold", false, "Purge OS page cache before each query iteration (requires sudo)")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: benchmark [options]\n\n")
@@ -295,6 +297,19 @@ func runBenchmark(cfg *config.Config, args []string) {
 	fmt.Fprintf(os.Stderr, "Index types: %v\n", indexes)
 	fmt.Fprintf(os.Stderr, "Ledger range: %d - %d (max per query: %d)\n\n", originalStartLedger, originalEndLedger, maxLedgerRange)
 
+	// Acquire sudo credentials once upfront for cold cache mode
+	if *coldCache {
+		fmt.Fprintf(os.Stderr, "Cold cache mode: acquiring sudo credentials for page cache purge...\n")
+		cmd := exec.Command("sudo", "-v")
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to acquire sudo credentials: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	// Run benchmarks
 	var results []BenchmarkResult
 	totalQueries := len(queries) * len(indexes)
@@ -339,7 +354,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 				StartLedger: queryStart,
 				EndLedger:   queryEnd,
 			}
-			result := runQueryBenchmark(eventStore, queryData, q, idxType, displayName, *iterations, *warmup, *limit, *timeout, *trackResources)
+			result := runQueryBenchmark(eventStore, queryData, q, idxType, displayName, *iterations, *warmup, *limit, *timeout, *trackResources, *coldCache)
 			results = append(results, result)
 
 			// Log query result
@@ -824,7 +839,21 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 // Benchmark Execution
 // =============================================================================
 
-func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData, spec QuerySpec, indexType, displayName string, iterations, warmup, limit int, timeout time.Duration, trackResources bool) BenchmarkResult {
+// purgePageCache drops the OS page cache. Requires privileges.
+// Linux: echo 3 > /proc/sys/vm/drop_caches
+// macOS: purge command
+func purgePageCache() error {
+	if runtime.GOOS == "linux" {
+		cmd := exec.Command("sh", "-c", "sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'")
+		return cmd.Run()
+	} else if runtime.GOOS == "darwin" {
+		cmd := exec.Command("sh", "-c", "sync && sudo purge")
+		return cmd.Run()
+	}
+	return fmt.Errorf("unsupported OS for cache purge: %s", runtime.GOOS)
+}
+
+func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData, spec QuerySpec, indexType, displayName string, iterations, warmup, limit int, timeout time.Duration, trackResources bool, coldCache bool) BenchmarkResult {
 	result := BenchmarkResult{
 		Query:       spec,
 		IndexType:   displayName,
@@ -880,6 +909,11 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 
 	// Warmup runs (with timeout)
 	for i := 0; i < warmup; i++ {
+		if coldCache {
+			if err := purgePageCache(); err != nil {
+				fmt.Fprintf(os.Stderr, "\nWarning: failed to purge page cache: %v\n", err)
+			}
+		}
 		resultChan := make(chan *QueryResult, 1)
 		go func() {
 			resultChan <- executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicGroups, indexType, limit)
@@ -895,6 +929,11 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 
 	// Benchmark runs
 	for i := 0; i < iterations; i++ {
+		if coldCache {
+			if err := purgePageCache(); err != nil {
+				fmt.Fprintf(os.Stderr, "\nWarning: failed to purge page cache: %v\n", err)
+			}
+		}
 		start := time.Now()
 
 		// Capture resource stats before query if tracking is enabled
