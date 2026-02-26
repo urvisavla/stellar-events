@@ -19,6 +19,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  query          Query events from RocksDB\n")
 	fmt.Fprintf(os.Stderr, "  stats          Show database statistics\n")
 	fmt.Fprintf(os.Stderr, "  benchmark      Benchmark query performance across index types\n")
+	fmt.Fprintf(os.Stderr, "  inspect        Inspect segment directories and report term counts\n")
 	fmt.Fprintf(os.Stderr, "\nConfiguration:\n")
 	fmt.Fprintf(os.Stderr, "  Requires stellar-events.toml or config.toml in current directory\n")
 	fmt.Fprintf(os.Stderr, "  See configs/stellar-events.example.toml for reference\n")
@@ -68,6 +69,8 @@ func main() {
 		runStats(cfg, args)
 	case "benchmark":
 		runBenchmark(cfg, args)
+	case "inspect":
+		runInspect(cfg, args)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
 		printUsage()

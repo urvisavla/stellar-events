@@ -288,6 +288,11 @@ func (m *MmapFile) Len() int {
 	return len(m.data)
 }
 
+// Data returns the underlying memory-mapped byte slice.
+func (m *MmapFile) Data() []byte {
+	return m.data
+}
+
 // ValidateLedgerMapFile validates a ledgermap.dat file by checking its size.
 func ValidateLedgerMapFile(path string) error {
 	info, err := os.Stat(path)
