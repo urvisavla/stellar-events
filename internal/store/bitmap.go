@@ -163,7 +163,9 @@ func (bi *eventBitmap32Index) AddTopicEvent(pos int, topicValue []byte, segmentI
 // Returns map[segmentID]*roaring.Bitmap so caller knows which segment each local ID belongs to.
 // Uses SegmentLedgerMap for range trimming with dense sequential IDs.
 // For topic lookups, isContract=false and pos specifies the topic position (0-3).
-func (bi *eventBitmap32Index) QueryIndexWithStats(isContract bool, termKey [32]byte, pos int, startLedger, endLedger uint32) (map[uint32]*roaring.Bitmap, int64, int, time.Duration, time.Duration, error) {
+// lmCache is an optional shared cache for ledger maps — if non-nil, loaded maps are stored/reused
+// across calls to avoid redundant loads when querying multiple terms over the same segments.
+func (bi *eventBitmap32Index) QueryIndexWithStats(isContract bool, termKey [32]byte, pos int, startLedger, endLedger uint32, lmCache map[uint32]*SegmentLedgerMap) (map[uint32]*roaring.Bitmap, int64, int, time.Duration, time.Duration, error) {
 	result := make(map[uint32]*roaring.Bitmap)
 	var bytesRead int64
 	var segmentsRead int
@@ -173,7 +175,7 @@ func (bi *eventBitmap32Index) QueryIndexWithStats(isContract bool, termKey [32]b
 	endSegment := SegmentID(endLedger)
 
 	for segID := startSegment; segID <= endSegment; segID++ {
-		bitmap, segBytes, readTime, decodeTime, err := bi.getSegmentWithStats(isContract, termKey, pos, segID)
+		bitmap, segBytes, readTime, decodeTime, fromCache, err := bi.getSegmentWithStats(isContract, termKey, pos, segID)
 		if err != nil {
 			return nil, bytesRead, segmentsRead, totalReadTime, totalDecodeTime, err
 		}
@@ -207,10 +209,20 @@ func (bi *eventBitmap32Index) QueryIndexWithStats(isContract bool, termKey [32]b
 		needsTrim := startOff > 0 || endOff < uint16(SegmentSize-1)
 
 		if needsTrim && bi.ledgerMapLoader != nil {
-			lm, err := bi.ledgerMapLoader.LoadSegmentLedgerMap(segID)
-			if err != nil {
-				return nil, bytesRead, segmentsRead, totalReadTime, totalDecodeTime,
-					fmt.Errorf("failed to load ledger map for segment %d: %w", segID, err)
+			// Check shared cache first
+			var lm *SegmentLedgerMap
+			if lmCache != nil {
+				lm = lmCache[segID]
+			}
+			if lm == nil {
+				lm, err = bi.ledgerMapLoader.LoadSegmentLedgerMap(segID)
+				if err != nil {
+					return nil, bytesRead, segmentsRead, totalReadTime, totalDecodeTime,
+						fmt.Errorf("failed to load ledger map for segment %d: %w", segID, err)
+				}
+				if lmCache != nil && lm != nil {
+					lmCache[segID] = lm
+				}
 			}
 			if lm != nil {
 				startLocalID, endLocalID = lm.LedgerRangeToIDRange(startOff, endOff)
@@ -223,8 +235,12 @@ func (bi *eventBitmap32Index) QueryIndexWithStats(isContract bool, termKey [32]b
 			endLocalID = bitmap.Maximum()
 		}
 
-		// Clone and trim to range
-		trimmed := bitmap.Clone()
+		// For hot-cache bitmaps, clone before mutating (shared reference).
+		// For storage-loaded bitmaps, operate in-place (freshly loaded, not shared).
+		trimmed := bitmap
+		if fromCache {
+			trimmed = bitmap.Clone()
+		}
 		if startLocalID > 0 {
 			trimmed.RemoveRange(0, uint64(startLocalID))
 		}
@@ -243,7 +259,8 @@ func (bi *eventBitmap32Index) QueryIndexWithStats(isContract bool, termKey [32]b
 }
 
 // getSegmentWithStats retrieves a segment and tracks bytes read.
-func (bi *eventBitmap32Index) getSegmentWithStats(isContract bool, termKey [32]byte, pos int, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
+// Returns fromCache=true if the bitmap came from the hot cache (shared, must clone before mutating).
+func (bi *eventBitmap32Index) getSegmentWithStats(isContract bool, termKey [32]byte, pos int, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, bool, error) {
 	key := makeIndexKey(termKey, segmentID)
 
 	// Check hot cache first - no disk read
@@ -255,16 +272,17 @@ func (bi *eventBitmap32Index) getSegmentWithStats(isContract bool, termKey [32]b
 	}
 	if segments != nil {
 		if bitmap, exists := segments[key]; exists {
-			return bitmap, 0, 0, 0, nil
+			return bitmap, 0, 0, 0, true, nil
 		}
 	}
 
 	// Load from storage if loader is available
 	if bi.loader != nil {
-		return bi.loader.LoadBitmap32SegmentWithTiming(isContract, termKey, pos, segmentID)
+		bm, bytes, rt, dt, err := bi.loader.LoadBitmap32SegmentWithTiming(isContract, termKey, pos, segmentID)
+		return bm, bytes, rt, dt, false, err
 	}
 
-	return nil, 0, 0, 0, nil
+	return nil, 0, 0, 0, false, nil
 }
 
 // GetAndClearAllSegments gets and clears all hot segments and segment counters.

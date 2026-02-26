@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/RoaringBitmap/roaring"
@@ -158,11 +159,14 @@ func (s *IndexStore) QueryEventKeysWithStats(contractID []byte, topicGroups [4][
 	// Count expected filter terms so we can skip segments missing any term
 	expectedTerms := 0
 
+	// Shared ledger map cache: avoids redundant loads when multiple terms hit the same segments
+	lmCache := make(map[uint32]*SegmentLedgerMap)
+
 	// Query contract index if specified
 	if len(contractID) > 0 {
 		expectedTerms++
 		termKey := ContractTermKey(contractID)
-		perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(true, termKey, -1, startLedger, endLedger)
+		perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(true, termKey, -1, startLedger, endLedger, lmCache)
 		if err != nil {
 			return nil, fmt.Errorf("contract bitmap32 query failed: %w", err)
 		}
@@ -187,7 +191,7 @@ func (s *IndexStore) QueryEventKeysWithStats(contractID []byte, topicGroups [4][
 			}
 			expectedTerms++
 			termKey := TopicTermKey(topic)
-			perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(false, termKey, pos, startLedger, endLedger)
+			perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(false, termKey, pos, startLedger, endLedger, lmCache)
 			if err != nil {
 				return nil, fmt.Errorf("topic bitmap32 query failed: %w", err)
 			}
@@ -205,16 +209,36 @@ func (s *IndexStore) QueryEventKeysWithStats(contractID []byte, topicGroups [4][
 		}
 	}
 
-	// Intersect per-segment bitmaps
+	// Intersect per-segment bitmaps in parallel
 	intersectStart := time.Now()
+
+	type segAndResult struct {
+		segID uint32
+		bm    *roaring.Bitmap
+	}
+	var eligible []uint32
 	for segID, sb := range allSegments {
-		if len(sb.bitmaps) < expectedTerms {
-			continue
+		if len(sb.bitmaps) >= expectedTerms {
+			eligible = append(eligible, segID)
 		}
-		intersected := roaring.FastAnd(sb.bitmaps...)
-		if !intersected.IsEmpty() {
-			result.PerSegment[segID] = intersected
-			result.TotalCount += intersected.GetCardinality()
+	}
+	andResults := make([]segAndResult, len(eligible))
+	var andWg sync.WaitGroup
+	for i, segID := range eligible {
+		andWg.Add(1)
+		go func(idx int, sid uint32) {
+			defer andWg.Done()
+			bm := roaring.FastAnd(allSegments[sid].bitmaps...)
+			if !bm.IsEmpty() {
+				andResults[idx] = segAndResult{segID: sid, bm: bm}
+			}
+		}(i, segID)
+	}
+	andWg.Wait()
+	for _, sr := range andResults {
+		if sr.bm != nil {
+			result.PerSegment[sr.segID] = sr.bm
+			result.TotalCount += sr.bm.GetCardinality()
 		}
 	}
 	result.IntersectTime = time.Since(intersectStart)
@@ -242,12 +266,15 @@ func (s *IndexStore) QueryEventKeysMultiFilter(
 	}
 	groups := make(map[int]*groupSegBitmaps)
 
+	// Shared ledger map cache: avoids redundant loads when multiple terms hit the same segments
+	lmCache := make(map[uint32]*SegmentLedgerMap)
+
 	// Query contract bitmaps (OR within contracts group)
 	if len(contractIDs) > 0 {
 		groups[0] = &groupSegBitmaps{bitmaps: make(map[uint32][]*roaring.Bitmap)}
 		for _, cid := range contractIDs {
 			termKey := ContractTermKey(cid)
-			perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(true, termKey, -1, startLedger, endLedger)
+			perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(true, termKey, -1, startLedger, endLedger, lmCache)
 			if err != nil {
 				return nil, fmt.Errorf("contract bitmap32 multi-filter query failed: %w", err)
 			}
@@ -274,7 +301,7 @@ func (s *IndexStore) QueryEventKeysMultiFilter(
 				continue
 			}
 			termKey := TopicTermKey(topicXDR)
-			perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(false, termKey, pos, startLedger, endLedger)
+			perSeg, bytesRead, segments, readTime, decodeTime, err := s.bitmap.QueryIndexWithStats(false, termKey, pos, startLedger, endLedger, lmCache)
 			if err != nil {
 				return nil, fmt.Errorf("topic bitmap32 multi-filter query failed: %w", err)
 			}
@@ -297,33 +324,50 @@ func (s *IndexStore) QueryEventKeysMultiFilter(
 		}
 	}
 
-	// For each segment: OR within each group, then AND across groups
+	// Parallel intersection: OR within each group, then AND across groups
 	intersectStart := time.Now()
+
+	type segAndResult struct {
+		segID uint32
+		bm    *roaring.Bitmap
+	}
+	segIDList := make([]uint32, 0, len(allSegIDs))
 	for segID := range allSegIDs {
-		var groupUnions []*roaring.Bitmap
-
-		for _, g := range groups {
-			bms := g.bitmaps[segID]
-			if len(bms) == 0 {
-				// This group has no data for this segment -> AND produces empty
-				groupUnions = nil
-				break
+		segIDList = append(segIDList, segID)
+	}
+	andResults := make([]segAndResult, len(segIDList))
+	var andWg sync.WaitGroup
+	for i, segID := range segIDList {
+		andWg.Add(1)
+		go func(idx int, sid uint32) {
+			defer andWg.Done()
+			var groupUnions []*roaring.Bitmap
+			for _, g := range groups {
+				bms := g.bitmaps[sid]
+				if len(bms) == 0 {
+					groupUnions = nil
+					break
+				}
+				if len(bms) == 1 {
+					groupUnions = append(groupUnions, bms[0])
+				} else {
+					groupUnions = append(groupUnions, roaring.FastOr(bms...))
+				}
 			}
-			if len(bms) == 1 {
-				groupUnions = append(groupUnions, bms[0])
-			} else {
-				groupUnions = append(groupUnions, roaring.FastOr(bms...))
+			if len(groupUnions) == 0 {
+				return
 			}
-		}
-
-		if len(groupUnions) == 0 {
-			continue
-		}
-
-		intersected := roaring.FastAnd(groupUnions...)
-		if !intersected.IsEmpty() {
-			result.PerSegment[segID] = intersected
-			result.TotalCount += intersected.GetCardinality()
+			intersected := roaring.FastAnd(groupUnions...)
+			if !intersected.IsEmpty() {
+				andResults[idx] = segAndResult{segID: sid, bm: intersected}
+			}
+		}(i, segID)
+	}
+	andWg.Wait()
+	for _, sr := range andResults {
+		if sr.bm != nil {
+			result.PerSegment[sr.segID] = sr.bm
+			result.TotalCount += sr.bm.GetCardinality()
 		}
 	}
 	result.IntersectTime = time.Since(intersectStart)

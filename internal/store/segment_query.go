@@ -207,17 +207,37 @@ func (r *SegmentReader) QueryEvents(contractID []byte, topicGroups [4][][]byte, 
 		}
 	}
 
-	// Intersect per-segment bitmaps (bitmaps already trimmed to ledger range)
+	// Intersect per-segment bitmaps in parallel (bitmaps already trimmed to ledger range)
 	intersectStart := time.Now()
 	perSegment := make(map[uint32]*roaring.Bitmap)
+
+	type segAndResult struct {
+		segID uint32
+		bm    *roaring.Bitmap
+	}
+	var eligible []uint32
 	for segID, sb := range allSegments {
-		if len(sb.bitmaps) < expectedTerms {
-			continue
+		if len(sb.bitmaps) >= expectedTerms {
+			eligible = append(eligible, segID)
 		}
-		bm := roaring.FastAnd(sb.bitmaps...)
-		if !bm.IsEmpty() {
-			perSegment[segID] = bm
-			result.MatchingLocalIDs += int(bm.GetCardinality())
+	}
+	andResults := make([]segAndResult, len(eligible))
+	var andWg sync.WaitGroup
+	for i, segID := range eligible {
+		andWg.Add(1)
+		go func(idx int, sid uint32) {
+			defer andWg.Done()
+			bm := roaring.FastAnd(allSegments[sid].bitmaps...)
+			if !bm.IsEmpty() {
+				andResults[idx] = segAndResult{segID: sid, bm: bm}
+			}
+		}(i, segID)
+	}
+	andWg.Wait()
+	for _, sr := range andResults {
+		if sr.bm != nil {
+			perSegment[sr.segID] = sr.bm
+			result.MatchingLocalIDs += int(sr.bm.GetCardinality())
 		}
 	}
 	result.IndexIntersectTime = time.Since(intersectStart)
@@ -322,33 +342,51 @@ func (r *SegmentReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGroups
 		}
 	}
 
-	// For each segment: OR within each group, then AND across groups (bitmaps already trimmed)
+	// Parallel intersection: OR within each group, then AND across groups (bitmaps already trimmed)
 	intersectStart := time.Now()
 	perSegment := make(map[uint32]*roaring.Bitmap)
+
+	type segAndResult struct {
+		segID uint32
+		bm    *roaring.Bitmap
+	}
+	segIDList := make([]uint32, 0, len(allSegIDs))
 	for segID := range allSegIDs {
-		var groupUnions []*roaring.Bitmap
-
-		for _, g := range groups {
-			bms := g.bitmaps[segID]
-			if len(bms) == 0 {
-				groupUnions = nil
-				break
+		segIDList = append(segIDList, segID)
+	}
+	andResults := make([]segAndResult, len(segIDList))
+	var andWg sync.WaitGroup
+	for i, segID := range segIDList {
+		andWg.Add(1)
+		go func(idx int, sid uint32) {
+			defer andWg.Done()
+			var groupUnions []*roaring.Bitmap
+			for _, g := range groups {
+				bms := g.bitmaps[sid]
+				if len(bms) == 0 {
+					groupUnions = nil
+					break
+				}
+				if len(bms) == 1 {
+					groupUnions = append(groupUnions, bms[0])
+				} else {
+					groupUnions = append(groupUnions, roaring.FastOr(bms...))
+				}
 			}
-			if len(bms) == 1 {
-				groupUnions = append(groupUnions, bms[0])
-			} else {
-				groupUnions = append(groupUnions, roaring.FastOr(bms...))
+			if len(groupUnions) == 0 {
+				return
 			}
-		}
-
-		if len(groupUnions) == 0 {
-			continue
-		}
-
-		intersected := roaring.FastAnd(groupUnions...)
-		if !intersected.IsEmpty() {
-			perSegment[segID] = intersected
-			result.MatchingLocalIDs += int(intersected.GetCardinality())
+			intersected := roaring.FastAnd(groupUnions...)
+			if !intersected.IsEmpty() {
+				andResults[idx] = segAndResult{segID: sid, bm: intersected}
+			}
+		}(i, segID)
+	}
+	andWg.Wait()
+	for _, sr := range andResults {
+		if sr.bm != nil {
+			perSegment[sr.segID] = sr.bm
+			result.MatchingLocalIDs += int(sr.bm.GetCardinality())
 		}
 	}
 	result.IndexIntersectTime = time.Since(intersectStart)
@@ -453,7 +491,7 @@ func (r *SegmentReader) loadBitmapFromFile(segmentID uint32, isContract bool, te
 	// Decode bitmap
 	decodeStart := time.Now()
 	bm := roaring.New()
-	if err = bm.UnmarshalBinary(bitmapBytes); err != nil {
+	if _, err = bm.FromBuffer(bitmapBytes); err != nil {
 		return nil, bytesRead, readTime, 0, fmt.Errorf("failed to decode bitmap: %w", err)
 	}
 	decodeTime := time.Since(decodeStart)
@@ -487,7 +525,9 @@ func (r *SegmentReader) trimToLedgerRange(segID uint32, bm *roaring.Bitmap, star
 
 	startLocalID, endLocalID := lm.LedgerRangeToIDRange(startOff, endOff)
 
-	trimmed := bm.Clone()
+	// Operate in-place: bitmap is freshly loaded from mmap'd pack file, not shared.
+	// FromBuffer bitmaps are copy-on-write, so only modified containers are materialized.
+	trimmed := bm
 	if startLocalID > 0 {
 		trimmed.RemoveRange(0, uint64(startLocalID))
 	}
@@ -746,14 +786,34 @@ func (r *SegmentReader) QueryEventsFromSegmentData(contractID []byte, topicGroup
 
 	intersectStart := time.Now()
 	perSegment := make(map[uint32]*roaring.Bitmap)
+
+	type segAndResult struct {
+		segID uint32
+		bm    *roaring.Bitmap
+	}
+	var eligible []uint32
 	for segID, sb := range allSegments {
-		if len(sb.bitmaps) < expectedTerms {
-			continue
+		if len(sb.bitmaps) >= expectedTerms {
+			eligible = append(eligible, segID)
 		}
-		bm := roaring.FastAnd(sb.bitmaps...)
-		if !bm.IsEmpty() {
-			perSegment[segID] = bm
-			result.MatchingLocalIDs += int(bm.GetCardinality())
+	}
+	andResults := make([]segAndResult, len(eligible))
+	var andWg sync.WaitGroup
+	for i, segID := range eligible {
+		andWg.Add(1)
+		go func(idx int, sid uint32) {
+			defer andWg.Done()
+			bm := roaring.FastAnd(allSegments[sid].bitmaps...)
+			if !bm.IsEmpty() {
+				andResults[idx] = segAndResult{segID: sid, bm: bm}
+			}
+		}(i, segID)
+	}
+	andWg.Wait()
+	for _, sr := range andResults {
+		if sr.bm != nil {
+			perSegment[sr.segID] = sr.bm
+			result.MatchingLocalIDs += int(sr.bm.GetCardinality())
 		}
 	}
 	result.IndexIntersectTime = time.Since(intersectStart)
@@ -852,29 +912,51 @@ func (r *SegmentReader) QueryEventsFromSegmentDataMultiFilter(contractIDs [][]by
 		}
 	}
 
+	// Parallel intersection: OR within each group, then AND across groups
 	intersectStart := time.Now()
 	perSegment := make(map[uint32]*roaring.Bitmap)
+
+	type segAndResult struct {
+		segID uint32
+		bm    *roaring.Bitmap
+	}
+	segIDList := make([]uint32, 0, len(allSegIDs))
 	for segID := range allSegIDs {
-		var groupUnions []*roaring.Bitmap
-		for _, g := range groups {
-			bms := g.bitmaps[segID]
-			if len(bms) == 0 {
-				groupUnions = nil
-				break
+		segIDList = append(segIDList, segID)
+	}
+	andResults := make([]segAndResult, len(segIDList))
+	var andWg sync.WaitGroup
+	for i, segID := range segIDList {
+		andWg.Add(1)
+		go func(idx int, sid uint32) {
+			defer andWg.Done()
+			var groupUnions []*roaring.Bitmap
+			for _, g := range groups {
+				bms := g.bitmaps[sid]
+				if len(bms) == 0 {
+					groupUnions = nil
+					break
+				}
+				if len(bms) == 1 {
+					groupUnions = append(groupUnions, bms[0])
+				} else {
+					groupUnions = append(groupUnions, roaring.FastOr(bms...))
+				}
 			}
-			if len(bms) == 1 {
-				groupUnions = append(groupUnions, bms[0])
-			} else {
-				groupUnions = append(groupUnions, roaring.FastOr(bms...))
+			if len(groupUnions) == 0 {
+				return
 			}
-		}
-		if len(groupUnions) == 0 {
-			continue
-		}
-		intersected := roaring.FastAnd(groupUnions...)
-		if !intersected.IsEmpty() {
-			perSegment[segID] = intersected
-			result.MatchingLocalIDs += int(intersected.GetCardinality())
+			intersected := roaring.FastAnd(groupUnions...)
+			if !intersected.IsEmpty() {
+				andResults[idx] = segAndResult{segID: sid, bm: intersected}
+			}
+		}(i, segID)
+	}
+	andWg.Wait()
+	for _, sr := range andResults {
+		if sr.bm != nil {
+			perSegment[sr.segID] = sr.bm
+			result.MatchingLocalIDs += int(sr.bm.GetCardinality())
 		}
 	}
 	result.IndexIntersectTime = time.Since(intersectStart)
