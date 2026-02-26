@@ -7,12 +7,14 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/RoaringBitmap/roaring"
 	"github.com/linxGnu/grocksdb"
 	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -30,10 +32,6 @@ const (
 	// 32-bit bitmap indexes (event-level, FromBuffer decode)
 	CFContractsBM32 = "contracts_bm32" // Contract ID bitmap32 index
 	CFTopicsBM32    = "topics_bm32"    // Topic bitmap32 index
-
-	// V2 posting list indexes (32-bit local IDs)
-	CFContractsPLV2 = "contracts_plv2" // Contract ID V2 posting lists
-	CFTopicsPLV2    = "topics_plv2"    // Topic V2 posting lists
 )
 
 // RocksDBOptions contains tuning parameters for RocksDB.
@@ -123,6 +121,254 @@ func parseCompression(compression string) grocksdb.CompressionType {
 	default:
 		return grocksdb.LZ4Compression
 	}
+}
+
+// =============================================================================
+// BitmapEventSeqStore — RocksDB I/O only for bitmap indexes
+// =============================================================================
+
+// BitmapEventSeqStore implements event-level index storage using RocksDB with 32-bit roaring bitmaps.
+// Uses FromBuffer for near-zero-cost decode instead of UnmarshalBinary.
+// This is a pure I/O layer — it does NOT own the in-memory bitmap index.
+type BitmapEventSeqStore struct {
+	db          *grocksdb.DB
+	cfContracts *grocksdb.ColumnFamilyHandle // Contract ID index CF (bitmap32)
+	cfTopics    *grocksdb.ColumnFamilyHandle // Topic index CF (bitmap32)
+	cfDefault   *grocksdb.ColumnFamilyHandle // Default CF for ledger maps
+
+	// RocksDB options
+	wo *grocksdb.WriteOptions
+	ro *grocksdb.ReadOptions
+}
+
+// NewBitmapEventSeqStore creates a new RocksDB-backed event index store using 32-bit bitmaps.
+func NewBitmapEventSeqStore(db *grocksdb.DB, cfDefault, cfContracts, cfTopics *grocksdb.ColumnFamilyHandle) (*BitmapEventSeqStore, error) {
+	wo := grocksdb.NewDefaultWriteOptions()
+	wo.DisableWAL(true)
+
+	store := &BitmapEventSeqStore{
+		db:          db,
+		cfDefault:   cfDefault,
+		cfContracts: cfContracts,
+		cfTopics:    cfTopics,
+		wo:          wo,
+		ro:          grocksdb.NewDefaultReadOptions(),
+	}
+
+	return store, nil
+}
+
+// LoadSegmentLedgerMap implements the ledgerMapLoader interface.
+// Reads the ledger map for a segment from CFDefault.
+func (s *BitmapEventSeqStore) LoadSegmentLedgerMap(segmentID uint32) (*SegmentLedgerMap, error) {
+	key := SegmentLedgerMapKey(segmentID)
+	data, err := s.db.GetCF(s.ro, s.cfDefault, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load ledger map for segment %d: %w", segmentID, err)
+	}
+	defer data.Free()
+
+	if data.Size() == 0 {
+		return nil, nil
+	}
+
+	// Copy data since it becomes invalid after Free
+	dataCopy := make([]byte, data.Size())
+	copy(dataCopy, data.Data())
+
+	return &SegmentLedgerMap{
+		SegmentID: segmentID,
+		Data:     dataCopy,
+	}, nil
+}
+
+// getCF returns the appropriate column family based on isContract flag.
+func (s *BitmapEventSeqStore) getCF(isContract bool) *grocksdb.ColumnFamilyHandle {
+	if isContract {
+		return s.cfContracts
+	}
+	return s.cfTopics
+}
+
+// Close releases resources.
+func (s *BitmapEventSeqStore) Close() error {
+	s.wo.Destroy()
+	s.ro.Destroy()
+	return nil
+}
+
+// LoadBitmap32Segment implements bitmap32Loader interface.
+func (s *BitmapEventSeqStore) LoadBitmap32Segment(isContract bool, termKey [32]byte, pos int, segmentID uint32) (*roaring.Bitmap, error) {
+	bitmap, _, _, _, err := s.LoadBitmap32SegmentWithTiming(isContract, termKey, pos, segmentID)
+	return bitmap, err
+}
+
+// LoadBitmap32SegmentWithTiming loads a segment using FromBuffer for near-zero-cost decode.
+func (s *BitmapEventSeqStore) LoadBitmap32SegmentWithTiming(isContract bool, termKey [32]byte, pos int, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
+	var dbKey []byte
+	if isContract {
+		dbKey = EncodeIndexKeyWithSegment(termKey, segmentID)
+	} else {
+		dbKey = EncodeTopicIndexKey(pos, termKey, segmentID)
+	}
+	cf := s.getCF(isContract)
+
+	readStart := time.Now()
+	data, err := s.db.GetCF(s.ro, cf, dbKey)
+	readTime := time.Since(readStart)
+	if err != nil {
+		return nil, 0, readTime, 0, fmt.Errorf("failed to get event bitmap32: %w", err)
+	}
+
+	if data.Size() == 0 {
+		data.Free()
+		return nil, 0, readTime, 0, nil
+	}
+
+	bytesRead := int64(data.Size())
+	decodeStart := time.Now()
+
+	// Must copy - data.Data() is invalid after Free()
+	dataCopy := make([]byte, data.Size())
+	copy(dataCopy, data.Data())
+	data.Free()
+
+	// FromBuffer: near-zero-cost decode into our copy
+	bitmap := roaring.New()
+	_, err = bitmap.FromBuffer(dataCopy)
+	decodeTime := time.Since(decodeStart)
+	if err != nil {
+		return nil, bytesRead, readTime, decodeTime, fmt.Errorf("failed to decode event bitmap32 via FromBuffer: %w", err)
+	}
+
+	return bitmap, bytesRead, readTime, decodeTime, nil
+}
+
+// loadBitmap32FromCF loads a bitmap from a column family (for merge during flush).
+func (s *BitmapEventSeqStore) loadBitmap32FromCF(cf *grocksdb.ColumnFamilyHandle, key []byte) (*roaring.Bitmap, error) {
+	data, err := s.db.GetCF(s.ro, cf, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get event bitmap32: %w", err)
+	}
+	defer data.Free()
+
+	if data.Size() == 0 {
+		return nil, nil
+	}
+
+	bitmap := roaring.New()
+	_, err = bitmap.FromBuffer(data.Data())
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode event bitmap32: %w", err)
+	}
+
+	// Clone to own the data since data.Data() becomes invalid after Free
+	return bitmap.Clone(), nil
+}
+
+// Flush persists bitmap segments and ledger maps to RocksDB, merging with existing data.
+// Receives data as parameters instead of pulling from internal state.
+// Returns the computed ledger map data per segment for optional flat file writes.
+func (s *BitmapEventSeqStore) Flush(
+	segments []bitmapChunk,
+	counters map[uint32]*segmentEventCounter,
+	writeToRocksDB bool,
+) (map[uint32][]byte, error) {
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+
+	for _, seg := range segments {
+		isContract := seg.FieldIndex == 0
+		cf := s.getCF(isContract)
+
+		// Encode the correct RocksDB key format based on field type.
+		// seg.Key contains [termHash:32][segmentID:4] from the hot index.
+		// For topics, we need to re-encode as [pos:1][termHash:32][segmentID:4].
+		var dbKey []byte
+		if isContract {
+			dbKey = seg.Key // Already [termHash:32][segmentID:4] = 36 bytes
+		} else {
+			pos := seg.FieldIndex - 1 // 1=topic0, 2=topic1, 3=topic2, 4=topic3
+			var termKey [32]byte
+			copy(termKey[:], seg.Key[0:32])
+			segmentID := binary.BigEndian.Uint32(seg.Key[32:36])
+			dbKey = EncodeTopicIndexKey(pos, termKey, segmentID)
+		}
+
+		if writeToRocksDB {
+			existingBitmap, err := s.loadBitmap32FromCF(cf, dbKey)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load existing event bitmap32 for merge: %w", err)
+			}
+
+			var finalData []byte
+			if existingBitmap != nil {
+				newBitmap := roaring.New()
+				_, err := newBitmap.FromBuffer(seg.Data)
+				if err != nil {
+					return nil, fmt.Errorf("failed to decode new event bitmap32: %w", err)
+				}
+				existingBitmap.Or(newBitmap)
+				existingBitmap.RunOptimize()
+				finalData, err = existingBitmap.ToBytes()
+				if err != nil {
+					return nil, fmt.Errorf("failed to serialize merged event bitmap32: %w", err)
+				}
+			} else {
+				finalData = seg.Data
+			}
+
+			batch.PutCF(cf, dbKey, finalData)
+		}
+	}
+
+	// Write/merge ledger maps for each segment that had events.
+	ledgerMapData := make(map[uint32][]byte, len(counters))
+	for segmentID, counter := range counters {
+		lmKey := SegmentLedgerMapKey(segmentID)
+
+		// Read existing ledger map data
+		existingData, err := s.db.GetCF(s.ro, s.cfDefault, lmKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read existing ledger map for segment %d: %w", segmentID, err)
+		}
+
+		var existingBytes []byte
+		if existingData.Size() > 0 {
+			existingBytes = make([]byte, existingData.Size())
+			copy(existingBytes, existingData.Data())
+		}
+		existingData.Free()
+
+		// Build new counts map from the counter
+		newCounts := make(map[uint16]uint32)
+		for i := uint32(0); i < SegmentSize; i++ {
+			if counter.eventCounts[i] > 0 {
+				newCounts[uint16(i)] = counter.eventCounts[i]
+			}
+		}
+
+		var finalData []byte
+		if len(existingBytes) > 0 {
+			finalData = MergeSegmentLedgerMapData(existingBytes, newCounts)
+		} else {
+			finalData = EncodeSegmentLedgerMap(segmentID, counter.eventCounts)
+		}
+
+		ledgerMapData[segmentID] = finalData
+
+		if writeToRocksDB {
+			batch.PutCF(s.cfDefault, lmKey, finalData)
+		}
+	}
+
+	if batch.Count() > 0 {
+		if err := s.db.Write(s.wo, batch); err != nil {
+			return nil, fmt.Errorf("failed to write event bitmap32 segments: %w", err)
+		}
+	}
+
+	return ledgerMapData, nil
 }
 
 // uint64AddMergeOperator implements a merge operator that adds uint64 values
@@ -225,14 +471,13 @@ func parseRawXDRToQueryEvent(rawXDR []byte, ledger uint32, tx, op uint32, eventI
 	return ev, nil
 }
 
-// RocksDBEventStore manages storing events in RocksDB
-type RocksDBEventStore struct {
+// EventStore manages storing events in RocksDB
+type EventStore struct {
 	db          *grocksdb.DB
 	dbPath      string // Store path for filesystem-based stats
 	wo          *grocksdb.WriteOptions
 	ro          *grocksdb.ReadOptions
-	indexes     *IndexConfig
-	eventFormat string // "xdr" or "binary"
+	indexes *IndexConfig
 
 	// Column family handles (managed by DB, don't destroy manually)
 	cfHandles []*grocksdb.ColumnFamilyHandle
@@ -244,12 +489,8 @@ type RocksDBEventStore struct {
 	cfContractsBM32 *grocksdb.ColumnFamilyHandle // Contract ID bitmap32 index
 	cfTopicsBM32    *grocksdb.ColumnFamilyHandle // Topic bitmap32 index
 
-	// V2 posting list index CFs (32-bit local IDs)
-	cfContractsPLV2 *grocksdb.ColumnFamilyHandle // Contract ID V2 posting lists
-	cfTopicsPLV2    *grocksdb.ColumnFamilyHandle // Topic V2 posting lists
-
-	// Event-level bitmap32 index (32-bit, FromBuffer decode)
-	eventIndex32Store *BitmapEventSeqStore
+	// Index coordinator (owns in-memory bitmap + delegates to BitmapEventSeqStore)
+	indexStore *IndexStore
 
 	// Options that need to be destroyed on Close
 	baseOpts *grocksdb.Options
@@ -259,23 +500,19 @@ type RocksDBEventStore struct {
 	// Keep merge operator alive to prevent GC (RocksDB holds a reference)
 	mergeOp grocksdb.MergeOperator
 
-	// In-memory posting list accumulation (for efficient batch writes)
-	postingsMu sync.Mutex
-
-	// V2 posting list accumulation (32-bit local IDs)
-	contractPostingsV2 map[string][]byte // index key -> accumulated 4-byte local IDs
-	topicPostingsV2    map[string][]byte // index key -> accumulated 4-byte local IDs
-
 	// Flat file segment directory path (empty = disabled)
-	segmentFilePath   string
-	segmentFileReader *SegmentFileReader // lazily initialized, reused across queries
+	segmentPath   string
+	segmentReader *SegmentReader // lazily initialized, reused across queries
 
-	// Event volume writer for flat file event storage (nil = disabled)
-	eventVolumeWriter *EventVolumeWriter
+	// Segment data writer for flat file event storage (nil = disabled)
+	segmentDataWriter *SegmentDataWriter
+
+	// writeRocksDB controls whether events and indexes are written to RocksDB
+	writeRocksDB bool
 }
 
 // NewEventStoreWithOptions creates a new event store with custom options
-func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpts *IndexConfig) (*RocksDBEventStore, error) {
+func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpts *IndexConfig) (*EventStore, error) {
 	// Create base options
 	baseOpts := grocksdb.NewDefaultOptions()
 	baseOpts.SetCreateIfMissing(true)
@@ -327,45 +564,24 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 	contractsBM32Opts, contractsBM32BBTO := createBitmapCFOpts()
 	topicsBM32Opts, topicsBM32BBTO := createBitmapCFOpts()
 
-	// Helper to create V2 posting list CF options (with V2 merge operator)
-	createPostingListV2CFOpts := func() (*grocksdb.Options, *grocksdb.BlockBasedTableOptions) {
-		opts := grocksdb.NewDefaultOptions()
-		applyRocksDBOptions(opts, rocksOpts)
-		opts.SetMergeOperator(&postingListV2MergeOperator{})
-		bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-		bbto.SetBlockSize(16 * 1024)
-		if rocksOpts != nil && rocksOpts.BloomFilterBitsPerKey > 0 {
-			bbto.SetFilterPolicy(grocksdb.NewBloomFilter(float64(rocksOpts.BloomFilterBitsPerKey)))
-		}
-		opts.SetBlockBasedTableFactory(bbto)
-		return opts, bbto
-	}
-
-	// V2 posting list CFs (32-bit local IDs)
-	contractsPLV2Opts, contractsPLV2BBTO := createPostingListV2CFOpts()
-	topicsPLV2Opts, topicsPLV2BBTO := createPostingListV2CFOpts()
-
 	cfNames := []string{
 		CFDefault, CFEvents, CFUnique,
 		CFContractsBM32, CFTopicsBM32,
-		CFContractsPLV2, CFTopicsPLV2,
 	}
 	cfOpts := []*grocksdb.Options{
 		defaultOpts, eventsOpts, uniqueOpts,
 		contractsBM32Opts, topicsBM32Opts,
-		contractsPLV2Opts, topicsPLV2Opts,
 	}
 	bbtoList := []*grocksdb.BlockBasedTableOptions{
 		eventsBBTO, uniqueBBTO,
 		contractsBM32BBTO, topicsBM32BBTO,
-		contractsPLV2BBTO, topicsPLV2BBTO,
 	}
 
 	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(baseOpts, dbPath, cfNames, cfOpts)
 	if err != nil {
 		// Note: We intentionally don't destroy cfOpts, bbtoList, or baseOpts here.
-		// Options with merge operators (uniqueOpts, postingListV2 opts) crash on
-		// Destroy() due to a grocksdb issue with rocksdb_mergeoperator_destroy.
+		// Options with merge operators (uniqueOpts) crash on Destroy() due to
+		// a grocksdb issue with rocksdb_mergeoperator_destroy.
 		// These are small allocations that will be cleaned up on process exit.
 		return nil, fmt.Errorf("failed to open RocksDB with column families: %w", err)
 	}
@@ -382,7 +598,7 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 
 	// Create event-level bitmap32 index store (32-bit, FromBuffer decode)
 	// cfHandles[0] = default, cfHandles[3] = contracts_bm32, cfHandles[4] = topics_bm32
-	eventIndex32Store, err := NewBitmapEventSeqStore(db, cfHandles[0], cfHandles[3], cfHandles[4])
+	bitmapStore, err := NewBitmapEventSeqStore(db, cfHandles[0], cfHandles[3], cfHandles[4])
 	if err != nil {
 		db.Close()
 		// Note: We intentionally don't destroy cfOpts, bbtoList, or baseOpts here.
@@ -391,34 +607,30 @@ func NewEventStoreWithOptions(dbPath string, rocksOpts *RocksDBOptions, indexOpt
 		return nil, fmt.Errorf("failed to create event bitmap32 index store: %w", err)
 	}
 
-	return &RocksDBEventStore{
-		db:                 db,
-		dbPath:             dbPath,
-		wo:                 wo,
-		ro:                 grocksdb.NewDefaultReadOptions(),
-		indexes:            indexes,
-		eventFormat:        "xdr", // Default to XDR format
-		cfHandles:          cfHandles,
-		cfDefault:          cfHandles[0],
-		cfEvents:           cfHandles[1],
-		cfUnique:           cfHandles[2],
-		cfContractsBM32:    cfHandles[3],
-		cfTopicsBM32:       cfHandles[4],
-		cfContractsPLV2:    cfHandles[5],
-		cfTopicsPLV2:       cfHandles[6],
-		eventIndex32Store:  eventIndex32Store,
-		baseOpts:           baseOpts,
-		cfOpts:             cfOpts,
-		bbtoList:           bbtoList,
-		mergeOp:            mergeOp,
-		contractPostingsV2: make(map[string][]byte),
-		topicPostingsV2:    make(map[string][]byte),
+	return &EventStore{
+		db:              db,
+		dbPath:          dbPath,
+		wo:              wo,
+		ro:              grocksdb.NewDefaultReadOptions(),
+		indexes:         indexes,
+		cfHandles:       cfHandles,
+		cfDefault:       cfHandles[0],
+		cfEvents:        cfHandles[1],
+		cfUnique:        cfHandles[2],
+		cfContractsBM32: cfHandles[3],
+		cfTopicsBM32:    cfHandles[4],
+		indexStore:      NewIndexStore(bitmapStore),
+		baseOpts:        baseOpts,
+		cfOpts:          cfOpts,
+		bbtoList:        bbtoList,
+		mergeOp:         mergeOp,
+		writeRocksDB:    true,
 	}, nil
 }
 
 // StoreEvents stores events with optional index updates based on options.
 // Returns the number of bytes written.
-func (es *RocksDBEventStore) StoreEvents(events []*event.IngestEvent, opts *StoreOptions) (int64, error) {
+func (es *EventStore) StoreEvents(events []*event.IngestEvent, opts *StoreOptions) (int64, error) {
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
 
@@ -433,23 +645,8 @@ func (es *RocksDBEventStore) StoreEvents(events []*event.IngestEvent, opts *Stor
 	// Map from unique key -> count to add
 	countUpdates := make(map[string]uint64)
 
-	// Get bitmap index once outside the loop (avoid per-event method call overhead)
-	var eventBitmap32Idx *eventBitmap32Index
-	if opts.V2Indexes && es.eventIndex32Store != nil {
-		eventBitmap32Idx = es.eventIndex32Store.getEventBitmap32Index()
-	}
-
-	// Track event sequence counters per ledger for bitmap32 V2 keys
-	var eventSeqCounters map[uint32]uint16
-	if opts.V2Indexes {
-		eventSeqCounters = make(map[uint32]uint16)
-	}
-
-	// Lock posting list maps if we'll be updating them
-	if opts.V2Indexes {
-		es.postingsMu.Lock()
-		defer es.postingsMu.Unlock()
-	}
+	// Track event sequence counters per ledger for V2 keys
+	eventSeqCounters := make(map[uint32]uint16)
 
 	for _, ev := range events {
 		// Skip diagnostic events if configured
@@ -465,89 +662,49 @@ func (es *RocksDBEventStore) StoreEvents(events []*event.IngestEvent, opts *Stor
 			}
 		}
 
-		// Use V2 key format when bitmap32 mode is active
-		var key []byte
-		var eventSeq uint16
-		if opts.V2Indexes {
-			eventSeq = eventSeqCounters[ev.LedgerSequence]
-			key = event.EncodeKeyV2(ev.LedgerSequence, eventSeq)
-			eventSeqCounters[ev.LedgerSequence] = eventSeq + 1
-		} else {
-			key = event.EncodeKeyFromParts(ev.LedgerSequence, uint32(ev.TransactionIndex), uint32(ev.OperationIndex), ev.EventIndex)
-		}
+		// V2 key format: [ledger:4][event_seq:2]
+		eventSeq := eventSeqCounters[ev.LedgerSequence]
+		key := event.EncodeKeyV2(ev.LedgerSequence, eventSeq)
+		eventSeqCounters[ev.LedgerSequence] = eventSeq + 1
 
-		// Encode event based on configured format
-		var value []byte
-		if es.eventFormat == "binary" {
-			value = event.EncodeBinaryEvent(ev)
-		} else {
-			value = ev.RawXDR
+		value := ev.RawXDR
+		if es.writeRocksDB {
+			batch.PutCF(es.cfEvents, key, value)
 		}
-		batch.PutCF(es.cfEvents, key, value)
 		totalBytes += int64(len(value))
 
 		// Assign dense local ID and update bitmap + posting list indexes
-		if eventBitmap32Idx != nil {
-			bucketID := BucketID(ev.LedgerSequence)
-			denseLocalID := eventBitmap32Idx.AssignDenseLocalID(bucketID, ev.LedgerSequence)
+		if es.indexStore != nil {
+			segmentID := SegmentID(ev.LedgerSequence)
+			denseLocalID := es.indexStore.AssignDenseLocalID(segmentID, ev.LedgerSequence)
 
 			// Index contract ID -> dense local ID (bitmap32)
 			if len(ev.ContractID) > 0 {
-				eventBitmap32Idx.AddContractEvent(ev.ContractID, bucketID, denseLocalID)
+				es.indexStore.AddContractEvent(ev.ContractID, segmentID, denseLocalID)
 			}
 
 			// Index topics -> dense local ID (bitmap32, positional)
 			for pos, topicBytes := range ev.Topics {
-				eventBitmap32Idx.AddTopicEvent(pos, topicBytes, bucketID, denseLocalID)
+				es.indexStore.AddTopicEvent(pos, topicBytes, segmentID, denseLocalID)
 			}
 
-			// Write to event volume if enabled
-			if es.eventVolumeWriter != nil {
-				if !es.eventVolumeWriter.IsActive() || bucketID != es.eventVolumeWriter.ChunkID() {
+			// Write to segment data if enabled
+			if es.segmentDataWriter != nil {
+				if !es.segmentDataWriter.IsActive() || segmentID != es.segmentDataWriter.ChunkID() {
 					// Finalize previous chunk if active
-					if es.eventVolumeWriter.IsActive() {
-						if err := es.eventVolumeWriter.FinalizeChunk(); err != nil {
-							return 0, fmt.Errorf("failed to finalize event volume chunk: %w", err)
+					if es.segmentDataWriter.IsActive() {
+						if err := es.segmentDataWriter.FinalizeChunk(); err != nil {
+							return 0, fmt.Errorf("failed to finalize segment data chunk: %w", err)
 						}
 					}
-					if err := es.eventVolumeWriter.StartChunk(bucketID); err != nil {
-						return 0, fmt.Errorf("failed to start event volume chunk %d: %w", bucketID, err)
+					if err := es.segmentDataWriter.StartChunk(segmentID); err != nil {
+						return 0, fmt.Errorf("failed to start segment data chunk %d: %w", segmentID, err)
 					}
 				}
-				v3Data := event.EncodeBinaryEventV3(ev)
-				if err := es.eventVolumeWriter.AppendEvent(denseLocalID, v3Data); err != nil {
-					return 0, fmt.Errorf("failed to append event to volume: %w", err)
+				v4Data := event.EncodeBinaryEventV4(ev)
+				if err := es.segmentDataWriter.AppendEvent(denseLocalID, v4Data); err != nil {
+					return 0, fmt.Errorf("failed to append event to file store: %w", err)
 				}
-			}
-		}
-
-		// Accumulate V2 posting list local IDs using dense IDs
-		if opts.V2Indexes {
-			bucketID := BucketID(ev.LedgerSequence)
-			// Re-use the same dense ID from the bitmap counter
-			// The bitmap index already assigned this ID, so we need to compute
-			// what it was. Since the bitmap assigns IDs sequentially and we're
-			// in the same loop iteration, we can get the last assigned ID.
-			var denseLocalID uint32
-			if eventBitmap32Idx != nil {
-				// The ID was just assigned above; it's nextDenseID - 1
-				counter := eventBitmap32Idx.bucketCounters[bucketID]
-				denseLocalID = counter.nextDenseID - 1
-			}
-
-			localIDBytes := make([]byte, 4)
-			binary.BigEndian.PutUint32(localIDBytes, denseLocalID)
-
-			if len(ev.ContractID) > 0 {
-				termKey := ContractTermKey(ev.ContractID)
-				indexKey := string(EncodeIndexKey(termKey, ev.LedgerSequence))
-				es.contractPostingsV2[indexKey] = append(es.contractPostingsV2[indexKey], localIDBytes...)
-			}
-
-			for pos, topicBytes := range ev.Topics {
-				termKey := TopicTermKey(pos, topicBytes)
-				indexKey := string(EncodeIndexKey(termKey, ev.LedgerSequence))
-				es.topicPostingsV2[indexKey] = append(es.topicPostingsV2[indexKey], localIDBytes...)
 			}
 		}
 
@@ -593,93 +750,27 @@ func (es *RocksDBEventStore) StoreEvents(events []*event.IngestEvent, opts *Stor
 		}
 	}
 
-	// Note: V2 posting list indexes are accumulated in memory and flushed
-	// periodically via FlushPostingListV2Indexes() for better write efficiency
-
-	if err := es.db.Write(es.wo, batch); err != nil {
-		return 0, fmt.Errorf("failed to write batch: %w", err)
+	if batch.Count() > 0 {
+		if err := es.db.Write(es.wo, batch); err != nil {
+			return 0, fmt.Errorf("failed to write batch: %w", err)
+		}
 	}
 
 	return totalBytes, nil
 }
 
 // FlushBitmapIndexes flushes hot bitmap segments to disk
-func (es *RocksDBEventStore) FlushBitmapIndexes() error {
-	// Flush 32-bit event-level bitmap (V2)
-	if es.eventIndex32Store != nil {
-		if err := es.eventIndex32Store.Flush(); err != nil {
-			return fmt.Errorf("failed to flush event-level bitmap32: %w", err)
-		}
+func (es *EventStore) FlushBitmapIndexes() error {
+	if es.indexStore != nil {
+		return es.indexStore.Flush()
 	}
 	return nil
 }
 
-// FlushPostingListV2Indexes flushes accumulated V2 posting list entries (32-bit local IDs) to disk.
-// Returns the number of contract and topic keys flushed.
-func (es *RocksDBEventStore) FlushPostingListV2Indexes() (int, int, error) {
-	es.postingsMu.Lock()
-	defer es.postingsMu.Unlock()
-
-	if len(es.contractPostingsV2) == 0 && len(es.topicPostingsV2) == 0 {
-		return 0, 0, nil
-	}
-
-	batch := grocksdb.NewWriteBatch()
-	defer batch.Destroy()
-
-	contractKeys := 0
-	topicKeys := 0
-
-	// Write all accumulated contract postings V2 (convert raw local IDs to delta-varint)
-	for keyStr, rawLocalIDs := range es.contractPostingsV2 {
-		localIDs := decodeRawLocalIDs(rawLocalIDs)
-		localIDs = deduplicateLocalIDs(localIDs)
-		encoded := EncodeLocalIDListDeltaVarint(localIDs)
-		batch.MergeCF(es.cfContractsPLV2, []byte(keyStr), encoded)
-		contractKeys++
-	}
-
-	// Write all accumulated topic postings V2 (convert raw local IDs to delta-varint)
-	for keyStr, rawLocalIDs := range es.topicPostingsV2 {
-		localIDs := decodeRawLocalIDs(rawLocalIDs)
-		localIDs = deduplicateLocalIDs(localIDs)
-		encoded := EncodeLocalIDListDeltaVarint(localIDs)
-		batch.MergeCF(es.cfTopicsPLV2, []byte(keyStr), encoded)
-		topicKeys++
-	}
-
-	if err := es.db.Write(es.wo, batch); err != nil {
-		return 0, 0, fmt.Errorf("failed to flush V2 posting list indexes: %w", err)
-	}
-
-	// Clear the maps
-	es.contractPostingsV2 = make(map[string][]byte)
-	es.topicPostingsV2 = make(map[string][]byte)
-
-	return contractKeys, topicKeys, nil
-}
-
-// GetPostingListV2Stats returns statistics about in-memory V2 posting list accumulation.
-func (es *RocksDBEventStore) GetPostingListV2Stats() (contractKeys, topicKeys int, contractBytes, topicBytes int64) {
-	es.postingsMu.Lock()
-	defer es.postingsMu.Unlock()
-
-	contractKeys = len(es.contractPostingsV2)
-	topicKeys = len(es.topicPostingsV2)
-
-	for _, v := range es.contractPostingsV2 {
-		contractBytes += int64(len(v))
-	}
-	for _, v := range es.topicPostingsV2 {
-		topicBytes += int64(len(v))
-	}
-
-	return
-}
 
 // GetEventsInRangeWithTiming retrieves events in a ledger range with detailed timing.
 // Returns query.Event format with disk read and unmarshal timing.
-func (es *RocksDBEventStore) GetEventsInRangeWithTiming(startLedger, endLedger uint32, limit int) (*query.RangeResult, error) {
+func (es *EventStore) GetEventsInRangeWithTiming(startLedger, endLedger uint32, limit int) (*query.RangeResult, error) {
 	result := &query.RangeResult{
 		Timing: query.FetchTiming{},
 	}
@@ -715,16 +806,9 @@ func (es *RocksDBEventStore) GetEventsInRangeWithTiming(startLedger, endLedger u
 			break
 		}
 
-		// Decode key based on format (6 bytes = V2, 10 bytes = TOID)
-		var tx, op uint32
+		// Decode V2 key: [ledger:4][event_seq:2]
 		var eventIdx uint16
-		if len(key) == 6 {
-			eventIdx = binary.BigEndian.Uint16(key[4:6])
-		} else if len(key) >= 10 {
-			_, tx, op, eventIdx = event.DecodeKeyFull(key)
-		} else {
-			break
-		}
+		eventIdx = binary.BigEndian.Uint16(key[4:6])
 
 		// Time value access (disk read)
 		diskStart = time.Now()
@@ -736,11 +820,7 @@ func (es *RocksDBEventStore) GetEventsInRangeWithTiming(startLedger, endLedger u
 		unmarshalStart := time.Now()
 		var ev *query.Event
 		var err error
-		if es.eventFormat == "binary" {
-			ev, err = event.DecodeBinaryToQueryEvent(valueData, keyLedger, tx, op, eventIdx)
-		} else {
-			ev, err = parseRawXDRToQueryEvent(valueData, keyLedger, tx, op, eventIdx)
-		}
+		ev, err = parseRawXDRToQueryEvent(valueData, keyLedger, 0, 0, eventIdx)
 		result.Timing.UnmarshalTime += time.Since(unmarshalStart)
 
 		result.EventsScanned++
@@ -769,7 +849,7 @@ func (es *RocksDBEventStore) GetEventsInRangeWithTiming(startLedger, endLedger u
 
 // GetEventsInLedger retrieves all events in a specific ledger as query.Event format.
 // Implements the EventReader interface.
-func (es *RocksDBEventStore) GetEventsInLedger(ledger uint32) ([]*query.Event, error) {
+func (es *EventStore) GetEventsInLedger(ledger uint32) ([]*query.Event, error) {
 	var events []*query.Event
 
 	startKey := event.EncodeKeyV2(ledger, 0)
@@ -787,25 +867,14 @@ func (es *RocksDBEventStore) GetEventsInLedger(ledger uint32) ([]*query.Event, e
 			break
 		}
 
-		var tx, op uint32
-		var eventIdx uint16
-		if len(key) == 6 {
-			eventIdx = binary.BigEndian.Uint16(key[4:6])
-		} else if len(key) >= 10 {
-			_, tx, op, eventIdx = event.DecodeKeyFull(key)
-		} else {
-			break
-		}
+		// Decode V2 key: [ledger:4][event_seq:2]
+		eventIdx := binary.BigEndian.Uint16(key[4:6])
 
 		valueData := it.Value().Data()
 
 		var ev *query.Event
 		var err error
-		if es.eventFormat == "binary" {
-			ev, err = event.DecodeBinaryToQueryEvent(valueData, ledger, tx, op, eventIdx)
-		} else {
-			ev, err = parseRawXDRToQueryEvent(valueData, ledger, tx, op, eventIdx)
-		}
+		ev, err = parseRawXDRToQueryEvent(valueData, ledger, 0, 0, eventIdx)
 		if err != nil {
 			continue
 		}
@@ -821,7 +890,7 @@ func (es *RocksDBEventStore) GetEventsInLedger(ledger uint32) ([]*query.Event, e
 
 // GetEventsInLedgerWithTiming retrieves all events in a specific ledger with detailed timing.
 // Implements the EventReader interface.
-func (es *RocksDBEventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.FetchResult, error) {
+func (es *EventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.FetchResult, error) {
 	result := &query.FetchResult{
 		Timing: query.FetchTiming{},
 	}
@@ -850,15 +919,8 @@ func (es *RocksDBEventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.
 			break
 		}
 
-		var tx, op uint32
-		var eventIdx uint16
-		if len(key) == 6 {
-			eventIdx = binary.BigEndian.Uint16(key[4:6])
-		} else if len(key) >= 10 {
-			_, tx, op, eventIdx = event.DecodeKeyFull(key)
-		} else {
-			break
-		}
+		// Decode V2 key: [ledger:4][event_seq:2]
+		eventIdx := binary.BigEndian.Uint16(key[4:6])
 
 		// Time value access (disk read)
 		diskStart = time.Now()
@@ -870,11 +932,7 @@ func (es *RocksDBEventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.
 		unmarshalStart := time.Now()
 		var ev *query.Event
 		var err error
-		if es.eventFormat == "binary" {
-			ev, err = event.DecodeBinaryToQueryEvent(valueData, ledger, tx, op, eventIdx)
-		} else {
-			ev, err = parseRawXDRToQueryEvent(valueData, ledger, tx, op, eventIdx)
-		}
+		ev, err = parseRawXDRToQueryEvent(valueData, ledger, 0, 0, eventIdx)
 		result.Timing.UnmarshalTime += time.Since(unmarshalStart)
 
 		if err != nil {
@@ -902,7 +960,7 @@ func (es *RocksDBEventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.
 // BuildIndexes scans all events and builds indexes based on options (one-time operation)
 // Bitmap indexes are always built. Unique indexes are optional.
 // Uses a collector pattern: workers read/extract in parallel, single goroutine updates bitmaps.
-func (es *RocksDBEventStore) BuildIndexes(workers int, opts *BuildIndexOptions, progressFn func(processed int64)) error {
+func (es *EventStore) BuildIndexes(workers int, opts *BuildIndexOptions, progressFn func(processed int64)) error {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
@@ -976,7 +1034,7 @@ func (es *RocksDBEventStore) BuildIndexes(workers int, opts *BuildIndexOptions, 
 
 // buildIndexesForRange reads events for a ledger range and sends index data to collector.
 // Unique indexes are still handled locally (no lock contention issue with RocksDB merge).
-func (es *RocksDBEventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *BuildIndexOptions, entryCh chan<- *indexEntry) error {
+func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *BuildIndexOptions, entryCh chan<- *indexEntry) error {
 	startKey := event.EncodeKeyV2(startLedger, 0)
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
 	defer it.Close()
@@ -999,16 +1057,9 @@ func (es *RocksDBEventStore) buildIndexesForRange(startLedger, endLedger uint32,
 			break
 		}
 
-		var txIdx, opIdx, eventIdx uint16
-		if len(key) == 6 {
-			eventIdx = binary.BigEndian.Uint16(key[4:6])
-		} else if len(key) >= 10 {
-			txIdx = binary.BigEndian.Uint16(key[4:6])
-			opIdx = binary.BigEndian.Uint16(key[6:8])
-			eventIdx = binary.BigEndian.Uint16(key[8:10])
-		} else {
-			break
-		}
+		// Decode V2 key: [ledger:4][event_seq:2]
+		eventIdx := binary.BigEndian.Uint16(key[4:6])
+		var txIdx, opIdx uint16
 
 		var xdrEvent xdr.ContractEvent
 		if err := xdrEvent.UnmarshalBinary(it.Value().Data()); err != nil {
@@ -1100,7 +1151,7 @@ func (es *RocksDBEventStore) buildIndexesForRange(startLedger, endLedger uint32,
 }
 
 // indexCollector receives index entries from workers and counts them.
-func (es *RocksDBEventStore) indexCollector(entryCh <-chan *indexEntry, opts *BuildIndexOptions, progressFn func(processed int64)) error {
+func (es *EventStore) indexCollector(entryCh <-chan *indexEntry, opts *BuildIndexOptions, progressFn func(processed int64)) error {
 	var processed int64
 
 	for range entryCh {
@@ -1120,154 +1171,142 @@ func (es *RocksDBEventStore) indexCollector(entryCh <-chan *indexEntry, opts *Bu
 	return nil
 }
 
-// SetEventFormat sets the event storage format ("xdr" or "binary").
-// Must be called before storing events.
-func (es *RocksDBEventStore) SetEventFormat(format string) {
-	if format == "binary" || format == "xdr" {
-		es.eventFormat = format
+// SetSegmentPath sets the base directory for segment flat files.
+func (es *EventStore) SetSegmentPath(path string) {
+	es.segmentPath = path
+}
+
+// SetLedgerMapWriteConfig configures where ledger maps are written during index flush.
+// segmentPath: base directory for segment flat files (empty = file writes disabled).
+// writeToRocksDB: if true, bitmaps and ledger maps are written to RocksDB.
+func (es *EventStore) SetLedgerMapWriteConfig(segmentPath string, writeToRocksDB bool) {
+	if es.indexStore != nil {
+		es.indexStore.SetWriteConfig(segmentPath, writeToRocksDB)
 	}
 }
 
-// GetEventFormat returns the current event storage format.
-func (es *RocksDBEventStore) GetEventFormat() string {
-	return es.eventFormat
+// SetWriteRocksDB controls whether events and bitmap indexes are written to RocksDB.
+func (es *EventStore) SetWriteRocksDB(enabled bool) {
+	es.writeRocksDB = enabled
 }
 
-// SetSegmentFilePath sets the base directory for segment flat files.
-func (es *RocksDBEventStore) SetSegmentFilePath(path string) {
-	es.segmentFilePath = path
-}
-
-// EnableEventVolume initializes the event volume writer for flat file event storage.
-// Uses the same base path as segment files.
+// EnableSegmentData initializes the segment data writer for flat file event storage.
+// Uses the same base path as segment indexes.
 // If compressEvents is true, each event blob is zstd-compressed in events.dat.
-// If dictCompress is true, zstd dictionary compression is used (takes priority over plain zstd).
 // groupSize controls how many events are compressed together (0 or 1 = per-event).
-func (es *RocksDBEventStore) EnableEventVolume(compressEvents bool, dictCompress bool, dictSampleCount int, groupSize int) {
-	if es.segmentFilePath != "" {
-		es.eventVolumeWriter = NewEventVolumeWriter(es.segmentFilePath, compressEvents, dictCompress, dictSampleCount, groupSize)
-		if dictCompress {
-			fmt.Fprintf(os.Stderr, "Event volume writer enabled with zstd dictionary compression (base: %s)\n", es.segmentFilePath)
-		} else if compressEvents && groupSize > 1 {
-			fmt.Fprintf(os.Stderr, "Event volume writer enabled with zstd grouped compression (group=%d, base: %s)\n", groupSize, es.segmentFilePath)
+func (es *EventStore) EnableSegmentData(compressEvents bool, groupSize int) {
+	if es.segmentPath != "" {
+		es.segmentDataWriter = NewSegmentDataWriter(es.segmentPath, compressEvents, groupSize)
+		if compressEvents && groupSize > 1 {
+			fmt.Fprintf(os.Stderr, "Segment data writer enabled with zstd grouped compression (group=%d, base: %s)\n", groupSize, es.segmentPath)
 		} else if compressEvents {
-			fmt.Fprintf(os.Stderr, "Event volume writer enabled with zstd compression (base: %s)\n", es.segmentFilePath)
+			fmt.Fprintf(os.Stderr, "Segment data writer enabled with zstd compression (base: %s)\n", es.segmentPath)
 		} else {
-			fmt.Fprintf(os.Stderr, "Event volume writer enabled (base: %s)\n", es.segmentFilePath)
+			fmt.Fprintf(os.Stderr, "Segment data writer enabled (base: %s)\n", es.segmentPath)
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "Warning: EnableEventVolume called but segment_file_path not set\n")
+		fmt.Fprintf(os.Stderr, "Warning: EnableSegmentData called but segment path not set\n")
 	}
 }
 
-// FinalizeEventVolume finalizes any active event volume chunk.
+// FinalizeSegmentData finalizes any active segment data chunk.
 // Called at the end of ingestion to flush the last incomplete chunk.
-func (es *RocksDBEventStore) FinalizeEventVolume() error {
-	if es.eventVolumeWriter != nil && es.eventVolumeWriter.IsActive() {
-		return es.eventVolumeWriter.FinalizeChunk()
+func (es *EventStore) FinalizeSegmentData() error {
+	if es.segmentDataWriter != nil && es.segmentDataWriter.IsActive() {
+		return es.segmentDataWriter.FinalizeChunk()
 	}
 	return nil
 }
 
-// WriteBucketDir writes flat file indexes (.idx + .pack pairs) for a completed bucket.
-// Scans the bitmap32 CFs to collect term data, partitions topics by position,
+// WriteSegmentDir writes flat file indexes (.hash + .pack pairs) for a completed segment.
+// Scans the bitmap32 CFs to collect term data, partitions topics by position from key format,
 // and writes the files atomically using tmp + rename.
-func (es *RocksDBEventStore) WriteBucketDir(bucketID uint32) error {
-	if es.segmentFilePath == "" {
-		return fmt.Errorf("segment file path not configured")
+func (es *EventStore) WriteSegmentDir(segmentID uint32) error {
+	if es.segmentPath == "" {
+		return fmt.Errorf("segment path not configured")
 	}
 
-	// Collect contract terms from cfContractsBM32
-	contractTerms, err := es.collectBitmapTerms(es.cfContractsBM32, bucketID)
-	if err != nil {
-		return fmt.Errorf("failed to collect contract terms: %w", err)
-	}
+	var contractTerms []SegmentTermData
+	var topicsByPos [4][]SegmentTermData
 
-	// Collect topic terms from cfTopicsBM32
-	topicTerms, err := es.collectBitmapTerms(es.cfTopicsBM32, bucketID)
-	if err != nil {
-		return fmt.Errorf("failed to collect topic terms: %w", err)
-	}
-
-	// Partition topic terms by position using the position map
-	topicsByPos := [4][]BucketTermData{}
-	var combinedTopics []BucketTermData
-
-	posMap := es.eventIndex32Store.getEventBitmap32Index().GetTopicTermPositions()
-	if len(posMap) > 0 {
-		for _, t := range topicTerms {
-			var termHash [16]byte
-			copy(termHash[:], t.TermHash[:])
-			if pos, ok := posMap[termHash]; ok && pos < 4 {
-				topicsByPos[pos] = append(topicsByPos[pos], t)
-			} else {
-				// Unknown position — put in combined fallback
-				combinedTopics = append(combinedTopics, t)
-			}
-		}
+	// Try cached data from the most recent Flush() first (used when writeToRocksDB=false)
+	if cached := es.indexStore.PopSegmentTerms(segmentID); cached != nil {
+		contractTerms = cached.contracts
+		topicsByPos = cached.topics
 	} else {
-		// No position map (restart fallback) — all topics go to combined
-		combinedTopics = topicTerms
+		// Fall back to RocksDB scan (for segments flushed in prior runs or with writeToRocksDB=true)
+		var err error
+		contractTerms, err = es.collectContractTerms(segmentID)
+		if err != nil {
+			return fmt.Errorf("failed to collect contract terms: %w", err)
+		}
+		topicsByPos, err = es.collectTopicTerms(segmentID)
+		if err != nil {
+			return fmt.Errorf("failed to collect topic terms: %w", err)
+		}
 	}
 
-	// Load ledger map
-	lm, err := es.LoadBucketLedgerMap(bucketID)
+	// Load ledger map (try IndexStore/RocksDB first, fall back to flat file)
+	lm, err := es.indexStore.LoadSegmentLedgerMap(segmentID)
 	if err != nil {
-		return fmt.Errorf("failed to load ledger map for bucket %d: %w", bucketID, err)
+		return fmt.Errorf("failed to load ledger map for segment %d: %w", segmentID, err)
+	}
+	if lm == nil && es.segmentPath != "" {
+		// Fallback: load from flat file written by Flush()
+		data, readErr := os.ReadFile(filepath.Join(es.segmentPath, fmt.Sprintf("%06d", segmentID), LedgerMapFileName))
+		if readErr == nil && len(data) == SegmentLedgerMapSize {
+			lm = &SegmentLedgerMap{SegmentID: segmentID, Data: data}
+		}
 	}
 
-	// Write the bucket directory
-	if err := WriteBucketDir(es.segmentFilePath, bucketID, contractTerms, topicsByPos, combinedTopics, lm); err != nil {
+	// Write the segment directory
+	if err := WriteSegmentDir(es.segmentPath, segmentID, contractTerms, topicsByPos, lm); err != nil {
 		return err
 	}
 
-	// Finalize event volume chunk if it matches this bucket
-	if es.eventVolumeWriter != nil && es.eventVolumeWriter.IsActive() && es.eventVolumeWriter.ChunkID() == bucketID {
-		if err := es.eventVolumeWriter.FinalizeChunk(); err != nil {
-			return fmt.Errorf("failed to finalize event volume chunk %d: %w", bucketID, err)
+	// Finalize segment data chunk if it matches this segment
+	if es.segmentDataWriter != nil && es.segmentDataWriter.IsActive() && es.segmentDataWriter.ChunkID() == segmentID {
+		if err := es.segmentDataWriter.FinalizeChunk(); err != nil {
+			return fmt.Errorf("failed to finalize segment data chunk %d: %w", segmentID, err)
 		}
 	}
 
 	return nil
 }
 
-// collectBitmapTerms scans a bitmap32 CF for all entries matching a specific bucket ID.
-// Returns a slice of (termHash, bitmapData) pairs.
-func (es *RocksDBEventStore) collectBitmapTerms(cf *grocksdb.ColumnFamilyHandle, bucketID uint32) ([]BucketTermData, error) {
-	// Create prefix to scan: we need to iterate all keys that end with this bucket ID.
-	// Since keys are [termHash:16][bucketID:4], we must scan the entire CF and filter.
-	// For efficiency, we use an iterator and check the bucket ID suffix.
-
+// collectContractTerms scans the contract bitmap32 CF for all entries matching a segment ID.
+// Contract keys: [termHash:32][segmentID:4] = 36 bytes
+func (es *EventStore) collectContractTerms(segmentID uint32) ([]SegmentTermData, error) {
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 
-	iter := es.db.NewIteratorCF(ro, cf)
+	iter := es.db.NewIteratorCF(ro, es.cfContractsBM32)
 	defer iter.Close()
 
-	var results []BucketTermData
+	var results []SegmentTermData
 
 	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
 		key := iter.Key().Data()
-		if len(key) != IndexKeySize {
+		if len(key) != IndexKeySize { // 36 bytes
 			continue
 		}
 
-		// Extract bucket ID from key suffix
-		keyBucketID := binary.BigEndian.Uint32(key[16:20])
-		if keyBucketID != bucketID {
+		// Extract segment ID from key suffix [32:36]
+		keySegmentID := binary.BigEndian.Uint32(key[32:36])
+		if keySegmentID != segmentID {
 			continue
 		}
 
-		// Extract term hash
-		var termHash [16]byte
-		copy(termHash[:], key[0:16])
+		// Extract full 32-byte term hash
+		var termHash [32]byte
+		copy(termHash[:], key[0:32])
 
 		// Copy bitmap data
 		valData := iter.Value().Data()
 		dataCopy := make([]byte, len(valData))
 		copy(dataCopy, valData)
 
-		results = append(results, BucketTermData{
+		results = append(results, SegmentTermData{
 			TermHash:   termHash,
 			BitmapData: dataCopy,
 		})
@@ -1280,16 +1319,68 @@ func (es *RocksDBEventStore) collectBitmapTerms(cf *grocksdb.ColumnFamilyHandle,
 	return results, nil
 }
 
-// Close closes the event store
-func (es *RocksDBEventStore) Close() {
-	// Close index stores (flushes any remaining hot segments)
-	if es.eventIndex32Store != nil {
-		es.eventIndex32Store.Close()
+// collectTopicTerms scans the topic bitmap32 CF for all entries matching a segment ID.
+// Topic keys: [pos:1][termHash:32][segmentID:4] = 37 bytes
+// Returns [4][]SegmentTermData pre-partitioned by position from key[0].
+func (es *EventStore) collectTopicTerms(segmentID uint32) ([4][]SegmentTermData, error) {
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+
+	iter := es.db.NewIteratorCF(ro, es.cfTopicsBM32)
+	defer iter.Close()
+
+	var results [4][]SegmentTermData
+
+	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+		key := iter.Key().Data()
+		if len(key) != 37 { // [pos:1][termHash:32][segmentID:4]
+			continue
+		}
+
+		// Extract position from key[0]
+		pos := int(key[0])
+		if pos > 3 {
+			continue
+		}
+
+		// Extract segment ID from key suffix [33:37]
+		keySegmentID := binary.BigEndian.Uint32(key[33:37])
+		if keySegmentID != segmentID {
+			continue
+		}
+
+		// Extract full 32-byte term hash
+		var termHash [32]byte
+		copy(termHash[:], key[1:33])
+
+		// Copy bitmap data
+		valData := iter.Value().Data()
+		dataCopy := make([]byte, len(valData))
+		copy(dataCopy, valData)
+
+		results[pos] = append(results[pos], SegmentTermData{
+			TermHash:   termHash,
+			BitmapData: dataCopy,
+		})
 	}
 
-	// Close segment file reader (releases mmap'd files)
-	if es.segmentFileReader != nil {
-		es.segmentFileReader.Close()
+	if err := iter.Err(); err != nil {
+		return results, fmt.Errorf("iterator error: %w", err)
+	}
+
+	return results, nil
+}
+
+// Close closes the event store
+func (es *EventStore) Close() {
+	// Close index stores (flushes any remaining hot segments)
+	if es.indexStore != nil {
+		es.indexStore.Close()
+	}
+
+	// Close segment reader (releases mmap'd files)
+	if es.segmentReader != nil {
+		es.segmentReader.Close()
 	}
 
 	// Destroy read/write options first
@@ -1311,17 +1402,13 @@ func (es *RocksDBEventStore) Close() {
 // Bitmap Stats and Metadata
 // =============================================================================
 
-func (es *RocksDBEventStore) GetBitmapStats() *BitmapStats {
-	if es.eventIndex32Store == nil {
+func (es *EventStore) GetBitmapStats() *BitmapStats {
+	if es.indexStore == nil {
 		return nil
 	}
-	bitmapIdx := es.eventIndex32Store.getEventBitmap32Index()
-	if bitmapIdx == nil {
-		return nil
-	}
-	count, cards, memBytes := bitmapIdx.GetHotSegmentStats()
+	count, cards, memBytes := es.indexStore.GetHotSegmentStats()
 	return &BitmapStats{
-		CurrentBucketID:    bitmapIdx.GetCurrentBucketID(),
+		CurrentSegmentID:    es.indexStore.GetCurrentSegmentID(),
 		HotSegmentCount:    count,
 		HotSegmentCards:    cards,
 		HotSegmentMemBytes: memBytes,
@@ -1329,7 +1416,7 @@ func (es *RocksDBEventStore) GetBitmapStats() *BitmapStats {
 }
 
 // SetLastProcessedLedger stores the last processed ledger sequence
-func (es *RocksDBEventStore) SetLastProcessedLedger(sequence uint32) error {
+func (es *EventStore) SetLastProcessedLedger(sequence uint32) error {
 	key := []byte("last_processed_ledger")
 	value := make([]byte, 4)
 	binary.BigEndian.PutUint32(value, sequence)
@@ -1337,7 +1424,7 @@ func (es *RocksDBEventStore) SetLastProcessedLedger(sequence uint32) error {
 }
 
 // GetLastProcessedLedger retrieves the last processed ledger sequence
-func (es *RocksDBEventStore) GetLastProcessedLedger() (uint32, error) {
+func (es *EventStore) GetLastProcessedLedger() (uint32, error) {
 	key := []byte("last_processed_ledger")
 	value, err := es.db.GetCF(es.ro, es.cfDefault, key)
 	if err != nil {
@@ -1352,28 +1439,28 @@ func (es *RocksDBEventStore) GetLastProcessedLedger() (uint32, error) {
 	return binary.BigEndian.Uint32(value.Data()), nil
 }
 
-// LoadBucketLedgerMap reads the ledger map for a bucket from CFDefault.
-func (es *RocksDBEventStore) LoadBucketLedgerMap(bucketID uint32) (*BucketLedgerMap, error) {
-	if es.eventIndex32Store != nil {
-		return es.eventIndex32Store.LoadBucketLedgerMap(bucketID)
+// LoadSegmentLedgerMap reads the ledger map for a segment from CFDefault.
+func (es *EventStore) LoadSegmentLedgerMap(segmentID uint32) (*SegmentLedgerMap, error) {
+	if es.indexStore != nil {
+		return es.indexStore.LoadSegmentLedgerMap(segmentID)
 	}
 	return nil, nil
 }
 
-// InitializeDenseCounters loads the ledger map for the current bucket from storage
+// InitializeDenseCounters loads the ledger map for the current segment from storage
 // and initializes the dense ID counter so ingestion continues from the correct offset.
 // Should be called on startup after the DB is opened.
-func (es *RocksDBEventStore) InitializeDenseCounters(lastLedger uint32) error {
-	if es.eventIndex32Store == nil {
+func (es *EventStore) InitializeDenseCounters(lastLedger uint32) error {
+	if es.indexStore == nil {
 		return nil
 	}
-	bucketID := BucketID(lastLedger)
-	lm, err := es.eventIndex32Store.LoadBucketLedgerMap(bucketID)
+	segmentID := SegmentID(lastLedger)
+	lm, err := es.indexStore.LoadSegmentLedgerMap(segmentID)
 	if err != nil {
 		return fmt.Errorf("failed to load ledger map on startup: %w", err)
 	}
 	if lm != nil {
-		es.eventIndex32Store.bitmap.InitializeDenseCounter(bucketID, lm.TotalEvents())
+		es.indexStore.InitializeDenseCounter(segmentID, lm.TotalEvents())
 	}
 	return nil
 }
@@ -1383,7 +1470,7 @@ func (es *RocksDBEventStore) InitializeDenseCounters(lastLedger uint32) error {
 // =============================================================================
 
 // CountEvents returns the total number of events in the store
-func (es *RocksDBEventStore) CountEvents() (int64, error) {
+func (es *EventStore) CountEvents() (int64, error) {
 	var count int64
 
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
@@ -1401,7 +1488,7 @@ func (es *RocksDBEventStore) CountEvents() (int64, error) {
 }
 
 // GetStorageSnapshot returns per-column-family storage statistics.
-func (es *RocksDBEventStore) GetStorageSnapshot() (*StorageSnapshot, error) {
+func (es *EventStore) GetStorageSnapshot() (*StorageSnapshot, error) {
 	snapshot := &StorageSnapshot{
 		Timestamp:      time.Now(),
 		ColumnFamilies: make(map[string]*ColumnFamilyStats),
@@ -1410,7 +1497,6 @@ func (es *RocksDBEventStore) GetStorageSnapshot() (*StorageSnapshot, error) {
 	cfNames := []string{
 		CFDefault, CFEvents, CFUnique,
 		CFContractsBM32, CFTopicsBM32,
-		CFContractsPLV2, CFTopicsPLV2,
 	}
 
 	// Helper to parse uint64 from RocksDB property string
@@ -1452,7 +1538,7 @@ func (es *RocksDBEventStore) GetStorageSnapshot() (*StorageSnapshot, error) {
 
 // Flush forces all memtables to be flushed to SST files
 // This should be called before getting accurate storage stats
-func (es *RocksDBEventStore) Flush() error {
+func (es *EventStore) Flush() error {
 	flushOpts := grocksdb.NewDefaultFlushOptions()
 	defer flushOpts.Destroy()
 	flushOpts.SetWait(true)
@@ -1467,7 +1553,7 @@ func (es *RocksDBEventStore) Flush() error {
 }
 
 // GetStats returns statistics about the event database (O(1) - no full scan)
-func (es *RocksDBEventStore) GetStats() (*DBStats, error) {
+func (es *EventStore) GetStats() (*DBStats, error) {
 	stats := &DBStats{}
 
 	// Get min/max ledger using seek (O(1))
@@ -1514,7 +1600,7 @@ func (es *RocksDBEventStore) GetStats() (*DBStats, error) {
 }
 
 // GetLedgerTxStats scans events to count ledgers with high transaction counts.
-func (es *RocksDBEventStore) GetLedgerTxStats() (*LedgerTxStats, error) {
+func (es *EventStore) GetLedgerTxStats() (*LedgerTxStats, error) {
 	stats := &LedgerTxStats{}
 
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
@@ -1562,7 +1648,7 @@ func (es *RocksDBEventStore) GetLedgerTxStats() (*LedgerTxStats, error) {
 }
 
 // CompactAllWithStats runs manual compaction and returns before/after stats per column family.
-func (es *RocksDBEventStore) CompactAllWithStats() (*CompactionSummary, error) {
+func (es *EventStore) CompactAllWithStats() (*CompactionSummary, error) {
 	before, err := es.GetStorageSnapshot()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pre-compaction stats: %w", err)
@@ -1632,7 +1718,7 @@ func (es *RocksDBEventStore) CompactAllWithStats() (*CompactionSummary, error) {
 }
 
 // CountUniqueIndexes counts entries in unique indexes and sums their event counts (parallel)
-func (es *RocksDBEventStore) CountUniqueIndexes() (*UniqueIndexCounts, error) {
+func (es *EventStore) CountUniqueIndexes() (*UniqueIndexCounts, error) {
 	// Use 16 partitions per index type (total 80 goroutines for 5 index types)
 	const partitions = 16
 
@@ -1692,7 +1778,7 @@ func (es *RocksDBEventStore) CountUniqueIndexes() (*UniqueIndexCounts, error) {
 
 // countIndexTypePartition counts entries for a partition of an index type
 // Partitions are based on the first byte of the value (after the type prefix)
-func (es *RocksDBEventStore) countIndexTypePartition(indexType byte, partition, totalPartitions int) (uniqueCount, totalEvents int64, err error) {
+func (es *EventStore) countIndexTypePartition(indexType byte, partition, totalPartitions int) (uniqueCount, totalEvents int64, err error) {
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 
@@ -1738,7 +1824,7 @@ func (es *RocksDBEventStore) countIndexTypePartition(indexType byte, partition, 
 
 // GetIndexDistribution computes percentile statistics for each index type in parallel
 // topN specifies how many top entries to include (0 for none)
-func (es *RocksDBEventStore) GetIndexDistribution(topN int, bottomN ...int) (*IndexDistribution, error) {
+func (es *EventStore) GetIndexDistribution(topN int, bottomN ...int) (*IndexDistribution, error) {
 	botN := 0
 	if len(bottomN) > 0 {
 		botN = bottomN[0]
@@ -1794,7 +1880,7 @@ func (es *RocksDBEventStore) GetIndexDistribution(topN int, bottomN ...int) (*In
 }
 
 // computeDistributionForType computes distribution for a single index type using parallel partitions
-func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN, bottomN int) (*DistributionStats, error) {
+func (es *EventStore) computeDistributionForType(indexType byte, topN, bottomN int) (*DistributionStats, error) {
 	const partitions = 16
 
 	type partitionResult struct {
@@ -1887,7 +1973,7 @@ func (es *RocksDBEventStore) computeDistributionForType(indexType byte, topN, bo
 
 // scanDistributionPartition scans a partition and returns counts for distribution
 // Returns: counts, total, over32Bytes, topN entries, bottomN entries, error
-func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition, totalPartitions, topN, bottomN int) ([]int64, int64, int64, []TopEntry, []TopEntry, error) {
+func (es *EventStore) scanDistributionPartition(indexType byte, partition, totalPartitions, topN, bottomN int) ([]int64, int64, int64, []TopEntry, []TopEntry, error) {
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 
@@ -1945,7 +2031,7 @@ func (es *RocksDBEventStore) scanDistributionPartition(indexType byte, partition
 }
 
 // getLedgerRange finds the min and max ledger sequences in the database
-func (es *RocksDBEventStore) getLedgerRange() (uint32, uint32, error) {
+func (es *EventStore) getLedgerRange() (uint32, uint32, error) {
 	var minLedger, maxLedger uint32
 
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
@@ -1974,7 +2060,7 @@ func (es *RocksDBEventStore) getLedgerRange() (uint32, uint32, error) {
 
 // GetLedgerRange returns the min and max ledger sequences in the store.
 // Implements the EventReader interface.
-func (es *RocksDBEventStore) GetLedgerRange() (min, max uint32, err error) {
+func (es *EventStore) GetLedgerRange() (min, max uint32, err error) {
 	return es.getLedgerRange()
 }
 
@@ -1984,7 +2070,7 @@ func (es *RocksDBEventStore) GetLedgerRange() (min, max uint32, err error) {
 
 // ComputeEventStats scans all events and computes unique counts.
 // Workers controls parallelism: 0 uses NumCPU, 1 for single-threaded, >1 for parallel.
-func (es *RocksDBEventStore) ComputeEventStats(workers int) (*EventStats, error) {
+func (es *EventStore) ComputeEventStats(workers int) (*EventStats, error) {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
@@ -2088,7 +2174,7 @@ func (es *RocksDBEventStore) ComputeEventStats(workers int) (*EventStats, error)
 }
 
 // computeEventStatsSingleThread is the single-threaded implementation
-func (es *RocksDBEventStore) computeEventStatsSingleThread() (*EventStats, error) {
+func (es *EventStore) computeEventStatsSingleThread() (*EventStats, error) {
 	stats := &EventStats{}
 
 	contracts := make(map[string]struct{})
@@ -2155,7 +2241,7 @@ func (es *RocksDBEventStore) computeEventStatsSingleThread() (*EventStats, error
 }
 
 // computeStatsForRange computes stats for a specific ledger range
-func (es *RocksDBEventStore) computeStatsForRange(startLedger, endLedger uint32) struct {
+func (es *EventStore) computeStatsForRange(startLedger, endLedger uint32) struct {
 	stats     *EventStats
 	contracts map[string]struct{}
 	topic0s   map[string]struct{}
@@ -2245,19 +2331,19 @@ func (es *RocksDBEventStore) computeStatsForRange(startLedger, endLedger uint32)
 
 // QueryEventsWithBitmap32EventIndex queries events using the 32-bit event-level bitmap index.
 // Uses sequential event IDs + FromBuffer for near-zero-cost index decode.
-func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+func (es *EventStore) QueryEventsWithBitmap32EventIndex(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
 	totalStart := time.Now()
 	result := &Bitmap32EventQueryResult{
 		LedgerRange: endLedger - startLedger + 1,
 	}
 
-	if es.eventIndex32Store == nil {
+	if es.indexStore == nil {
 		return nil, nil, fmt.Errorf("bitmap32 event index not available")
 	}
 
 	// Query the bitmap32 index (positional topic matching)
 	indexStart := time.Now()
-	queryResult, err := es.eventIndex32Store.QueryEventKeysWithStats(contractID, topicGroups, startLedger, endLedger)
+	queryResult, err := es.indexStore.QueryEventKeysWithStats(contractID, topicGroups, startLedger, endLedger)
 	if err != nil {
 		return nil, nil, fmt.Errorf("bitmap32 event query failed: %w", err)
 	}
@@ -2265,7 +2351,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 	result.MatchingLocalIDs = int(queryResult.TotalCount)
 	result.IndexBytesRead = queryResult.BytesRead
 	result.SegmentsScanned = queryResult.Segments
-	result.BucketsTouched = len(GetBucketsForRange(startLedger, endLedger))
+	result.SegmentsTouched = len(GetSegmentsForRange(startLedger, endLedger))
 	result.IndexReadTime = queryResult.ReadTime
 	result.IndexDecodeTime = queryResult.DecodeTime
 	result.IndexIntersectTime = queryResult.IntersectTime
@@ -2296,7 +2382,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 	allMetas := make([]bitmapEvtMeta, 0, fetchCap)
 
 	// Cache ledger maps per segment
-	ledgerMaps := make(map[uint32]*BucketLedgerMap)
+	ledgerMaps := make(map[uint32]*SegmentLedgerMap)
 
 	for _, segID := range segIDs {
 		if len(allKeys) >= fetchCap {
@@ -2307,9 +2393,9 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 		lm, ok := ledgerMaps[segID]
 		if !ok {
 			var lmErr error
-			lm, lmErr = es.eventIndex32Store.LoadBucketLedgerMap(segID)
+			lm, lmErr = es.indexStore.LoadSegmentLedgerMap(segID)
 			if lmErr != nil {
-				return nil, nil, fmt.Errorf("failed to load ledger map for bucket %d: %w", segID, lmErr)
+				return nil, nil, fmt.Errorf("failed to load ledger map for segment %d: %w", segID, lmErr)
 			}
 			ledgerMaps[segID] = lm
 		}
@@ -2407,28 +2493,11 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 				r.bytesRead += int64(len(valueCopy))
 				r.scanned++
 
-				// Filter using binary header (contract ID only; topic filtering is handled by positional index)
-				filterStart := time.Now()
-				if es.eventFormat == "binary" && len(contractID) > 0 {
-					header := event.ParseBinaryHeader(valueCopy)
-					if header != nil {
-						if !header.MatchesContractID(contractID) {
-							r.filterTime += time.Since(filterStart)
-							continue
-						}
-					}
-				}
-				r.filterTime += time.Since(filterStart)
-
 				// Decode to query.Event
 				decStart := time.Now()
 				var ev *query.Event
 				var decErr error
-				if es.eventFormat == "binary" {
-					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, meta.ledger, meta.eventSeq)
-				} else {
-					ev, decErr = parseRawXDRToQueryEvent(valueCopy, meta.ledger, 0, 0, meta.eventSeq)
-				}
+				ev, decErr = parseRawXDRToQueryEvent(valueCopy, meta.ledger, 0, 0, meta.eventSeq)
 				r.decodeTime += time.Since(decStart)
 
 				if decErr != nil {
@@ -2475,7 +2544,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32EventIndex(contractID []byte
 // QueryEventsWithBitmap32MultiFilter queries events using the 32-bit bitmap index with multi-value OR filters.
 // contractIDs: multiple contract IDs (OR within group)
 // topicGroups: per-position topic values (OR within position, AND across positions)
-func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
+func (es *EventStore) QueryEventsWithBitmap32MultiFilter(
 	contractIDs [][]byte,
 	topicGroups [4][][]byte,
 	startLedger, endLedger uint32,
@@ -2486,13 +2555,13 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 		LedgerRange: endLedger - startLedger + 1,
 	}
 
-	if es.eventIndex32Store == nil {
+	if es.indexStore == nil {
 		return nil, nil, fmt.Errorf("bitmap32 event index not available")
 	}
 
 	// Query the bitmap32 index with multi-value filters
 	indexStart := time.Now()
-	queryResult, err := es.eventIndex32Store.QueryEventKeysMultiFilter(contractIDs, topicGroups, startLedger, endLedger)
+	queryResult, err := es.indexStore.QueryEventKeysMultiFilter(contractIDs, topicGroups, startLedger, endLedger)
 	if err != nil {
 		return nil, nil, fmt.Errorf("bitmap32 multi-filter query failed: %w", err)
 	}
@@ -2500,7 +2569,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 	result.MatchingLocalIDs = int(queryResult.TotalCount)
 	result.IndexBytesRead = queryResult.BytesRead
 	result.SegmentsScanned = queryResult.Segments
-	result.BucketsTouched = len(GetBucketsForRange(startLedger, endLedger))
+	result.SegmentsTouched = len(GetSegmentsForRange(startLedger, endLedger))
 	result.IndexReadTime = queryResult.ReadTime
 	result.IndexDecodeTime = queryResult.DecodeTime
 	result.IndexIntersectTime = queryResult.IntersectTime
@@ -2531,7 +2600,7 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 	allMetas := make([]bitmapEvtMeta, 0, fetchCap)
 
 	// Cache ledger maps per segment
-	ledgerMaps := make(map[uint32]*BucketLedgerMap)
+	ledgerMaps := make(map[uint32]*SegmentLedgerMap)
 
 	for _, segID := range segIDs {
 		if len(allKeys) >= fetchCap {
@@ -2542,9 +2611,9 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 		lm, ok := ledgerMaps[segID]
 		if !ok {
 			var lmErr error
-			lm, lmErr = es.eventIndex32Store.LoadBucketLedgerMap(segID)
+			lm, lmErr = es.indexStore.LoadSegmentLedgerMap(segID)
 			if lmErr != nil {
-				return nil, nil, fmt.Errorf("failed to load ledger map for bucket %d: %w", segID, lmErr)
+				return nil, nil, fmt.Errorf("failed to load ledger map for segment %d: %w", segID, lmErr)
 			}
 			ledgerMaps[segID] = lm
 		}
@@ -2642,35 +2711,11 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 				r.bytesRead += int64(len(valueCopy))
 				r.scanned++
 
-				// Post-filter: contract ID only (topic filtering is handled by positional index)
-				filterStart := time.Now()
-				if es.eventFormat == "binary" && len(contractIDs) > 0 {
-					header := event.ParseBinaryHeader(valueCopy)
-					if header != nil {
-						contractMatch := false
-						for _, cid := range contractIDs {
-							if header.MatchesContractID(cid) {
-								contractMatch = true
-								break
-							}
-						}
-						if !contractMatch {
-							r.filterTime += time.Since(filterStart)
-							continue
-						}
-					}
-				}
-				r.filterTime += time.Since(filterStart)
-
 				// Decode to query.Event
 				decStart := time.Now()
 				var ev *query.Event
 				var decErr error
-				if es.eventFormat == "binary" {
-					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, meta.ledger, meta.eventSeq)
-				} else {
-					ev, decErr = parseRawXDRToQueryEvent(valueCopy, meta.ledger, 0, 0, meta.eventSeq)
-				}
+				ev, decErr = parseRawXDRToQueryEvent(valueCopy, meta.ledger, 0, 0, meta.eventSeq)
 				r.decodeTime += time.Since(decStart)
 
 				if decErr != nil {
@@ -2714,60 +2759,60 @@ func (es *RocksDBEventStore) QueryEventsWithBitmap32MultiFilter(
 	return result, events, nil
 }
 
-// GetSegmentFileReader returns a SegmentFileReader for querying flat file indexes.
+// GetSegmentReader returns a SegmentReader for querying flat file indexes.
 // The reader is created once and reused across queries so file caches persist.
-// Returns nil if segment file path is not configured.
-func (es *RocksDBEventStore) GetSegmentFileReader() *SegmentFileReader {
-	if es.segmentFilePath == "" {
+// Returns nil if segment path is not configured.
+func (es *EventStore) GetSegmentReader() *SegmentReader {
+	if es.segmentPath == "" {
 		return nil
 	}
-	if es.segmentFileReader == nil {
-		es.segmentFileReader = NewSegmentFileReader(es.segmentFilePath, es)
+	if es.segmentReader == nil {
+		es.segmentReader = NewSegmentReader(es.segmentPath, es)
 	}
-	return es.segmentFileReader
+	return es.segmentReader
 }
 
-// QueryEventsWithSegmentFile queries events using flat file segment indexes (single-value per filter).
-func (es *RocksDBEventStore) QueryEventsWithSegmentFile(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
-	reader := es.GetSegmentFileReader()
+// QueryEventsWithSegmentIndex queries events using flat file segment indexes (single-value per filter).
+func (es *EventStore) QueryEventsWithSegmentIndex(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+	reader := es.GetSegmentReader()
 	if reader == nil {
-		return nil, nil, fmt.Errorf("segment file path not configured")
+		return nil, nil, fmt.Errorf("segment path not configured")
 	}
 	return reader.QueryEvents(contractID, topicGroups, startLedger, endLedger, limit)
 }
 
-// QueryEventsWithSegmentFileMultiFilter queries events using flat file segment indexes with multi-value OR/AND filters.
-func (es *RocksDBEventStore) QueryEventsWithSegmentFileMultiFilter(contractIDs [][]byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
-	reader := es.GetSegmentFileReader()
+// QueryEventsWithSegmentIndexMultiFilter queries events using flat file segment indexes with multi-value OR/AND filters.
+func (es *EventStore) QueryEventsWithSegmentIndexMultiFilter(contractIDs [][]byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+	reader := es.GetSegmentReader()
 	if reader == nil {
-		return nil, nil, fmt.Errorf("segment file path not configured")
+		return nil, nil, fmt.Errorf("segment path not configured")
 	}
 	return reader.QueryEventsMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
 }
 
-// QueryEventsWithSegmentVolume queries events using flat file indexes + flat file event volume (no RocksDB event fetches).
-func (es *RocksDBEventStore) QueryEventsWithSegmentVolume(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
-	reader := es.GetSegmentFileReader()
+// QueryEventsWithSegmentData queries events using flat file indexes + flat file event store (no RocksDB event fetches).
+func (es *EventStore) QueryEventsWithSegmentData(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+	reader := es.GetSegmentReader()
 	if reader == nil {
-		return nil, nil, fmt.Errorf("segment file path not configured")
+		return nil, nil, fmt.Errorf("segment path not configured")
 	}
-	return reader.QueryEventsFromVolume(contractID, topicGroups, startLedger, endLedger, limit)
+	return reader.QueryEventsFromSegmentData(contractID, topicGroups, startLedger, endLedger, limit)
 }
 
-// QueryEventsWithSegmentVolumeMultiFilter queries events from volume with multi-value OR/AND filters.
-func (es *RocksDBEventStore) QueryEventsWithSegmentVolumeMultiFilter(contractIDs [][]byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
-	reader := es.GetSegmentFileReader()
+// QueryEventsWithSegmentDataMultiFilter queries events from file store with multi-value OR/AND filters.
+func (es *EventStore) QueryEventsWithSegmentDataMultiFilter(contractIDs [][]byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+	reader := es.GetSegmentReader()
 	if reader == nil {
-		return nil, nil, fmt.Errorf("segment file path not configured")
+		return nil, nil, fmt.Errorf("segment path not configured")
 	}
-	return reader.QueryEventsFromVolumeMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
+	return reader.QueryEventsFromSegmentDataMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
 }
 
-// GetEventsInRangeFromVolume reads all events in a ledger range from flat file volumes (no index, no RocksDB).
-func (es *RocksDBEventStore) GetEventsInRangeFromVolume(startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
-	reader := es.GetSegmentFileReader()
+// GetEventsInRangeFromSegmentData reads all events in a ledger range from flat file store (no index, no RocksDB).
+func (es *EventStore) GetEventsInRangeFromSegmentData(startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+	reader := es.GetSegmentReader()
 	if reader == nil {
-		return nil, nil, fmt.Errorf("segment file path not configured")
+		return nil, nil, fmt.Errorf("segment path not configured")
 	}
 	return reader.GetEventsInRange(startLedger, endLedger, limit)
 }

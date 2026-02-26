@@ -18,12 +18,6 @@ network = "mainnet"
 # Path to RocksDB database directory
 db_path = "./rocksdb/events"
 
-# Event storage format: "xdr" (default) or "binary" (faster queries)
-# - xdr: Store raw XDR bytes (smaller, but requires XDR parsing on query)
-# - binary: Store pre-decoded fields (larger ~10%, but ~10-15x faster queries)
-# Note: Must reingest data when changing this option
-event_format = "xdr"
-
 # --- Write Performance ---
 # Memtable size in MB (larger = better write throughput, more memory)
 write_buffer_size_mb = 256
@@ -64,25 +58,21 @@ target_file_size_mb = 256
 # Max bytes for level 1 in MB
 max_bytes_for_level_base_mb = 1024
 
-# --- Flat File Segment Indexes ---
-# Base directory for segment flat files (empty = disabled)
-# segment_file_path = "./data/segments"
+# --- Storage Destinations ---
+# Write events, indexes, and ledger maps to RocksDB (default: true)
+rocksdb = true
 
-# Enable writing flat file indexes at segment boundaries
-# enable_segment_files = false
+# Write events, indexes, and ledger maps to segment flat files (default: false)
+# segment_files = false
 
-# Write event data to flat files alongside indexes
-# enable_event_volume = false
+# Base directory for segment flat files (required if segment_files = true)
+# segment_path = "./data/segments"
 
-# Zstd compress per-event blobs in event volume files (experimental)
-# compress_event_volume = false
+# Zstd compress event data blocks in segment data files
+# compress_data = false
 
-# Zstd dictionary compression for event volume (experimental, better ratio than plain zstd)
-# dict_compress_event_volume = false
-
-# Events to buffer before training zstd dictionary (default: 16384)
-# More samples = better dictionary quality, but more memory during ingestion
-# dict_sample_count = 16384
+# Events per compression block (default: 128, used by eventstore blocked format)
+# block_size = 128
 
 # =============================================================================
 # Ingestion
@@ -97,10 +87,7 @@ final_compaction = false
 compute_stats = false
 
 # Index maintenance
-v2_indexes = true
 unique_indexes = true
-
-index_flush_interval = 10000
 
 # --- Parallelism ---
 # Number of parallel workers (0 = all CPUs)

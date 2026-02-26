@@ -1,10 +1,12 @@
 module github.com/urvisavla/stellar-events
 
-go 1.24.0
+go 1.26
 
 require (
-	github.com/klauspost/compress v1.18.3
+	github.com/BurntSushi/toml v1.6.0
+	github.com/RoaringBitmap/roaring v1.9.4
 	github.com/stellar/go-stellar-sdk v0.1.0
+	golang.org/x/text v0.21.0
 )
 
 require (
@@ -14,9 +16,7 @@ require (
 	cloud.google.com/go/compute/metadata v0.3.0 // indirect
 	cloud.google.com/go/iam v1.1.8 // indirect
 	cloud.google.com/go/storage v1.42.0 // indirect
-	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/Microsoft/go-winio v0.6.1 // indirect
-	github.com/RoaringBitmap/roaring v1.9.4 // indirect
 	github.com/aws/aws-sdk-go v1.45.27 // indirect
 	github.com/aws/aws-sdk-go-v2 v1.36.5 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.11 // indirect
@@ -40,11 +40,12 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.12.0 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
-	github.com/cespare/xxhash/v2 v2.2.0 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/creachadair/jrpc2 v1.2.0 // indirect
 	github.com/creachadair/mds v0.13.4 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/djherbis/fscache v0.10.1 // indirect
+	github.com/edsrzf/mmap-go v1.2.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-errors/errors v1.5.1 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
@@ -57,6 +58,8 @@ require (
 	github.com/googleapis/gax-go/v2 v2.12.4 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
+	github.com/klauspost/compress v1.18.3 // indirect
+	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
 	github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
 	github.com/pelletier/go-toml v1.9.5 // indirect
@@ -69,6 +72,8 @@ require (
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
+	github.com/tamirms/streamhash v0.0.0-20260224125831-92eef2d6e54e // indirect
+	github.com/zeebo/xxh3 v1.0.2 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.49.0 // indirect
@@ -82,8 +87,7 @@ require (
 	golang.org/x/net v0.26.0 // indirect
 	golang.org/x/oauth2 v0.21.0 // indirect
 	golang.org/x/sync v0.10.0 // indirect
-	golang.org/x/sys v0.29.0 // indirect
-	golang.org/x/text v0.21.0 // indirect
+	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
 	golang.org/x/tools v0.22.0 // indirect
 	google.golang.org/api v0.183.0 // indirect

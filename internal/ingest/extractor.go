@@ -88,9 +88,14 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 				stats.TotalEvents++
 			}
 
-			rawXDR, err := ev.Event.MarshalBinary()
+			// Marshal as DiagnosticEvent XDR (wraps ContractEvent + InSuccessfulContractCall)
+			diagEvent := xdr.DiagnosticEvent{
+				InSuccessfulContractCall: txSuccessful,
+				Event:                    ev.Event,
+			}
+			rawXDR, err := diagEvent.MarshalBinary()
 			if err != nil {
-				return nil, fmt.Errorf("failed to marshal event XDR: %w", err)
+				return nil, fmt.Errorf("failed to marshal DiagnosticEvent XDR: %w", err)
 			}
 
 			// Extract contract ID, topics, type, and data for indexing and binary storage
@@ -143,9 +148,14 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 					stats.TotalEvents++
 				}
 
-				rawXDR, err := ev.MarshalBinary()
+				// Marshal as DiagnosticEvent XDR (wraps ContractEvent + InSuccessfulContractCall)
+				diagEvent := xdr.DiagnosticEvent{
+					InSuccessfulContractCall: txSuccessful,
+					Event:                    ev,
+				}
+				rawXDR, err := diagEvent.MarshalBinary()
 				if err != nil {
-					return nil, fmt.Errorf("failed to marshal event XDR: %w", err)
+					return nil, fmt.Errorf("failed to marshal DiagnosticEvent XDR: %w", err)
 				}
 
 				// Extract contract ID, topics, type, and data for indexing and binary storage

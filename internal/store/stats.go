@@ -128,7 +128,7 @@ type EventStats struct {
 
 // BitmapStats holds statistics about bitmap indexes.
 type BitmapStats struct {
-	CurrentBucketID    uint32 `json:"current_bucket_id"`
+	CurrentSegmentID   uint32 `json:"current_segment_id"`
 	HotSegmentCount    int    `json:"hot_segment_count"`
 	HotSegmentCards    uint64 `json:"hot_segment_cards"`
 	HotSegmentMemBytes uint64 `json:"hot_segment_mem_bytes"`
@@ -302,14 +302,14 @@ func percentile(sorted []int64, p float64) int64 {
 // =============================================================================
 
 // UnifiedQueryResult holds query results in a common format for all index types.
-// This enables consistent output and comparison across posting-v2, bitmap32, and bitmap64.
+// This enables consistent output and comparison across bitmap32, segment-index, and segment-data.
 type UnifiedQueryResult struct {
 	// Index identification
-	IndexType string // "posting-v2", "bitmap32", or "bitmap64"
+	IndexType string // "bitmap32", "segment-index", or "segment-data"
 
 	// Ledger range
 	LedgerRange    uint32 // endLedger - startLedger + 1
-	BucketsTouched int    // Number of buckets touched by the query
+	SegmentsTouched int    // Number of segments touched by the query
 	IndexMatches   int    // Matches from index (ledgers, keys, or TOIDs depending on type)
 	MatchUnitName  string // "ledgers", "event keys", or "TOIDs" - describes what IndexMatches counts
 

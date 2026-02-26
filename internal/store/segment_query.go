@@ -2,50 +2,73 @@ package store
 
 import (
 	"bytes"
+	"context"
+	"encoding/binary"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/RoaringBitmap/roaring"
+	"github.com/tamirms/streamhash"
 
 	"github.com/urvisavla/stellar-events/internal/event"
+	"github.com/urvisavla/stellar-events/internal/eventstore"
 	"github.com/urvisavla/stellar-events/internal/query"
 )
 
-// SegmentFileReader reads flat file indexes (.idx/.pack) for queries.
-// Uses mmap to avoid repeated syscalls; mapped files are cached for reuse.
-type SegmentFileReader struct {
+// SegmentReader reads flat file indexes (MPHF .hash + .pack) for queries.
+// Uses cached readers to avoid repeated opens; mapped files are cached for reuse.
+type SegmentReader struct {
 	basePath string
-	es       *RocksDBEventStore
+	es       *EventStore
 
-	mu        sync.Mutex
-	mmapCache map[string]*MmapFile // path -> mmap'd file, reused across queries
+	mu            sync.Mutex
+	mmapCache     map[string]*MmapFile         // path -> mmap'd file (for segment.meta)
+	hashCache     map[string]*streamhash.Index  // path -> streamhash index (for .hash files)
+	packMmapCache map[string]*MmapFile          // path -> mmap'd .pack file
+	eventCache    map[string]*eventstore.Reader  // path -> eventstore reader (for event data)
 }
 
-// NewSegmentFileReader creates a new reader for segment flat file indexes.
-func NewSegmentFileReader(basePath string, es *RocksDBEventStore) *SegmentFileReader {
-	return &SegmentFileReader{
-		basePath:  basePath,
-		es:        es,
-		mmapCache: make(map[string]*MmapFile),
+// NewSegmentReader creates a new reader for segment flat file indexes.
+func NewSegmentReader(basePath string, es *EventStore) *SegmentReader {
+	return &SegmentReader{
+		basePath:      basePath,
+		es:            es,
+		mmapCache:     make(map[string]*MmapFile),
+		hashCache:     make(map[string]*streamhash.Index),
+		packMmapCache: make(map[string]*MmapFile),
+		eventCache:    make(map[string]*eventstore.Reader),
 	}
 }
 
-// Close releases all mmap'd files held by this reader.
-func (r *SegmentFileReader) Close() error {
+// Close releases all cached readers held by this reader.
+func (r *SegmentReader) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, mm := range r.mmapCache {
 		mm.Close()
 	}
+	for _, hi := range r.hashCache {
+		hi.Close()
+	}
+	for _, pm := range r.packMmapCache {
+		pm.Close()
+	}
+	for _, er := range r.eventCache {
+		er.Close()
+	}
 	r.mmapCache = nil
+	r.hashCache = nil
+	r.packMmapCache = nil
+	r.eventCache = nil
 	return nil
 }
 
 // getMmap returns a cached mmap for the given path, opening it on first access.
-func (r *SegmentFileReader) getMmap(path string) (*MmapFile, error) {
+func (r *SegmentReader) getMmap(path string) (*MmapFile, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if mm, ok := r.mmapCache[path]; ok {
@@ -59,15 +82,63 @@ func (r *SegmentFileReader) getMmap(path string) (*MmapFile, error) {
 	return mm, nil
 }
 
+// getHashIndex returns a cached streamhash index for the given path.
+func (r *SegmentReader) getHashIndex(path string) (*streamhash.Index, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if hi, ok := r.hashCache[path]; ok {
+		return hi, nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	hi, err := streamhash.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	r.hashCache[path] = hi
+	return hi, nil
+}
+
+// getPackMmap returns a cached mmap for a .pack file.
+func (r *SegmentReader) getPackMmap(path string) (*MmapFile, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if pm, ok := r.packMmapCache[path]; ok {
+		return pm, nil
+	}
+	pm, err := OpenMmap(path)
+	if err != nil {
+		return nil, err
+	}
+	r.packMmapCache[path] = pm
+	return pm, nil
+}
+
+// getEventstoreReader returns a cached eventstore reader for the given path.
+func (r *SegmentReader) getEventstoreReader(dirPath string) (*eventstore.Reader, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if er, ok := r.eventCache[dirPath]; ok {
+		return er, nil
+	}
+	if _, err := os.Stat(filepath.Join(dirPath, EventsIndexFileName)); err != nil {
+		return nil, err
+	}
+	er := eventstore.Open(dirPath)
+	r.eventCache[dirPath] = er
+	return er, nil
+}
+
 // QueryEvents queries events using flat file segment indexes (single-value per filter).
-func (r *SegmentFileReader) QueryEvents(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+func (r *SegmentReader) QueryEvents(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
 	totalStart := time.Now()
 	result := &Bitmap32EventQueryResult{
 		LedgerRange: endLedger - startLedger + 1,
 	}
 
-	buckets := GetBucketsForRange(startLedger, endLedger)
-	result.BucketsTouched = len(buckets)
+	segments := GetSegmentsForRange(startLedger, endLedger)
+	result.SegmentsTouched = len(segments)
 
 	indexStart := time.Now()
 
@@ -82,7 +153,7 @@ func (r *SegmentFileReader) QueryEvents(contractID []byte, topicGroups [4][][]by
 	if len(contractID) > 0 {
 		expectedTerms++
 		termKey := ContractTermKey(contractID)
-		for _, segID := range buckets {
+		for _, segID := range segments {
 			bm, bytesRead, readTime, decodeTime, err := r.loadBitmapFromFile(segID, true, termKey, -1)
 			if err != nil {
 				continue // segment file may not exist
@@ -112,8 +183,8 @@ func (r *SegmentFileReader) QueryEvents(contractID []byte, topicGroups [4][][]by
 				continue
 			}
 			expectedTerms++
-			termKey := TopicTermKey(pos, topic)
-			for _, segID := range buckets {
+			termKey := TopicTermKey(topic)
+			for _, segID := range segments {
 				bm, bytesRead, readTime, decodeTime, err := r.loadBitmapFromFile(segID, false, termKey, pos)
 				if err != nil {
 					continue
@@ -158,7 +229,7 @@ func (r *SegmentFileReader) QueryEvents(contractID []byte, topicGroups [4][][]by
 	}
 
 	// Resolve dense IDs to event keys and fetch from RocksDB
-	events, err := r.fetchEvents(perSegment, contractID, nil, limit, result)
+	events, err := r.fetchEvents(perSegment, limit, result)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -168,14 +239,14 @@ func (r *SegmentFileReader) QueryEvents(contractID []byte, topicGroups [4][][]by
 }
 
 // QueryEventsMultiFilter queries events with multi-value OR/AND filters.
-func (r *SegmentFileReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+func (r *SegmentReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
 	totalStart := time.Now()
 	result := &Bitmap32EventQueryResult{
 		LedgerRange: endLedger - startLedger + 1,
 	}
 
-	buckets := GetBucketsForRange(startLedger, endLedger)
-	result.BucketsTouched = len(buckets)
+	segments := GetSegmentsForRange(startLedger, endLedger)
+	result.SegmentsTouched = len(segments)
 
 	indexStart := time.Now()
 
@@ -191,7 +262,7 @@ func (r *SegmentFileReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGr
 		groups[0] = &groupSegBitmaps{bitmaps: make(map[uint32][]*roaring.Bitmap)}
 		for _, cid := range contractIDs {
 			termKey := ContractTermKey(cid)
-			for _, segID := range buckets {
+			for _, segID := range segments {
 				bm, bytesRead, readTime, decodeTime, err := r.loadBitmapFromFile(segID, true, termKey, -1)
 				if err != nil {
 					continue
@@ -222,8 +293,8 @@ func (r *SegmentFileReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGr
 			if len(topicXDR) == 0 {
 				continue
 			}
-			termKey := TopicTermKey(pos, topicXDR)
-			for _, segID := range buckets {
+			termKey := TopicTermKey(topicXDR)
+			for _, segID := range segments {
 				bm, bytesRead, readTime, decodeTime, err := r.loadBitmapFromFile(segID, false, termKey, pos)
 				if err != nil {
 					continue
@@ -288,7 +359,7 @@ func (r *SegmentFileReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGr
 		return result, nil, nil
 	}
 
-	events, err := r.fetchEvents(perSegment, nil, contractIDs, limit, result)
+	events, err := r.fetchEvents(perSegment, limit, result)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -298,7 +369,7 @@ func (r *SegmentFileReader) QueryEventsMultiFilter(contractIDs [][]byte, topicGr
 }
 
 // loadLedgerMapFromFile reads a ledger map from segment flat files via mmap cache.
-func (r *SegmentFileReader) loadLedgerMapFromFile(segmentID uint32) (*BucketLedgerMap, error) {
+func (r *SegmentReader) loadLedgerMapFromFile(segmentID uint32) (*SegmentLedgerMap, error) {
 	dirName := fmt.Sprintf("%06d", segmentID)
 	path := filepath.Join(r.basePath, dirName, LedgerMapFileName)
 
@@ -307,97 +378,103 @@ func (r *SegmentFileReader) loadLedgerMapFromFile(segmentID uint32) (*BucketLedg
 		return nil, fmt.Errorf("failed to mmap ledger map: %w", err)
 	}
 
-	if mm.Len() != BucketLedgerMapSize {
-		return nil, fmt.Errorf("invalid ledger map size: got %d, expected %d", mm.Len(), BucketLedgerMapSize)
+	if mm.Len() != SegmentLedgerMapSize {
+		return nil, fmt.Errorf("invalid ledger map size: got %d, expected %d", mm.Len(), SegmentLedgerMapSize)
 	}
 
 	// Data points directly into the mmap region (zero-copy).
-	return &BucketLedgerMap{BucketID: segmentID, Data: mm.data}, nil
+	return &SegmentLedgerMap{SegmentID: segmentID, Data: mm.data}, nil
 }
 
-// loadBitmapFromFile loads a bitmap from segment flat files via mmap cache.
-// For contracts: reads contracts.idx/.pack
-// For topics: reads topic{pos}.idx/.pack, falls back to topics.idx/.pack
-func (r *SegmentFileReader) loadBitmapFromFile(segmentID uint32, isContract bool, termKey [16]byte, pos int) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
+// loadBitmapFromFile loads a bitmap from segment MPHF index files via reader cache.
+// For contracts: reads contracts.hash + contracts.pack
+// For topics: reads topic{pos}.hash + topic{pos}.pack
+func (r *SegmentReader) loadBitmapFromFile(segmentID uint32, isContract bool, termKey [32]byte, pos int) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
 	dirName := fmt.Sprintf("%06d", segmentID)
 	dirPath := filepath.Join(r.basePath, dirName)
 
-	var idxName string
+	var name string
 	if isContract {
-		idxName = "contracts"
+		name = "contracts"
 	} else {
-		idxName = fmt.Sprintf("topic%d", pos)
+		name = fmt.Sprintf("topic%d", pos)
 	}
 
-	idxPath := filepath.Join(dirPath, idxName+".idx")
-	packPath := filepath.Join(dirPath, idxName+".pack")
+	hashPath := filepath.Join(dirPath, name+".hash")
+	packPath := filepath.Join(dirPath, name+".pack")
 
-	// Try per-position file first; fall back to combined topics
+	// Get cached MPHF index
 	readStart := time.Now()
-	var idxFile *IndexFile
-	idxMm, err := r.getMmap(idxPath)
-	if err == nil {
-		idxFile, err = OpenIndexFileMmap(idxMm)
-	}
-	if err != nil && !isContract {
-		// Fall back to combined topics.idx
-		idxName = "topics"
-		idxPath = filepath.Join(dirPath, idxName+".idx")
-		packPath = filepath.Join(dirPath, idxName+".pack")
-		idxMm, err = r.getMmap(idxPath)
-		if err == nil {
-			idxFile, err = OpenIndexFileMmap(idxMm)
-		}
-	}
-	readTime := time.Since(readStart)
+	hashIdx, err := r.getHashIndex(hashPath)
 	if err != nil {
 		return nil, 0, 0, 0, err
 	}
 
-	// Look up the term (binary search — pure CPU, no I/O)
-	entry := idxFile.LookupTerm(termKey)
-	if entry == nil {
-		return nil, 0, readTime, 0, nil
+	// O(1) MPHF lookup with fingerprint check
+	slot, err := hashIdx.Query(termKey[:])
+	if err != nil {
+		// Fingerprint mismatch or not found — term not in index
+		return nil, 0, time.Since(readStart), 0, nil
 	}
 
-	// Read bitmap data from pack file (zero-copy slice from mmap)
-	packStart := time.Now()
-	packMm, err := r.getMmap(packPath)
+	// Get cached pack mmap
+	packMmap, err := r.getPackMmap(packPath)
 	if err != nil {
-		return nil, 0, readTime, 0, err
+		return nil, 0, time.Since(readStart), 0, err
 	}
-	data, err := ReadBitmapFromPackMmap(packMm, entry.PackOffset, entry.PackLength)
-	packReadTime := time.Since(packStart)
-	if err != nil {
-		return nil, 0, readTime, 0, err
-	}
-	bytesRead := int64(entry.PackLength)
 
-	// Decode bitmap (UnmarshalBinary copies data, safe with read-only mmap)
+	// Read offsets from trailer
+	numKeys := hashIdx.NumKeys()
+	trailerSize := (numKeys + 1) * 8
+	fileSize := uint64(packMmap.Len())
+	if fileSize < trailerSize {
+		return nil, 0, time.Since(readStart), 0, fmt.Errorf("pack file too small: %d < trailer %d", fileSize, trailerSize)
+	}
+	trailerStart := fileSize - trailerSize
+
+	offStart := trailerStart + slot*8
+	offEnd := trailerStart + (slot+1)*8
+	if offEnd+8 > fileSize {
+		return nil, 0, time.Since(readStart), 0, fmt.Errorf("offset out of bounds in pack trailer")
+	}
+
+	bitmapStart := binary.LittleEndian.Uint64(packMmap.data[offStart : offStart+8])
+	bitmapEnd := binary.LittleEndian.Uint64(packMmap.data[offEnd : offEnd+8])
+
+	if bitmapEnd < bitmapStart || bitmapEnd > trailerStart {
+		return nil, 0, time.Since(readStart), 0, fmt.Errorf("invalid bitmap offsets: [%d, %d)", bitmapStart, bitmapEnd)
+	}
+
+	readTime := time.Since(readStart)
+
+	bitmapBytes := packMmap.data[bitmapStart:bitmapEnd]
+	bytesRead := int64(bitmapEnd - bitmapStart)
+
+	// Decode bitmap
 	decodeStart := time.Now()
 	bm := roaring.New()
-	if err = bm.UnmarshalBinary(data); err != nil {
-		return nil, bytesRead, readTime + packReadTime, 0, fmt.Errorf("failed to decode bitmap: %w", err)
+	if err = bm.UnmarshalBinary(bitmapBytes); err != nil {
+		return nil, bytesRead, readTime, 0, fmt.Errorf("failed to decode bitmap: %w", err)
 	}
 	decodeTime := time.Since(decodeStart)
 
-	return bm, bytesRead, readTime + packReadTime, decodeTime, nil
+	return bm, bytesRead, readTime, decodeTime, nil
 }
 
 // trimToLedgerRange trims a bitmap to the dense ID range corresponding to the requested ledger range.
-func (r *SegmentFileReader) trimToLedgerRange(segID uint32, bm *roaring.Bitmap, startLedger, endLedger uint32) *roaring.Bitmap {
-	segmentStart := segID * BucketSize
+func (r *SegmentReader) trimToLedgerRange(segID uint32, bm *roaring.Bitmap, startLedger, endLedger uint32) *roaring.Bitmap {
+	segmentStart := segID * SegmentSize
 
 	var startOff uint16
 	if startLedger > segmentStart {
 		startOff = uint16(startLedger - segmentStart)
 	}
-	endOff := uint16(BucketSize - 1)
-	if endLedger < segmentStart+BucketSize-1 {
+	endOff := uint16(SegmentSize - 1)
+	if endLedger < segmentStart+SegmentSize-1 {
 		endOff = uint16(endLedger - segmentStart)
 	}
 
-	needsTrim := startOff > 0 || endOff < uint16(BucketSize-1)
+	needsTrim := startOff > 0 || endOff < uint16(SegmentSize-1)
 	if !needsTrim {
 		return bm
 	}
@@ -425,7 +502,7 @@ func (r *SegmentFileReader) trimToLedgerRange(segID uint32, bm *roaring.Bitmap, 
 
 // fetchEvents resolves dense IDs to (ledger, eventSeq) and fetches events from RocksDB.
 // Mirrors the parallel worker pattern from QueryEventsWithBitmap32EventIndex.
-func (r *SegmentFileReader) fetchEvents(perSegment map[uint32]*roaring.Bitmap, singleContractID []byte, multiContractIDs [][]byte, limit int, result *Bitmap32EventQueryResult) ([]*query.Event, error) {
+func (r *SegmentReader) fetchEvents(perSegment map[uint32]*roaring.Bitmap, limit int, result *Bitmap32EventQueryResult) ([]*query.Event, error) {
 	type bitmapEvtMeta struct {
 		ledger   uint32
 		eventSeq uint16
@@ -547,43 +624,11 @@ func (r *SegmentFileReader) fetchEvents(perSegment map[uint32]*roaring.Bitmap, s
 				wr.bytesRead += int64(len(valueCopy))
 				wr.scanned++
 
-				// Post-filter: contract ID (topic filtering handled by positional index)
-				filterStart := time.Now()
-				if r.es.eventFormat == "binary" {
-					if len(singleContractID) > 0 {
-						header := event.ParseBinaryHeader(valueCopy)
-						if header != nil && !header.MatchesContractID(singleContractID) {
-							wr.filterTime += time.Since(filterStart)
-							continue
-						}
-					} else if len(multiContractIDs) > 0 {
-						header := event.ParseBinaryHeader(valueCopy)
-						if header != nil {
-							contractMatch := false
-							for _, cid := range multiContractIDs {
-								if header.MatchesContractID(cid) {
-									contractMatch = true
-									break
-								}
-							}
-							if !contractMatch {
-								wr.filterTime += time.Since(filterStart)
-								continue
-							}
-						}
-					}
-				}
-				wr.filterTime += time.Since(filterStart)
-
 				// Decode to query.Event
 				decStart := time.Now()
 				var ev *query.Event
 				var decErr error
-				if r.es.eventFormat == "binary" {
-					ev, decErr = event.DecodeBinaryToQueryEventV2(valueCopy, meta.ledger, meta.eventSeq)
-				} else {
-					ev, decErr = parseRawXDRToQueryEvent(valueCopy, meta.ledger, 0, 0, meta.eventSeq)
-				}
+				ev, decErr = parseRawXDRToQueryEvent(valueCopy, meta.ledger, 0, 0, meta.eventSeq)
 				wr.decodeTime += time.Since(decStart)
 
 				if decErr != nil {
@@ -626,15 +671,15 @@ func (r *SegmentFileReader) fetchEvents(perSegment map[uint32]*roaring.Bitmap, s
 	return events, nil
 }
 
-// QueryEventsFromVolume queries events using flat file bitmap indexes + flat file event volume (no RocksDB).
-func (r *SegmentFileReader) QueryEventsFromVolume(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+// QueryEventsFromSegmentData queries events using flat file bitmap indexes + eventstore (no RocksDB).
+func (r *SegmentReader) QueryEventsFromSegmentData(contractID []byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
 	totalStart := time.Now()
 	result := &Bitmap32EventQueryResult{
 		LedgerRange: endLedger - startLedger + 1,
 	}
 
-	buckets := GetBucketsForRange(startLedger, endLedger)
-	result.BucketsTouched = len(buckets)
+	segments := GetSegmentsForRange(startLedger, endLedger)
+	result.SegmentsTouched = len(segments)
 
 	indexStart := time.Now()
 
@@ -647,7 +692,7 @@ func (r *SegmentFileReader) QueryEventsFromVolume(contractID []byte, topicGroups
 	if len(contractID) > 0 {
 		expectedTerms++
 		termKey := ContractTermKey(contractID)
-		for _, segID := range buckets {
+		for _, segID := range segments {
 			bm, bytesRead, readTime, decodeTime, err := r.loadBitmapFromFile(segID, true, termKey, -1)
 			if err != nil {
 				continue
@@ -675,8 +720,8 @@ func (r *SegmentFileReader) QueryEventsFromVolume(contractID []byte, topicGroups
 				continue
 			}
 			expectedTerms++
-			termKey := TopicTermKey(pos, topic)
-			for _, segID := range buckets {
+			termKey := TopicTermKey(topic)
+			for _, segID := range segments {
 				bm, bytesRead, readTime, decodeTime, err := r.loadBitmapFromFile(segID, false, termKey, pos)
 				if err != nil {
 					continue
@@ -719,7 +764,7 @@ func (r *SegmentFileReader) QueryEventsFromVolume(contractID []byte, topicGroups
 		return result, nil, nil
 	}
 
-	events, err := r.fetchEventsFromVolume(perSegment, limit, result)
+	events, err := r.fetchEventsFromSegmentData(perSegment, limit, result)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -728,15 +773,15 @@ func (r *SegmentFileReader) QueryEventsFromVolume(contractID []byte, topicGroups
 	return result, events, nil
 }
 
-// QueryEventsFromVolumeMultiFilter queries events from volume with multi-value OR/AND filters.
-func (r *SegmentFileReader) QueryEventsFromVolumeMultiFilter(contractIDs [][]byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+// QueryEventsFromSegmentDataMultiFilter queries events from eventstore with multi-value OR/AND filters.
+func (r *SegmentReader) QueryEventsFromSegmentDataMultiFilter(contractIDs [][]byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
 	totalStart := time.Now()
 	result := &Bitmap32EventQueryResult{
 		LedgerRange: endLedger - startLedger + 1,
 	}
 
-	buckets := GetBucketsForRange(startLedger, endLedger)
-	result.BucketsTouched = len(buckets)
+	segments := GetSegmentsForRange(startLedger, endLedger)
+	result.SegmentsTouched = len(segments)
 
 	indexStart := time.Now()
 
@@ -749,7 +794,7 @@ func (r *SegmentFileReader) QueryEventsFromVolumeMultiFilter(contractIDs [][]byt
 		groups[0] = &groupSegBitmaps{bitmaps: make(map[uint32][]*roaring.Bitmap)}
 		for _, cid := range contractIDs {
 			termKey := ContractTermKey(cid)
-			for _, segID := range buckets {
+			for _, segID := range segments {
 				bm, bytesRead, readTime, decodeTime, err := r.loadBitmapFromFile(segID, true, termKey, -1)
 				if err != nil {
 					continue
@@ -779,8 +824,8 @@ func (r *SegmentFileReader) QueryEventsFromVolumeMultiFilter(contractIDs [][]byt
 			if len(topicXDR) == 0 {
 				continue
 			}
-			termKey := TopicTermKey(pos, topicXDR)
-			for _, segID := range buckets {
+			termKey := TopicTermKey(topicXDR)
+			for _, segID := range segments {
 				bm, bytesRead, readTime, decodeTime, err := r.loadBitmapFromFile(segID, false, termKey, pos)
 				if err != nil {
 					continue
@@ -840,7 +885,7 @@ func (r *SegmentFileReader) QueryEventsFromVolumeMultiFilter(contractIDs [][]byt
 		return result, nil, nil
 	}
 
-	events, err := r.fetchEventsFromVolume(perSegment, limit, result)
+	events, err := r.fetchEventsFromSegmentData(perSegment, limit, result)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -849,16 +894,16 @@ func (r *SegmentFileReader) QueryEventsFromVolumeMultiFilter(contractIDs [][]byt
 	return result, events, nil
 }
 
-// GetEventsInRange reads all events in a ledger range from flat file volumes (no index, no RocksDB).
-// Uses the ledger map to determine the dense ID range per bucket and reads sequentially.
-func (r *SegmentFileReader) GetEventsInRange(startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
+// GetEventsInRange reads all events in a ledger range from eventstore (no index, no RocksDB).
+// Uses the ledger map to determine the dense ID range per segment and reads sequentially.
+func (r *SegmentReader) GetEventsInRange(startLedger, endLedger uint32, limit int) (*Bitmap32EventQueryResult, []*query.Event, error) {
 	totalStart := time.Now()
 	result := &Bitmap32EventQueryResult{
 		LedgerRange: endLedger - startLedger + 1,
 	}
 
-	buckets := GetBucketsForRange(startLedger, endLedger)
-	result.BucketsTouched = len(buckets)
+	segments := GetSegmentsForRange(startLedger, endLedger)
+	result.SegmentsTouched = len(segments)
 
 	fetchCap := 0
 	if limit > 0 {
@@ -866,7 +911,7 @@ func (r *SegmentFileReader) GetEventsInRange(startLedger, endLedger uint32, limi
 	}
 	events := make([]*query.Event, 0)
 
-	for _, segID := range buckets {
+	for _, segID := range segments {
 		if fetchCap > 0 && len(events) >= fetchCap {
 			break
 		}
@@ -876,14 +921,14 @@ func (r *SegmentFileReader) GetEventsInRange(startLedger, endLedger uint32, limi
 			continue // segment may not exist
 		}
 
-		segmentStart := segID * BucketSize
+		segmentStart := segID * SegmentSize
 
 		var startOff uint16
 		if startLedger > segmentStart {
 			startOff = uint16(startLedger - segmentStart)
 		}
-		endOff := uint16(BucketSize - 1)
-		if endLedger < segmentStart+BucketSize-1 {
+		endOff := uint16(SegmentSize - 1)
+		if endLedger < segmentStart+SegmentSize-1 {
 			endOff = uint16(endLedger - segmentStart)
 		}
 
@@ -892,47 +937,45 @@ func (r *SegmentFileReader) GetEventsInRange(startLedger, endLedger uint32, limi
 			continue
 		}
 
-		// Build sequential dense IDs slice
 		count := int(endID - startID + 1)
 		if fetchCap > 0 && count > fetchCap-len(events) {
 			count = fetchCap - len(events)
 		}
-		denseIDs := make([]uint32, count)
-		for i := 0; i < count; i++ {
-			denseIDs[i] = startID + uint32(i)
-		}
 
 		result.MatchingLocalIDs += count
 
-		// Batch read events from volume (via mmap cache)
+		// Open eventstore reader for this segment
+		dirName := fmt.Sprintf("%06d", segID)
+		eventsPath := filepath.Join(r.basePath, dirName)
+
 		readStart := time.Now()
-		eventBlobs, volTiming, err := r.readEventsFromVolumeMmap(segID, denseIDs)
-		readTime := time.Since(readStart)
+		er, err := r.getEventstoreReader(eventsPath)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to read events from volume for segment %d: %w", segID, err)
+			return nil, nil, fmt.Errorf("failed to open eventstore for segment %d: %w", segID, err)
 		}
 
-		result.EventFetchTime += readTime
-		if volTiming != nil {
-			result.DecompressTime += volTiming.DecompressTime
-			result.EventDiskReadTime += volTiming.DiskReadTime
-			result.GroupsDecompressed += volTiming.GroupsDecompressed
-		}
-
-		// Decode events
-		for _, denseID := range denseIDs {
-			blob, ok := eventBlobs[denseID]
-			if !ok {
-				continue
+		// Sequential range read using eventstore.ReadEvents
+		var ioStats eventstore.ReadStats
+		eventIdx := 0
+		for blob, readErr := range er.ReadEvents(int(startID), count, &ioStats) {
+			if readErr != nil {
+				return nil, nil, fmt.Errorf("failed to read events from segment %d: %w", segID, readErr)
 			}
 
-			result.EventBytesRead += int64(len(blob))
+			denseID := startID + uint32(eventIdx)
+			eventIdx++
+
+			// Copy the blob since it's only valid until the next iteration
+			blobCopy := make([]byte, len(blob))
+			copy(blobCopy, blob)
+
+			result.EventBytesRead += int64(len(blobCopy))
 			result.EventsScanned++
 
 			ledger, eventSeq := lm.DenseIDToLedgerAndSeq(denseID)
 
 			decStart := time.Now()
-			ev, err := event.DecodeBinaryToQueryEvent(blob, ledger, 0, 0, eventSeq)
+			ev, err := event.DecodeBinaryToQueryEventV4(blobCopy, ledger, eventSeq)
 			result.DecodeTime += time.Since(decStart)
 
 			if err != nil {
@@ -941,6 +984,10 @@ func (r *SegmentFileReader) GetEventsInRange(startLedger, endLedger uint32, limi
 
 			events = append(events, ev)
 		}
+		result.EventFetchTime += time.Since(readStart)
+		result.DecompressTime += ioStats.DecompressTime
+		result.EventDiskReadTime += ioStats.DiskReadTime
+		result.GroupsDecompressed += ioStats.BlocksRead
 	}
 
 	if fetchCap > 0 && len(events) > fetchCap {
@@ -952,9 +999,9 @@ func (r *SegmentFileReader) GetEventsInRange(startLedger, endLedger uint32, limi
 	return result, events, nil
 }
 
-// fetchEventsFromVolume reads events from flat file event volumes (no RocksDB).
-// Uses O(1) positional lookup per event via the offset array.
-func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring.Bitmap, limit int, result *Bitmap32EventQueryResult) ([]*query.Event, error) {
+// fetchEventsFromSegmentData reads events from eventstore (no RocksDB).
+// Uses eventstore.ReadIndices for parallel scattered access.
+func (r *SegmentReader) fetchEventsFromSegmentData(perSegment map[uint32]*roaring.Bitmap, limit int, result *Bitmap32EventQueryResult) ([]*query.Event, error) {
 	segIDs := make([]uint32, 0, len(perSegment))
 	for segID := range perSegment {
 		segIDs = append(segIDs, segID)
@@ -974,7 +1021,7 @@ func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring
 
 		bitmap := perSegment[segID]
 
-		// Collect dense IDs for this segment
+		// Collect dense IDs for this segment (sorted by bitmap iterator)
 		denseIDs := make([]uint32, 0, bitmap.GetCardinality())
 		bitmapIter := bitmap.Iterator()
 		for bitmapIter.HasNext() {
@@ -994,27 +1041,32 @@ func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring
 			return nil, fmt.Errorf("failed to load ledger map for segment %d: %w", segID, err)
 		}
 
-		// Batch read events from volume (via mmap cache)
+		// Open eventstore reader
+		dirName := fmt.Sprintf("%06d", segID)
+		eventsPath := filepath.Join(r.basePath, dirName)
+
 		readStart := time.Now()
-		eventBlobs, volTiming, err := r.readEventsFromVolumeMmap(segID, denseIDs)
-		readTime := time.Since(readStart)
+		er, err := r.getEventstoreReader(eventsPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read events from volume for segment %d: %w", segID, err)
+			return nil, fmt.Errorf("failed to open eventstore for segment %d: %w", segID, err)
 		}
 
-		result.EventFetchTime += readTime
-		if volTiming != nil {
-			result.DecompressTime += volTiming.DecompressTime
-			result.EventDiskReadTime += volTiming.DiskReadTime
-			result.GroupsDecompressed += volTiming.GroupsDecompressed
+		// Convert uint32 dense IDs to sorted int indices for ReadIndices
+		indices := make([]int, len(denseIDs))
+		for i, id := range denseIDs {
+			indices[i] = int(id)
 		}
 
-		// Decode events
-		for _, denseID := range denseIDs {
-			blob, ok := eventBlobs[denseID]
-			if !ok {
-				continue
+		// Use ReadIndices for parallel scattered event fetch
+		var ioStats eventstore.ReadStats
+		eventIdx := 0
+		for blob, readErr := range er.ReadIndices(context.Background(), indices, &ioStats) {
+			if readErr != nil {
+				return nil, fmt.Errorf("failed to read events from segment %d: %w", segID, readErr)
 			}
+
+			denseID := denseIDs[eventIdx]
+			eventIdx++
 
 			result.EventBytesRead += int64(len(blob))
 			result.EventsScanned++
@@ -1022,7 +1074,7 @@ func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring
 			ledger, eventSeq := lm.DenseIDToLedgerAndSeq(denseID)
 
 			decStart := time.Now()
-			ev, err := event.DecodeBinaryToQueryEvent(blob, ledger, 0, 0, eventSeq)
+			ev, err := event.DecodeBinaryToQueryEventV4(blob, ledger, eventSeq)
 			result.DecodeTime += time.Since(decStart)
 
 			if err != nil {
@@ -1031,6 +1083,10 @@ func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring
 
 			events = append(events, ev)
 		}
+		result.EventFetchTime += time.Since(readStart)
+		result.DecompressTime += ioStats.DecompressTime
+		result.EventDiskReadTime += ioStats.DiskReadTime
+		result.GroupsDecompressed += ioStats.BlocksRead
 	}
 
 	if limit > 0 && len(events) > limit {
@@ -1041,83 +1097,48 @@ func (r *SegmentFileReader) fetchEventsFromVolume(perSegment map[uint32]*roaring
 	return events, nil
 }
 
-// readEventsFromVolumeMmap reads events from mmap'd volume files via the cache.
-func (r *SegmentFileReader) readEventsFromVolumeMmap(segID uint32, denseIDs []uint32) (map[uint32][]byte, *VolumeReadTiming, error) {
-	dirName := fmt.Sprintf("%06d", segID)
-	dirPath := filepath.Join(r.basePath, dirName)
-
-	offsetsPath := filepath.Join(dirPath, EventOffsetsFileName)
-	eventsPath := filepath.Join(dirPath, EventsFileName)
-
-	offsetsMm, err := r.getMmap(offsetsPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to mmap event_offsets.dat: %w", err)
-	}
-	eventsMm, err := r.getMmap(eventsPath)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to mmap events.dat: %w", err)
-	}
-
-	hdr, err := parseOffsetsHeaderMmap(offsetsMm)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Load dictionary for dict-compressed volumes
-	var dictMm *MmapFile
-	if hdr.dictCompressed {
-		dictPath := filepath.Join(dirPath, EventsDictFileName)
-		dictMm, err = r.getMmap(dictPath)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to mmap events.dict: %w", err)
-		}
-	}
-
-	return ReadEventsFromVolumeMmap(offsetsMm, eventsMm, hdr, dictMm, denseIDs)
-}
-
-// SegmentFileToUnified converts a Bitmap32EventQueryResult from segment-file queries to UnifiedQueryResult.
-func SegmentFileToUnified(r *Bitmap32EventQueryResult) *UnifiedQueryResult {
+// SegmentIndexToUnified converts a Bitmap32EventQueryResult from segment index queries to UnifiedQueryResult.
+func SegmentIndexToUnified(r *Bitmap32EventQueryResult) *UnifiedQueryResult {
 	return &UnifiedQueryResult{
-		IndexType:         "segment-file",
-		LedgerRange:       r.LedgerRange,
-		BucketsTouched:    r.BucketsTouched,
-		IndexMatches:      r.MatchingLocalIDs,
-		MatchUnitName:     "local IDs",
-		EventsScanned:     r.EventsScanned,
-		EventsReturned:    r.EventsReturned,
-		IndexBytesRead:    r.IndexBytesRead,
-		EventBytesRead:    r.EventBytesRead,
-		IndexLookupTime:   r.IndexLookupTime,
-		EventFetchTime:    r.EventFetchTime,
+		IndexType:          "segment-index",
+		LedgerRange:        r.LedgerRange,
+		SegmentsTouched:    r.SegmentsTouched,
+		IndexMatches:       r.MatchingLocalIDs,
+		MatchUnitName:      "local IDs",
+		EventsScanned:      r.EventsScanned,
+		EventsReturned:     r.EventsReturned,
+		IndexBytesRead:     r.IndexBytesRead,
+		EventBytesRead:     r.EventBytesRead,
+		IndexLookupTime:    r.IndexLookupTime,
+		EventFetchTime:     r.EventFetchTime,
 		DecompressTime:     r.DecompressTime,
 		EventDiskReadTime:  r.EventDiskReadTime,
 		GroupsDecompressed: r.GroupsDecompressed,
-		DecodeTime:        r.DecodeTime,
-		FilterTime:        r.FilterTime,
-		TotalTime:         r.TotalTime,
+		DecodeTime:         r.DecodeTime,
+		FilterTime:         r.FilterTime,
+		TotalTime:          r.TotalTime,
 	}
 }
 
-// SegmentVolumeToUnified converts a Bitmap32EventQueryResult from segment-volume queries to UnifiedQueryResult.
-func SegmentVolumeToUnified(r *Bitmap32EventQueryResult) *UnifiedQueryResult {
+// SegmentDataToUnified converts a Bitmap32EventQueryResult from segment file store queries to UnifiedQueryResult.
+func SegmentDataToUnified(r *Bitmap32EventQueryResult) *UnifiedQueryResult {
 	return &UnifiedQueryResult{
-		IndexType:         "segment-volume",
-		LedgerRange:       r.LedgerRange,
-		BucketsTouched:    r.BucketsTouched,
-		IndexMatches:      r.MatchingLocalIDs,
-		MatchUnitName:     "local IDs",
-		EventsScanned:     r.EventsScanned,
-		EventsReturned:    r.EventsReturned,
-		IndexBytesRead:    r.IndexBytesRead,
-		EventBytesRead:    r.EventBytesRead,
-		IndexLookupTime:   r.IndexLookupTime,
-		EventFetchTime:    r.EventFetchTime,
+		IndexType:          "segment-data",
+		LedgerRange:        r.LedgerRange,
+		SegmentsTouched:    r.SegmentsTouched,
+		IndexMatches:       r.MatchingLocalIDs,
+		MatchUnitName:      "local IDs",
+		EventsScanned:      r.EventsScanned,
+		EventsReturned:     r.EventsReturned,
+		IndexBytesRead:     r.IndexBytesRead,
+		EventBytesRead:     r.EventBytesRead,
+		IndexLookupTime:    r.IndexLookupTime,
+		EventFetchTime:     r.EventFetchTime,
 		DecompressTime:     r.DecompressTime,
 		EventDiskReadTime:  r.EventDiskReadTime,
 		GroupsDecompressed: r.GroupsDecompressed,
-		DecodeTime:        r.DecodeTime,
-		FilterTime:        r.FilterTime,
-		TotalTime:         r.TotalTime,
+		DecodeTime:         r.DecodeTime,
+		FilterTime:         r.FilterTime,
+		TotalTime:          r.TotalTime,
 	}
 }

@@ -44,9 +44,6 @@ type SourceConfig struct {
 type StorageConfig struct {
 	DBPath string `toml:"db_path"` // Path to RocksDB database directory
 
-	// Event storage format: "xdr" (default) or "binary" (faster queries)
-	EventFormat string `toml:"event_format"`
-
 	// Write performance
 	WriteBufferSizeMB           int `toml:"write_buffer_size_mb"`             // Memtable size (default: 64)
 	MaxWriteBufferNumber        int `toml:"max_write_buffer_number"`          // Number of memtables (default: 2)
@@ -72,14 +69,14 @@ type StorageConfig struct {
 	TargetFileSizeMB       int  `toml:"target_file_size_mb"`         // Target SST file size (default: 256)
 	MaxBytesForLevelBaseMB int  `toml:"max_bytes_for_level_base_mb"` // Max bytes for L1 (default: 1024)
 
-	// Flat file segment indexes
-	SegmentFilePath    string `toml:"segment_file_path"`    // Base directory for segment flat files (empty = disabled)
-	EnableSegmentFiles bool   `toml:"enable_segment_files"` // Enable writing flat file indexes at segment boundaries
-	EnableEventVolume       bool   `toml:"enable_event_volume"`        // Write event data to flat files alongside indexes
-	CompressEventVolume     bool   `toml:"compress_event_volume"`      // Zstd compress per-event blobs in event volume files
-	DictCompressEventVolume  bool `toml:"dict_compress_event_volume"`  // Zstd dictionary compression for event volume
-	DictSampleCount          int  `toml:"dict_sample_count"`           // Events to buffer before training dict (default: 16384)
-	EventCompressGroupSize   int  `toml:"event_compress_group_size"`   // Events per compression group (default: 1 = per-event)
+	// Storage destinations
+	RocksDB      bool `toml:"rocksdb"`       // Write events, indexes, ledger maps to RocksDB (default: true)
+	SegmentFiles bool `toml:"segment_files"` // Write events, indexes, ledger maps to segment flat files (default: false)
+
+	// Flat file segment options
+	SegmentPath  string `toml:"segment_path"`  // Base directory for segment flat files (required if segment_files = true)
+	CompressData bool   `toml:"compress_data"` // Zstd compress per-event blobs in event file store
+	BlockSize    int    `toml:"block_size"`    // Events per compression block (default: 1 = per-event)
 }
 
 // =============================================================================
@@ -97,10 +94,6 @@ type IngestionConfig struct {
 
 	// Index maintenance during ingestion
 	UniqueIndexes bool `toml:"unique_indexes"` // Maintain unique value counts (default: false)
-	V2Indexes     bool `toml:"v2_indexes"`     // Maintain V2 indexes: bitmap32-event + posting-v2 (default: true)
-
-	// Index flush interval (applies to both bitmap and posting list indexes)
-	IndexFlushInterval int `toml:"index_flush_interval"` // Ledgers between index flushes (default: 10000)
 
 	// Parallelism
 	Workers   int `toml:"workers"`    // Parallel workers (0 = NumCPU)
@@ -146,8 +139,7 @@ func DefaultConfig() *Config {
 			Network:   "mainnet",
 		},
 		Storage: StorageConfig{
-			DBPath:      "./events.db",
-			EventFormat: "xdr", // "xdr" or "binary"
+			DBPath: "./events.db",
 			// Write performance
 			WriteBufferSizeMB:           64,
 			MaxWriteBufferNumber:        2,
@@ -167,15 +159,16 @@ func DefaultConfig() *Config {
 			DisableAutoCompaction:  false,
 			TargetFileSizeMB:       256,
 			MaxBytesForLevelBaseMB: 1024,
+			// Storage destinations
+			RocksDB:      true,
+			SegmentFiles: false,
 		},
 		Ingestion: IngestionConfig{
 			ProgressFile:       "", // Empty = disabled
 			FinalCompaction:    true,
 			ComputeStats:       false,
 			UniqueIndexes: false,
-			V2Indexes:          true, // V2 indexes enabled by default
-			IndexFlushInterval: 10000, // Flush indexes every 10K ledgers
-			Workers:            0,     // 0 = NumCPU
+			Workers:       0, // 0 = NumCPU
 			BatchSize:          100,
 			QueueSize:          0, // 0 = workers * 2
 		},
@@ -228,9 +221,14 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("source.network is required")
 	}
 
-	// Validate event format
-	if c.Storage.EventFormat != "" && c.Storage.EventFormat != "xdr" && c.Storage.EventFormat != "binary" {
-		return fmt.Errorf("storage.event_format must be 'xdr' or 'binary', got '%s'", c.Storage.EventFormat)
+	// At least one storage destination must be enabled
+	if !c.Storage.RocksDB && !c.Storage.SegmentFiles {
+		return fmt.Errorf("at least one of storage.rocksdb or storage.segment_files must be true")
+	}
+
+	// Segment files require a path
+	if c.Storage.SegmentFiles && c.Storage.SegmentPath == "" {
+		return fmt.Errorf("storage.segment_path is required when storage.segment_files is true")
 	}
 
 	return nil

@@ -13,14 +13,12 @@ import (
 
 // PipelineConfig configures the parallel ingestion pipeline
 type PipelineConfig struct {
-	Workers            int    // Number of parallel workers
-	BatchSize          int    // Ledgers to batch before writing
-	QueueSize          int    // Channel buffer size
-	DataDir            string // Ledger data directory
-	NetworkPassphrase  string // Network passphrase for XDR parsing
-	MaintainUniqueIdx  bool   // Maintain unique indexes during ingestion
-	MaintainV2Idx      bool   // Maintain V2 indexes: bitmap32-event + posting-v2
-	IndexFlushInterval int    // Ledgers between index flushes (0 = only at end)
+	Workers           int    // Number of parallel workers
+	BatchSize         int    // Ledgers to batch before writing
+	QueueSize         int    // Channel buffer size
+	DataDir           string // Ledger data directory
+	NetworkPassphrase string // Network passphrase for XDR parsing
+	MaintainUniqueIdx bool   // Maintain unique indexes during ingestion
 
 	// ExcludeTopic0 is a set of topic0 values to skip during ingestion.
 	// Keys are the raw topic0 bytes as strings.
@@ -29,11 +27,8 @@ type PipelineConfig struct {
 	// ExcludeDiagnostic skips diagnostic events during ingestion.
 	ExcludeDiagnostic bool
 
-	// EnableSegmentFiles enables writing flat file indexes at segment boundaries.
-	EnableSegmentFiles bool
-
-	// EnableEventVolume enables writing event data to flat files alongside indexes.
-	EnableEventVolume bool
+	// SegmentFiles enables writing flat file indexes and event data at segment boundaries.
+	SegmentFiles bool
 }
 
 // PipelineStats tracks pipeline performance
@@ -63,7 +58,7 @@ type LedgerResult struct {
 type Pipeline struct {
 	config PipelineConfig
 	stats  PipelineStats
-	store  *store.RocksDBEventStore
+	store  *store.EventStore
 
 	// Channels
 	jobs    chan uint32        // Ledger sequences to process
@@ -80,7 +75,7 @@ type Pipeline struct {
 }
 
 // NewPipeline creates a new parallel ingestion pipeline
-func NewPipeline(config PipelineConfig, store *store.RocksDBEventStore) *Pipeline {
+func NewPipeline(config PipelineConfig, store *store.EventStore) *Pipeline {
 	if config.Workers <= 0 {
 		config.Workers = runtime.NumCPU()
 	}
@@ -275,7 +270,6 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 				writeStart := time.Now()
 				_, err := p.store.StoreEvents(eventBatch, &store.StoreOptions{
 					UniqueIndexes:     p.config.MaintainUniqueIdx,
-					V2Indexes:         p.config.MaintainV2Idx,
 					ExcludeTopic0:     p.config.ExcludeTopic0,
 					ExcludeDiagnostic: p.config.ExcludeDiagnostic,
 				})
@@ -295,44 +289,28 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 				batchRawBytes = 0
 				batchStartSeq = nextSeq
 
-				// Periodic bitmap flush to prevent hot segment memory growth
-				if p.config.MaintainV2Idx && p.config.IndexFlushInterval > 0 &&
-					ledgersProcessed%p.config.IndexFlushInterval == 0 {
-					if err := p.store.FlushBitmapIndexes(); err != nil {
-						return fmt.Errorf("failed to flush bitmap indexes: %w", err)
-					}
-				}
-
-				// Periodic V2 posting list flush when bitmap32 mode is active
-				if p.config.MaintainV2Idx && p.config.IndexFlushInterval > 0 &&
-					ledgersProcessed%p.config.IndexFlushInterval == 0 {
-					if _, _, err := p.store.FlushPostingListV2Indexes(); err != nil {
-						return fmt.Errorf("failed to flush V2 posting list indexes: %w", err)
-					}
-				}
 			}
 
-			// Check for bucket boundary crossing — write flat files for completed bucket
-			if p.config.EnableSegmentFiles && p.config.MaintainV2Idx {
+			// Check for segment boundary crossing — write flat files for completed segment
+			if p.config.SegmentFiles {
 				prevLedger := nextSeq - 1 // the ledger we just processed
-				prevBucket := store.BucketID(prevLedger)
-				_, bucketEnd := store.BucketRange(prevBucket)
+				prevSegment := store.SegmentID(prevLedger)
+				_, segmentEnd := store.SegmentRange(prevSegment)
 
-				// Bucket is complete when the last processed ledger equals the bucket's last ledger
-				if prevLedger >= bucketEnd {
+				// Segment is complete when the last processed ledger equals the segment's last ledger
+				if prevLedger >= segmentEnd {
 					// Force-write any pending event batch so StoreEvents populates
 					// the in-memory bitmaps for all ledgers up to the boundary.
 					if len(eventBatch) > 0 {
 						writeStart := time.Now()
 						_, err := p.store.StoreEvents(eventBatch, &store.StoreOptions{
 							UniqueIndexes:     p.config.MaintainUniqueIdx,
-							V2Indexes:         p.config.MaintainV2Idx,
 							ExcludeTopic0:     p.config.ExcludeTopic0,
 							ExcludeDiagnostic: p.config.ExcludeDiagnostic,
 						})
 						atomic.AddInt64(&p.stats.WriteTimeNs, time.Since(writeStart).Nanoseconds())
 						if err != nil {
-							return fmt.Errorf("failed to store events at bucket boundary %d: %w", prevBucket, err)
+							return fmt.Errorf("failed to store events at segment boundary %d: %w", prevSegment, err)
 						}
 						if err := p.store.SetLastProcessedLedger(nextSeq - 1); err != nil {
 							return fmt.Errorf("failed to update last processed ledger: %w", err)
@@ -342,16 +320,13 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 						batchStartSeq = nextSeq
 					}
 
-					// Flush in-memory bitmaps to RocksDB so WriteBucketDir can scan them
+					// Flush in-memory bitmaps to RocksDB so WriteSegmentDir can scan them
 					if err := p.store.FlushBitmapIndexes(); err != nil {
-						return fmt.Errorf("failed to flush bitmap indexes before bucket file write: %w", err)
-					}
-					if _, _, err := p.store.FlushPostingListV2Indexes(); err != nil {
-						return fmt.Errorf("failed to flush V2 posting list indexes before bucket file write: %w", err)
+						return fmt.Errorf("failed to flush bitmap indexes before segment file write: %w", err)
 					}
 
-					if err := p.store.WriteBucketDir(prevBucket); err != nil {
-						return fmt.Errorf("failed to write bucket dir %d: %w", prevBucket, err)
+					if err := p.store.WriteSegmentDir(prevSegment); err != nil {
+						return fmt.Errorf("failed to write segment dir %d: %w", prevSegment, err)
 					}
 				}
 			}
@@ -363,24 +338,15 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 		}
 	}
 
-	// Flush bitmap indexes if enabled
-	if p.config.MaintainV2Idx {
-		if err := p.store.FlushBitmapIndexes(); err != nil {
-			return fmt.Errorf("failed to flush bitmap indexes: %w", err)
-		}
+	// Flush bitmap indexes
+	if err := p.store.FlushBitmapIndexes(); err != nil {
+		return fmt.Errorf("failed to flush bitmap indexes: %w", err)
 	}
 
-	// Flush V2 posting list indexes when bitmap32 mode is active
-	if p.config.MaintainV2Idx {
-		if _, _, err := p.store.FlushPostingListV2Indexes(); err != nil {
-			return fmt.Errorf("failed to flush V2 posting list indexes: %w", err)
-		}
-	}
-
-	// Finalize any active event volume chunk
-	if p.config.EnableEventVolume {
-		if err := p.store.FinalizeEventVolume(); err != nil {
-			return fmt.Errorf("failed to finalize event volume: %w", err)
+	// Finalize any active segment data chunk
+	if p.config.SegmentFiles {
+		if err := p.store.FinalizeSegmentData(); err != nil {
+			return fmt.Errorf("failed to finalize segment data: %w", err)
 		}
 	}
 

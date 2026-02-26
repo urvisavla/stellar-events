@@ -1,8 +1,6 @@
 package store
 
-import (
-	"encoding/binary"
-)
+import "time"
 
 // =============================================================================
 // Configuration Types
@@ -16,8 +14,7 @@ type IndexConfig struct {
 
 // BuildIndexOptions controls which indexes to build during rebuild.
 type BuildIndexOptions struct {
-	UniqueIndexes      bool // Build unique value counts (for stats)
-	IndexFlushInterval int  // Ledgers between index flushes (0 = only at end)
+	UniqueIndexes bool // Build unique value counts (for stats)
 }
 
 // indexEntry holds extracted data for index updates (used by collector pattern)
@@ -50,7 +47,6 @@ const (
 // StoreOptions configures what indexes to update when storing events.
 type StoreOptions struct {
 	UniqueIndexes bool // Maintain unique value indexes with counts
-	V2Indexes     bool // Maintain V2 indexes: bitmap32-event + posting-v2 (uses 6-byte event keys)
 
 	// ExcludeTopic0 is a set of topic0 values (as strings) to skip during ingestion.
 	// Events with matching topic0 will not be stored.
@@ -60,62 +56,94 @@ type StoreOptions struct {
 	ExcludeDiagnostic bool
 }
 
-// decodeRawLocalIDs decodes raw 4-byte big-endian local IDs to a uint32 slice.
-func decodeRawLocalIDs(data []byte) []uint32 {
-	count := len(data) / 4
-	ids := make([]uint32, count)
-	for i := 0; i < count; i++ {
-		ids[i] = binary.BigEndian.Uint32(data[i*4:])
-	}
-	return ids
-}
-
-// deduplicateLocalIDs removes consecutive duplicate local IDs from a sorted slice.
-func deduplicateLocalIDs(ids []uint32) []uint32 {
-	if len(ids) <= 1 {
-		return ids
-	}
-	writeIdx := 1
-	for readIdx := 1; readIdx < len(ids); readIdx++ {
-		if ids[readIdx] != ids[readIdx-1] {
-			ids[writeIdx] = ids[readIdx]
-			writeIdx++
-		}
-	}
-	return ids[:writeIdx]
-}
-
 const (
-	// BucketSize is the number of ledgers per index bucket.
+	// SegmentSize is the number of ledgers per index segment.
 	// At ~5 seconds per ledger, 10,000 ledgers ≈ 14 hours.
-	// Used by both bitmap and posting list indexes.
-	BucketSize uint32 = 10_000
+	SegmentSize uint32 = 10_000
 )
 
 // =============================================================================
-// Bucket Functions (shared by bitmap and posting list indexes)
+// Segment Functions (shared by bitmap and segment-index indexes)
 // =============================================================================
 
-// BucketID calculates the bucket ID for a given ledger sequence.
-func BucketID(ledgerSeq uint32) uint32 {
-	return ledgerSeq / BucketSize
+// SegmentID calculates the segment ID for a given ledger sequence.
+func SegmentID(ledgerSeq uint32) uint32 {
+	return ledgerSeq / SegmentSize
 }
 
-// BucketRange returns the ledger range covered by a bucket.
-func BucketRange(bucketID uint32) (start, end uint32) {
-	start = bucketID * BucketSize
-	end = start + BucketSize - 1
+// SegmentRange returns the ledger range covered by a segment.
+func SegmentRange(segmentID uint32) (start, end uint32) {
+	start = segmentID * SegmentSize
+	end = start + SegmentSize - 1
 	return
 }
 
-// GetBucketsForRange returns all bucket IDs that cover the given ledger range.
-func GetBucketsForRange(startLedger, endLedger uint32) []uint32 {
-	startBucket := BucketID(startLedger)
-	endBucket := BucketID(endLedger)
+// GetSegmentsForRange returns all segment IDs that cover the given ledger range.
+func GetSegmentsForRange(startLedger, endLedger uint32) []uint32 {
+	startSegment := SegmentID(startLedger)
+	endSegment := SegmentID(endLedger)
 
-	buckets := make([]uint32, 0, endBucket-startBucket+1)
-	for b := startBucket; b <= endBucket; b++ {
-		buckets = append(buckets, b)
+	segments := make([]uint32, 0, endSegment-startSegment+1)
+	for s := startSegment; s <= endSegment; s++ {
+		segments = append(segments, s)
 	}
-	return buckets
+	return segments
+}
+
+// =============================================================================
+// Bitmap32 Event-Level Query Result (FromBuffer decode)
+// =============================================================================
+
+// Bitmap32EventQueryResult holds detailed results from a bitmap32 event-level query.
+// Uses sequential event IDs + FromBuffer for near-zero-cost decode.
+type Bitmap32EventQueryResult struct {
+	// Ledger range
+	LedgerRange      uint32 // endLedger - startLedger + 1
+	MatchingLocalIDs int    // Local IDs matching index query
+
+	// Index stats
+	SegmentsTouched int   // Number of segments touched
+	SegmentsScanned int   // Number of segments scanned
+	IndexBytesRead  int64 // Bytes read from bitmap index
+
+	// Event fetch stats
+	EventsScanned  int   // Events scanned from storage
+	EventsReturned int   // Events returned after filtering
+	EventBytesRead int64 // Bytes read from event storage
+
+	// Timing breakdown
+	IndexLookupTime    time.Duration // Time querying bitmap index
+	IndexReadTime      time.Duration // Time reading bitmap segments from storage (I/O)
+	IndexDecodeTime    time.Duration // Time decoding bitmap segments (CPU - near zero with FromBuffer)
+	IndexIntersectTime time.Duration // Time spent on bitmap OR/AND operations
+	EventFetchTime      time.Duration // Time fetching events
+	DecompressTime      time.Duration // Time spent decompressing event blobs (zstd/dict)
+	EventDiskReadTime   time.Duration // Time spent on disk I/O for event data
+	GroupsDecompressed  int           // Number of group blocks decompressed
+	DecodeTime         time.Duration // Time decoding events
+	FilterTime         time.Duration // Time filtering events
+	TotalTime          time.Duration // Total query time
+}
+
+// ToUnified converts Bitmap32EventQueryResult to UnifiedQueryResult
+func (r *Bitmap32EventQueryResult) ToUnified() *UnifiedQueryResult {
+	return &UnifiedQueryResult{
+		IndexType:         "bitmap32-event",
+		LedgerRange:       r.LedgerRange,
+		SegmentsTouched:   r.SegmentsTouched,
+		IndexMatches:      r.MatchingLocalIDs,
+		MatchUnitName:     "local IDs",
+		EventsScanned:     r.EventsScanned,
+		EventsReturned:    r.EventsReturned,
+		IndexBytesRead:    r.IndexBytesRead,
+		EventBytesRead:    r.EventBytesRead,
+		IndexLookupTime:   r.IndexLookupTime,
+		EventFetchTime:    r.EventFetchTime,
+		DecompressTime:     r.DecompressTime,
+		EventDiskReadTime:  r.EventDiskReadTime,
+		GroupsDecompressed: r.GroupsDecompressed,
+		DecodeTime:        r.DecodeTime,
+		FilterTime:        r.FilterTime,
+		TotalTime:         r.TotalTime,
+	}
 }

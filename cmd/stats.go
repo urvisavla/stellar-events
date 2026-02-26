@@ -95,7 +95,7 @@ func cmdStats(cfg *config.Config, top, bottom int) {
 	bitmapStats := eventStore.GetBitmapStats()
 	if bitmapStats != nil {
 		p.Printf("\n=== Bitmap Index Stats ===\n")
-		p.Printf("  Current bucket ID:     %d (each bucket = 10K ledgers)\n", bitmapStats.CurrentBucketID)
+		p.Printf("  Current segment ID:    %d (each segment = 10K ledgers)\n", bitmapStats.CurrentSegmentID)
 		p.Printf("  Hot segments (memory): %d segments, %d entries, %.2f MB\n",
 			bitmapStats.HotSegmentCount,
 			bitmapStats.HotSegmentCards,
@@ -148,7 +148,6 @@ func printStorageStats(snapshot *store.StorageSnapshot) {
 	cfOrder := []string{
 		"events", "unique", "default",
 		"contracts_bm32", "topics_bm32",
-		"contracts_plv2", "topics_plv2",
 	}
 	for _, name := range cfOrder {
 		cf, ok := snapshot.ColumnFamilies[name]

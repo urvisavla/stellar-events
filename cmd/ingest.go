@@ -127,13 +127,10 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		QueueSize:          queueSize,
 		DataDir:            cfg.Source.LedgerDir,
 		NetworkPassphrase:  networkPassphrase,
-		MaintainUniqueIdx:  cfg.Ingestion.UniqueIndexes,
-		MaintainV2Idx:      cfg.Ingestion.V2Indexes,
-		IndexFlushInterval: cfg.Ingestion.IndexFlushInterval,
-		ExcludeTopic0:      excludeTopic0,
+		MaintainUniqueIdx: cfg.Ingestion.UniqueIndexes,
+		ExcludeTopic0:     excludeTopic0,
 		ExcludeDiagnostic:  cfg.Ingestion.ExcludeDiagnostic,
-		EnableSegmentFiles: cfg.Storage.EnableSegmentFiles,
-		EnableEventVolume:  cfg.Storage.EnableEventVolume,
+		SegmentFiles: cfg.Storage.SegmentFiles,
 	}
 
 	pipeline := ingest.NewPipeline(pipelineConfig, eventStore)
@@ -326,7 +323,6 @@ func printStorageSnapshot(sb *strings.Builder, snapshot *store.StorageSnapshot) 
 	cfOrder := []string{
 		"events", "unique", "default",
 		"contracts_bm32", "topics_bm32",
-		"contracts_plv2", "topics_plv2",
 	}
 	for _, name := range cfOrder {
 		cf, ok := snapshot.ColumnFamilies[name]
@@ -360,7 +356,6 @@ func printCompactionSummary(sb *strings.Builder, cs *store.CompactionSummary) {
 	cfOrder := []string{
 		"events", "unique", "default",
 		"contracts_bm32", "topics_bm32",
-		"contracts_plv2", "topics_plv2",
 	}
 	for _, name := range cfOrder {
 		cf, ok := cs.PerCF[name]

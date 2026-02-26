@@ -18,7 +18,7 @@ import (
 // =============================================================================
 
 // openEventStore opens the event store with config options
-func openEventStore(cfg *config.Config) (*store.RocksDBEventStore, error) {
+func openEventStore(cfg *config.Config) (*store.EventStore, error) {
 	es, err := store.NewEventStoreWithOptions(
 		cfg.Storage.DBPath,
 		configToRocksDBOptions(&cfg.Storage),
@@ -28,23 +28,22 @@ func openEventStore(cfg *config.Config) (*store.RocksDBEventStore, error) {
 		return nil, err
 	}
 
-	// Set event format if configured
-	if cfg.Storage.EventFormat != "" {
-		es.SetEventFormat(cfg.Storage.EventFormat)
-	}
-
 	// Set segment file path if configured
-	if cfg.Storage.SegmentFilePath != "" {
-		es.SetSegmentFilePath(cfg.Storage.SegmentFilePath)
+	if cfg.Storage.SegmentPath != "" {
+		es.SetSegmentPath(cfg.Storage.SegmentPath)
 	}
 
-	// Enable event volume if configured
-	if cfg.Storage.EnableEventVolume {
-		dictSamples := cfg.Storage.DictSampleCount
-		if dictSamples <= 0 {
-			dictSamples = 16_384 // default
-		}
-		es.EnableEventVolume(cfg.Storage.CompressEventVolume, cfg.Storage.DictCompressEventVolume, dictSamples, cfg.Storage.EventCompressGroupSize)
+	// Configure write targets based on storage destination flags
+	segPath := ""
+	if cfg.Storage.SegmentFiles {
+		segPath = cfg.Storage.SegmentPath
+	}
+	es.SetLedgerMapWriteConfig(segPath, cfg.Storage.RocksDB)
+	es.SetWriteRocksDB(cfg.Storage.RocksDB)
+
+	// Enable segment data writer if segment files are enabled
+	if cfg.Storage.SegmentFiles {
+		es.EnableSegmentData(cfg.Storage.CompressData, cfg.Storage.BlockSize)
 	}
 
 	return es, nil

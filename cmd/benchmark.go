@@ -93,12 +93,8 @@ type BenchmarkResult struct {
 	P99EventDecompressTime time.Duration // P99 time decompressing event blobs
 	P99EventDiskReadTime   time.Duration // P99 time on event disk I/O
 
-	// Resource stats (P99, populated when --track-resources is enabled)
-	P99TotalAllocBytes uint64
-	P99HeapInUseBytes  uint64
-
 	// Index stats
-	BucketsTouched   int   // Number of buckets touched by the query
+	SegmentsTouched   int   // Number of segments touched by the query
 	IndexMatches     int   // TOIDs or ledgers matched by index
 	IndexBytes       int64 // Bytes read from index
 	SmallestListSize int   // Size of smallest posting list (posting list only)
@@ -134,7 +130,6 @@ func runBenchmark(cfg *config.Config, args []string) {
 	fixedRange := fs.Bool("fixed-range", false, "Use fixed ledger range for all queries (no random sampling)")
 	logFile := fs.String("log", "benchmark.log", "Log file for query details (use 'none' to disable)")
 	outputFile := fs.String("output", "", "Output file for results (writes incrementally; use 'none' to disable)")
-	trackResources := fs.Bool("track-resources", false, "Track memory allocation stats per query (adds ~100µs overhead)")
 	coldCache := fs.Bool("cold", false, "Purge OS page cache before each query iteration (requires sudo)")
 
 	fs.Usage = func() {
@@ -145,7 +140,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  benchmark --generate > benchmark_data.json  # Generate sample data file\n")
 		fmt.Fprintf(os.Stderr, "  benchmark --data benchmark_data.json        # Run benchmarks\n")
-		fmt.Fprintf(os.Stderr, "  benchmark --data data.json --index posting  # Only test posting list\n")
+		fmt.Fprintf(os.Stderr, "  benchmark --data data.json --index rocksdb  # Only test bitmap32\n")
 		fmt.Fprintf(os.Stderr, "  benchmark --data data.json --format csv     # CSV output\n")
 	}
 
@@ -192,18 +187,18 @@ func runBenchmark(cfg *config.Config, args []string) {
 	// Map user-facing names to internal names
 	indexNameToInternal := map[string]string{
 		"rocksdb":  "bitmap32",
-		"flat-idx": "segment-file",
-		"flat-all": "segment-volume",
+		"flat-idx": "segment-index",
+		"flat-all": "segment-data",
 	}
 	internalToDisplay := map[string]string{
 		"bitmap32":       "rocksdb",
-		"segment-file":   "flat-idx",
-		"segment-volume": "flat-all",
+		"segment-index":   "flat-idx",
+		"segment-data": "flat-all",
 	}
 
 	var indexes []string
 	if *indexTypes == "all" {
-		indexes = []string{"bitmap32", "segment-file", "segment-volume"}
+		indexes = []string{"bitmap32", "segment-index", "segment-data"}
 	} else {
 		for _, name := range strings.Split(*indexTypes, ",") {
 			internal, ok := indexNameToInternal[name]
@@ -245,7 +240,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		}
 		defer logWriter.Close()
 		// Write CSV header
-		fmt.Fprintln(logWriter, "timestamp,query_name,index_type,events_returned,index_matches,buckets_touched,index_bytes,event_bytes,groups_decompressed,p99_idx_read_ms,p99_idx_decode_ms,p99_idx_intersect_ms,p99_idx_ms,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,p99_total_ms,total_alloc,heap_inuse,error")
+		fmt.Fprintln(logWriter, "timestamp,query_name,index_type,events_returned,index_matches,segments_touched,index_bytes,event_bytes,groups_decompressed,p99_idx_read_ms,p99_idx_decode_ms,p99_idx_intersect_ms,p99_idx_ms,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,p99_total_ms,error")
 		logWriter.Sync()
 	}
 
@@ -271,7 +266,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		defer outputWriter.Close()
 		// Write CSV header for results
 		if outputFileFormat == "csv" {
-			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,index_type,start_ledger,end_ledger,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,buckets_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,groups_decompressed,total_alloc_bytes,heap_inuse_bytes,iterations,error")
+			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,index_type,start_ledger,end_ledger,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
 			outputWriter.Sync()
 		}
 		fmt.Fprintf(os.Stderr, "Output file: %s (format: %s)\n", *outputFile, outputFileFormat)
@@ -354,19 +349,19 @@ func runBenchmark(cfg *config.Config, args []string) {
 				StartLedger: queryStart,
 				EndLedger:   queryEnd,
 			}
-			result := runQueryBenchmark(eventStore, queryData, q, idxType, displayName, *iterations, *warmup, *limit, *timeout, *trackResources, *coldCache)
+			result := runQueryBenchmark(eventStore, queryData, q, idxType, displayName, *iterations, *warmup, *limit, *timeout, *coldCache)
 			results = append(results, result)
 
 			// Log query result
 			if logWriter != nil {
 				errStr := result.Error
-				fmt.Fprintf(logWriter, "%s,%s,%s,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%s,%s\n",
+				fmt.Fprintf(logWriter, "%s,%s,%s,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s\n",
 					time.Now().Format(time.RFC3339),
 					result.Query.Name,
 					result.IndexType,
 					result.EventsReturned,
 					result.IndexMatches,
-					result.BucketsTouched,
+					result.SegmentsTouched,
 					result.IndexBytes,
 					result.EventBytes,
 					result.GroupsDecompressed,
@@ -381,8 +376,6 @@ func runBenchmark(cfg *config.Config, args []string) {
 					float64(result.P99EventDecompressTime.Microseconds())/1000.0,
 					float64(result.P99EventDiskReadTime.Microseconds())/1000.0,
 					float64(result.P99Time.Microseconds())/1000.0,
-					formatBytes(int64(result.P99TotalAllocBytes)),
-					formatBytes(int64(result.P99HeapInUseBytes)),
 					errStr,
 				)
 				logWriter.Sync() // Flush to disk immediately
@@ -853,7 +846,7 @@ func purgePageCache() error {
 	return fmt.Errorf("unsupported OS for cache purge: %s", runtime.GOOS)
 }
 
-func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData, spec QuerySpec, indexType, displayName string, iterations, warmup, limit int, timeout time.Duration, trackResources bool, coldCache bool) BenchmarkResult {
+func runQueryBenchmark(eventStore *store.EventStore, data *BenchmarkData, spec QuerySpec, indexType, displayName string, iterations, warmup, limit int, timeout time.Duration, coldCache bool) BenchmarkResult {
 	result := BenchmarkResult{
 		Query:       spec,
 		IndexType:   displayName,
@@ -875,8 +868,6 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 		eventFilter    time.Duration
 		eventDecompress time.Duration
 		eventDiskRead   time.Duration
-		totalAlloc      uint64
-		heapInUse       uint64
 	}
 	var timings []iterationTiming
 
@@ -936,12 +927,6 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 		}
 		start := time.Now()
 
-		// Capture resource stats before query if tracking is enabled
-		var mBefore, mAfter runtime.MemStats
-		if trackResources {
-			runtime.ReadMemStats(&mBefore)
-		}
-
 		resultChan := make(chan *QueryResult, 1)
 		go func() {
 			resultChan <- executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicGroups, indexType, limit)
@@ -958,27 +943,13 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 			qr = <-resultChan
 		}
 
-		// Capture resource stats after query
-		if trackResources {
-			runtime.ReadMemStats(&mAfter)
-		}
-
 		elapsed := time.Since(start)
-
-		// Build resource fields
-		var resAlloc uint64
-		var resHeap uint64
-		if trackResources {
-			resAlloc = mAfter.TotalAlloc - mBefore.TotalAlloc
-			resHeap = mAfter.HeapInuse
-		}
 
 		makeIterTiming := func(qr *QueryResult) iterationTiming {
 			return iterationTiming{
 				total: elapsed, index: qr.IndexTime, indexRead: qr.IndexReadTime, indexDecode: qr.IndexDecodeTime, indexIntersect: qr.IndexIntersectTime,
 				event: qr.EventTime, eventFetch: qr.EventFetchTime, eventDecode: qr.EventDecodeTime, eventFilter: qr.EventFilterTime,
 				eventDecompress: qr.EventDecompressTime, eventDiskRead: qr.EventDiskReadTime,
-				totalAlloc: resAlloc, heapInUse: resHeap,
 			}
 		}
 
@@ -989,14 +960,14 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 				populateQueryStats(&result, qr)
 				timings = append(timings, makeIterTiming(qr))
 			} else {
-				timings = append(timings, iterationTiming{total: elapsed, totalAlloc: resAlloc, heapInUse: resHeap})
+				timings = append(timings, iterationTiming{total: elapsed})
 			}
 			// Stop further iterations - this query is too slow
 			break
 		} else if qr != nil {
 			if qr.Error != nil {
 				result.Error = qr.Error.Error()
-				timings = append(timings, iterationTiming{total: elapsed, totalAlloc: resAlloc, heapInUse: resHeap})
+				timings = append(timings, iterationTiming{total: elapsed})
 			} else {
 				populateQueryStats(&result, qr)
 				timings = append(timings, makeIterTiming(qr))
@@ -1023,8 +994,6 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 		result.P99EventFilterTime = timings[p99Idx].eventFilter
 		result.P99EventDecompressTime = timings[p99Idx].eventDecompress
 		result.P99EventDiskReadTime = timings[p99Idx].eventDiskRead
-		result.P99TotalAllocBytes = timings[p99Idx].totalAlloc
-		result.P99HeapInUseBytes = timings[p99Idx].heapInUse
 	}
 
 	return result
@@ -1034,7 +1003,7 @@ func runQueryBenchmark(eventStore *store.RocksDBEventStore, data *BenchmarkData,
 func populateQueryStats(result *BenchmarkResult, qr *QueryResult) {
 	result.EventsReturned = qr.EventsReturned
 	result.EventsScanned = qr.EventsScanned
-	result.BucketsTouched = qr.BucketsTouched
+	result.SegmentsTouched = qr.SegmentsTouched
 	result.IndexMatches = qr.IndexMatches
 	result.IndexBytes = qr.IndexBytes
 	result.EventBytes = qr.EventBytes
@@ -1050,7 +1019,7 @@ type QueryResult struct {
 	EventsScanned  int
 
 	// Index stats
-	BucketsTouched   int   // Number of buckets touched by the query
+	SegmentsTouched   int   // Number of segments touched by the query
 	IndexMatches     int   // TOIDs or ledgers matched by index
 	IndexBytes       int64 // Bytes read from index
 	SmallestListSize int   // Size of smallest posting list (posting list only)
@@ -1074,14 +1043,10 @@ type QueryResult struct {
 	EventDiskReadTime    time.Duration // Time spent on disk I/O for event data
 	GroupsDecompressed   int           // Number of group blocks decompressed
 
-	// Resource stats (populated when --track-resources is enabled)
-	TotalAllocBytes uint64 // runtime.MemStats.TotalAlloc delta
-	HeapInUseBytes  uint64 // runtime.MemStats.HeapInuse snapshot after query
-
 	Error error
 }
 
-func executeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, indexType string, limit int) *QueryResult {
+func executeQueryBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, indexType string, limit int) *QueryResult {
 	// Determine if this is a multi-value query (OR within any group)
 	isMultiValue := len(contractIDs) > 1
 	if !isMultiValue {
@@ -1101,57 +1066,29 @@ func executeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, end
 		}
 
 		switch indexType {
-		case "posting-v2":
-			return executePostingV2QueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
 		case "bitmap32":
 			return executeBitmap32QueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
-		case "segment-file":
-			return executeSegmentFileQueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
-		case "segment-volume":
-			return executeSegmentVolumeQueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
+		case "segment-index":
+			return executeSegmentIndexQueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
+		case "segment-data":
+			return executeSegmentDataQueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
 		}
 		return nil
 	}
 
 	// Multi-value: use new multi-filter functions
 	switch indexType {
-	case "posting-v2":
-		return executePostingV2MultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
 	case "bitmap32":
 		return executeBitmap32MultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
-	case "segment-file":
-		return executeSegmentFileMultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
-	case "segment-volume":
-		return executeSegmentVolumeMultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
+	case "segment-index":
+		return executeSegmentIndexMultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
+	case "segment-data":
+		return executeSegmentDataMultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
 	}
 	return nil
 }
 
-func executePostingV2QueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithPostingListV2Timing(contractID, topicGroups, startLedger, endLedger, limit)
-	if err != nil {
-		return &QueryResult{Error: err}
-	}
-
-	return &QueryResult{
-		EventsReturned:     len(events),
-		EventsScanned:      stats.EventsScanned,
-		BucketsTouched:     stats.BucketsTouched,
-		IndexBytes:         stats.PostingListBytes,
-		EventBytes:         stats.EventBytesRead,
-		IndexMatches:       stats.LocalIDsAfterIntersect,
-		IndexTime:          stats.PostingListTime + stats.IntersectTime,
-		IndexReadTime:      stats.PostingListReadTime,
-		IndexDecodeTime:    stats.PostingListDecodeTime,
-		IndexIntersectTime: stats.IntersectTime,
-		EventTime:          stats.EventFetchTime + stats.DecodeTime + stats.FilterTime,
-		EventFetchTime:     stats.EventFetchTime,
-		EventDecodeTime:    stats.DecodeTime,
-		EventFilterTime:    stats.FilterTime,
-	}
-}
-
-func executeBitmap32QueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
+func executeBitmap32QueryBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
 	stats, events, err := eventStore.QueryEventsWithBitmap32EventIndex(contractID, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		return &QueryResult{Error: err}
@@ -1160,7 +1097,7 @@ func executeBitmap32QueryBenchmark(eventStore *store.RocksDBEventStore, startLed
 	return &QueryResult{
 		EventsReturned:     len(events),
 		EventsScanned:      stats.EventsScanned,
-		BucketsTouched:     stats.BucketsTouched,
+		SegmentsTouched:     stats.SegmentsTouched,
 		IndexBytes:         stats.IndexBytesRead,
 		EventBytes:         stats.EventBytesRead,
 		IndexMatches:       stats.MatchingLocalIDs,
@@ -1175,31 +1112,7 @@ func executeBitmap32QueryBenchmark(eventStore *store.RocksDBEventStore, startLed
 	}
 }
 
-func executePostingV2MultiFilterBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithPostingListV2MultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
-	if err != nil {
-		return &QueryResult{Error: err}
-	}
-
-	return &QueryResult{
-		EventsReturned:     len(events),
-		EventsScanned:      stats.EventsScanned,
-		BucketsTouched:     stats.BucketsTouched,
-		IndexBytes:         stats.PostingListBytes,
-		EventBytes:         stats.EventBytesRead,
-		IndexMatches:       stats.LocalIDsAfterIntersect,
-		IndexTime:          stats.PostingListTime + stats.IntersectTime,
-		IndexReadTime:      stats.PostingListReadTime,
-		IndexDecodeTime:    stats.PostingListDecodeTime,
-		IndexIntersectTime: stats.IntersectTime,
-		EventTime:          stats.EventFetchTime + stats.DecodeTime + stats.FilterTime,
-		EventFetchTime:     stats.EventFetchTime,
-		EventDecodeTime:    stats.DecodeTime,
-		EventFilterTime:    stats.FilterTime,
-	}
-}
-
-func executeBitmap32MultiFilterBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
+func executeBitmap32MultiFilterBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
 	stats, events, err := eventStore.QueryEventsWithBitmap32MultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		return &QueryResult{Error: err}
@@ -1208,7 +1121,7 @@ func executeBitmap32MultiFilterBenchmark(eventStore *store.RocksDBEventStore, st
 	return &QueryResult{
 		EventsReturned:     len(events),
 		EventsScanned:      stats.EventsScanned,
-		BucketsTouched:     stats.BucketsTouched,
+		SegmentsTouched:     stats.SegmentsTouched,
 		IndexBytes:         stats.IndexBytesRead,
 		EventBytes:         stats.EventBytesRead,
 		IndexMatches:       stats.MatchingLocalIDs,
@@ -1223,8 +1136,8 @@ func executeBitmap32MultiFilterBenchmark(eventStore *store.RocksDBEventStore, st
 	}
 }
 
-func executeSegmentFileQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithSegmentFile(contractID, topicGroups, startLedger, endLedger, limit)
+func executeSegmentIndexQueryBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEventsWithSegmentIndex(contractID, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		return &QueryResult{Error: err}
 	}
@@ -1232,7 +1145,7 @@ func executeSegmentFileQueryBenchmark(eventStore *store.RocksDBEventStore, start
 	return &QueryResult{
 		EventsReturned:      len(events),
 		EventsScanned:       stats.EventsScanned,
-		BucketsTouched:      stats.BucketsTouched,
+		SegmentsTouched:      stats.SegmentsTouched,
 		IndexBytes:          stats.IndexBytesRead,
 		EventBytes:          stats.EventBytesRead,
 		IndexMatches:        stats.MatchingLocalIDs,
@@ -1251,8 +1164,8 @@ func executeSegmentFileQueryBenchmark(eventStore *store.RocksDBEventStore, start
 	}
 }
 
-func executeSegmentFileMultiFilterBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithSegmentFileMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
+func executeSegmentIndexMultiFilterBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEventsWithSegmentIndexMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		return &QueryResult{Error: err}
 	}
@@ -1260,7 +1173,7 @@ func executeSegmentFileMultiFilterBenchmark(eventStore *store.RocksDBEventStore,
 	return &QueryResult{
 		EventsReturned:      len(events),
 		EventsScanned:       stats.EventsScanned,
-		BucketsTouched:      stats.BucketsTouched,
+		SegmentsTouched:      stats.SegmentsTouched,
 		IndexBytes:          stats.IndexBytesRead,
 		EventBytes:          stats.EventBytesRead,
 		IndexMatches:        stats.MatchingLocalIDs,
@@ -1279,8 +1192,8 @@ func executeSegmentFileMultiFilterBenchmark(eventStore *store.RocksDBEventStore,
 	}
 }
 
-func executeSegmentVolumeQueryBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithSegmentVolume(contractID, topicGroups, startLedger, endLedger, limit)
+func executeSegmentDataQueryBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEventsWithSegmentData(contractID, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		return &QueryResult{Error: err}
 	}
@@ -1288,7 +1201,7 @@ func executeSegmentVolumeQueryBenchmark(eventStore *store.RocksDBEventStore, sta
 	return &QueryResult{
 		EventsReturned:      len(events),
 		EventsScanned:       stats.EventsScanned,
-		BucketsTouched:      stats.BucketsTouched,
+		SegmentsTouched:      stats.SegmentsTouched,
 		IndexBytes:          stats.IndexBytesRead,
 		EventBytes:          stats.EventBytesRead,
 		IndexMatches:        stats.MatchingLocalIDs,
@@ -1307,8 +1220,8 @@ func executeSegmentVolumeQueryBenchmark(eventStore *store.RocksDBEventStore, sta
 	}
 }
 
-func executeSegmentVolumeMultiFilterBenchmark(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithSegmentVolumeMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
+func executeSegmentDataMultiFilterBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEventsWithSegmentDataMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		return &QueryResult{Error: err}
 	}
@@ -1316,7 +1229,7 @@ func executeSegmentVolumeMultiFilterBenchmark(eventStore *store.RocksDBEventStor
 	return &QueryResult{
 		EventsReturned:      len(events),
 		EventsScanned:       stats.EventsScanned,
-		BucketsTouched:      stats.BucketsTouched,
+		SegmentsTouched:      stats.SegmentsTouched,
 		IndexBytes:          stats.IndexBytesRead,
 		EventBytes:          stats.EventBytesRead,
 		IndexMatches:        stats.MatchingLocalIDs,
@@ -1361,7 +1274,7 @@ func outputTable(results []BenchmarkResult, indexes []string) {
 	for _, idx := range indexes {
 		fmt.Printf(" | %8s p99", idx)
 	}
-	fmt.Printf(" | %6s/%6s | %4s | %8s | %8s | %8s\n", "EvtRet", "Scaned", "Bkts", "IdxMatch", "IdxBytes", "EvtBytes")
+	fmt.Printf(" | %6s/%6s | %4s | %8s | %8s | %8s\n", "EvtRet", "Scaned", "Segs", "IdxMatch", "IdxBytes", "EvtBytes")
 
 	fmt.Print(strings.Repeat("-", 40))
 	for range indexes {
@@ -1374,7 +1287,7 @@ func outputTable(results []BenchmarkResult, indexes []string) {
 		qr := queryResults[name]
 		fmt.Printf("%-40s", truncateBenchmarkStr(name, 40))
 
-		var eventsReturned, eventsScanned, idxMatches, bucketsTouched int
+		var eventsReturned, eventsScanned, idxMatches, segmentsTouched int
 		var idxBytes, evtBytes int64
 		for _, idx := range indexes {
 			if r, ok := qr[idx]; ok {
@@ -1386,14 +1299,14 @@ func outputTable(results []BenchmarkResult, indexes []string) {
 				eventsReturned = r.EventsReturned
 				eventsScanned = r.EventsScanned
 				idxMatches = r.IndexMatches
-				bucketsTouched = r.BucketsTouched
+				segmentsTouched = r.SegmentsTouched
 				idxBytes = r.IndexBytes
 				evtBytes = r.EventBytes
 			} else {
 				fmt.Printf(" | %12s", "N/A")
 			}
 		}
-		fmt.Printf(" | %6d/%6d | %4d | %8d | %8s | %8s\n", eventsReturned, eventsScanned, bucketsTouched, idxMatches, formatBytes(idxBytes), formatBytes(evtBytes))
+		fmt.Printf(" | %6d/%6d | %4d | %8d | %8s | %8s\n", eventsReturned, eventsScanned, segmentsTouched, idxMatches, formatBytes(idxBytes), formatBytes(evtBytes))
 	}
 
 	// Summary statistics
@@ -1423,7 +1336,7 @@ func printSummaryStats(results []BenchmarkResult, indexes []string) {
 
 func outputCSV(results []BenchmarkResult) {
 	// Header: query | timing | index | event | test
-	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,index_type,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,buckets_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,groups_decompressed,total_alloc_bytes,heap_inuse_bytes,iterations,error")
+	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,index_type,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
 
 	for _, r := range results {
 		contractID := strings.Join(r.Query.ContractIDs, "|")
@@ -1440,7 +1353,7 @@ func outputCSV(results []BenchmarkResult) {
 			}
 		}
 
-		fmt.Printf("%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%d,%d,%s\n",
+		fmt.Printf("%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%s\n",
 			r.Query.Name,
 			contractID,
 			topics[0], topics[1], topics[2], topics[3],
@@ -1451,7 +1364,7 @@ func outputCSV(results []BenchmarkResult) {
 			float64(r.P99IndexReadTime.Microseconds())/1000.0,
 			float64(r.P99IndexDecodeTime.Microseconds())/1000.0,
 			float64(r.P99IndexIntersectTime.Microseconds())/1000.0,
-			r.BucketsTouched,
+			r.SegmentsTouched,
 			r.IndexMatches,
 			formatBytes(r.IndexBytes),
 			r.SmallestListSize,
@@ -1466,8 +1379,6 @@ func outputCSV(results []BenchmarkResult) {
 			r.EventsScanned,
 			formatBytes(r.EventBytes),
 			r.GroupsDecompressed,
-			r.P99TotalAllocBytes,
-			r.P99HeapInUseBytes,
 			r.Iterations,
 			r.Error,
 		)
@@ -1491,7 +1402,7 @@ func outputJSON(results []BenchmarkResult) {
 		IdxReadMs        float64 `json:"idx_read_ms"`
 		IdxDecodeMs      float64 `json:"idx_decode_ms"`
 		IdxIntersectMs   float64 `json:"idx_intersect_ms"`
-		BucketsTouched   int     `json:"buckets_touched"`
+		SegmentsTouched   int     `json:"segments_touched"`
 		IndexMatches     int     `json:"index_matches"`
 		IndexBytes       string  `json:"index_bytes"`
 		SmallestListSize int     `json:"smallest_list_size,omitempty"`
@@ -1508,10 +1419,6 @@ func outputJSON(results []BenchmarkResult) {
 		EventsScanned      int     `json:"events_scanned"`
 		EventBytes         string  `json:"event_bytes"`
 		GroupsDecompressed int     `json:"groups_decompressed"`
-
-		// Resource stats
-		TotalAllocBytes uint64 `json:"total_alloc_bytes,omitempty"`
-		HeapInUseBytes  uint64 `json:"heap_inuse_bytes,omitempty"`
 
 		// Test config
 		Iterations int    `json:"iterations"`
@@ -1531,7 +1438,7 @@ func outputJSON(results []BenchmarkResult) {
 			IdxReadMs:        float64(r.P99IndexReadTime.Microseconds()) / 1000.0,
 			IdxDecodeMs:      float64(r.P99IndexDecodeTime.Microseconds()) / 1000.0,
 			IdxIntersectMs:   float64(r.P99IndexIntersectTime.Microseconds()) / 1000.0,
-			BucketsTouched:   r.BucketsTouched,
+			SegmentsTouched:   r.SegmentsTouched,
 			IndexMatches:     r.IndexMatches,
 			IndexBytes:       formatBytes(r.IndexBytes),
 			SmallestListSize: r.SmallestListSize,
@@ -1546,8 +1453,6 @@ func outputJSON(results []BenchmarkResult) {
 			EventsScanned:      r.EventsScanned,
 			EventBytes:         formatBytes(r.EventBytes),
 			GroupsDecompressed: r.GroupsDecompressed,
-			TotalAllocBytes:    r.P99TotalAllocBytes,
-			HeapInUseBytes:     r.P99HeapInUseBytes,
 			Iterations:         r.Iterations,
 			Error:              r.Error,
 		}
@@ -1580,7 +1485,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			IdxReadMs        float64 `json:"idx_read_ms"`
 			IdxDecodeMs      float64 `json:"idx_decode_ms"`
 			IdxIntersectMs   float64 `json:"idx_intersect_ms"`
-			BucketsTouched   int     `json:"buckets_touched"`
+			SegmentsTouched   int     `json:"segments_touched"`
 			IndexMatches     int     `json:"index_matches"`
 			IndexBytes       string  `json:"index_bytes"`
 			SmallestListSize int     `json:"smallest_list_size,omitempty"`
@@ -1598,10 +1503,6 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			EventBytes         string  `json:"event_bytes"`
 			GroupsDecompressed int     `json:"groups_decompressed"`
 
-			// Resource stats
-			TotalAllocBytes uint64 `json:"total_alloc_bytes,omitempty"`
-			HeapInUseBytes  uint64 `json:"heap_inuse_bytes,omitempty"`
-
 			// Test config
 			Iterations int    `json:"iterations"`
 			Error      string `json:"error,omitempty"`
@@ -1618,7 +1519,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			IdxReadMs:        float64(r.P99IndexReadTime.Microseconds()) / 1000.0,
 			IdxDecodeMs:      float64(r.P99IndexDecodeTime.Microseconds()) / 1000.0,
 			IdxIntersectMs:   float64(r.P99IndexIntersectTime.Microseconds()) / 1000.0,
-			BucketsTouched:   r.BucketsTouched,
+			SegmentsTouched:   r.SegmentsTouched,
 			IndexMatches:     r.IndexMatches,
 			IndexBytes:       formatBytes(r.IndexBytes),
 			SmallestListSize: r.SmallestListSize,
@@ -1633,8 +1534,6 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			EventsScanned:      r.EventsScanned,
 			EventBytes:         formatBytes(r.EventBytes),
 			GroupsDecompressed: r.GroupsDecompressed,
-			TotalAllocBytes:    r.P99TotalAllocBytes,
-			HeapInUseBytes:     r.P99HeapInUseBytes,
 			Iterations:         r.Iterations,
 			Error:              r.Error,
 		}
@@ -1654,7 +1553,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 				topics[i] = "-"
 			}
 		}
-		fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%d,%d,%s\n",
+		fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%s\n",
 			r.Query.Name,
 			contractID,
 			topics[0], topics[1], topics[2], topics[3],
@@ -1667,7 +1566,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			float64(r.P99IndexReadTime.Microseconds())/1000.0,
 			float64(r.P99IndexDecodeTime.Microseconds())/1000.0,
 			float64(r.P99IndexIntersectTime.Microseconds())/1000.0,
-			r.BucketsTouched,
+			r.SegmentsTouched,
 			r.IndexMatches,
 			formatBytes(r.IndexBytes),
 			r.SmallestListSize,
@@ -1682,8 +1581,6 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			r.EventsScanned,
 			formatBytes(r.EventBytes),
 			r.GroupsDecompressed,
-			r.P99TotalAllocBytes,
-			r.P99HeapInUseBytes,
 			r.Iterations,
 			r.Error,
 		)

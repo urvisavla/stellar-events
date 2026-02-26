@@ -4,68 +4,6 @@ package event
 import "encoding/binary"
 
 // =============================================================================
-// TOID (Transaction Order ID) Format
-// =============================================================================
-// TOID Format (64 bits):
-//   (ledger_seq << 32) | (tx_order << 12) | op_index
-//   - ledger_seq: 32 bits (0 - 4,294,967,295)
-//   - tx_order:   20 bits (0 - 1,048,575)
-//   - op_index:   12 bits (0 - 4,095)
-
-// EncodeTOID encodes ledger, transaction, and operation into a 64-bit TOID.
-func EncodeTOID(ledger uint32, tx uint32, op uint32) uint64 {
-	return (uint64(ledger) << 32) | (uint64(tx&0xFFFFF) << 12) | uint64(op&0xFFF)
-}
-
-// DecodeTOID extracts ledger, transaction, and operation from a TOID.
-func DecodeTOID(toid uint64) (ledger uint32, tx uint32, op uint32) {
-	ledger = uint32(toid >> 32)
-	tx = uint32((toid >> 12) & 0xFFFFF)
-	op = uint32(toid & 0xFFF)
-	return
-}
-
-// =============================================================================
-// 10-byte RocksDB Key Format (TOID + Event Index)
-// =============================================================================
-// Format: [toid:8][event_index:2] (big-endian)
-//   - toid:        64-bit TOID, big-endian
-//   - event_index: 16-bit event index within operation, big-endian
-
-// EncodeKey creates a 10-byte RocksDB key from TOID and event index.
-func EncodeKey(toid uint64, eventIndex uint16) []byte {
-	key := make([]byte, 10)
-	binary.BigEndian.PutUint64(key[0:8], toid)
-	binary.BigEndian.PutUint16(key[8:10], eventIndex)
-	return key
-}
-
-// DecodeKey extracts TOID and event index from a 10-byte RocksDB key.
-func DecodeKey(key []byte) (toid uint64, eventIndex uint16) {
-	if len(key) < 10 {
-		return 0, 0
-	}
-	toid = binary.BigEndian.Uint64(key[0:8])
-	eventIndex = binary.BigEndian.Uint16(key[8:10])
-	return
-}
-
-// EncodeKeyFromParts creates a 10-byte key from individual components.
-// This is a convenience function that combines EncodeTOID and EncodeKey.
-func EncodeKeyFromParts(ledger uint32, tx uint32, op uint32, eventIndex uint16) []byte {
-	toid := EncodeTOID(ledger, tx, op)
-	return EncodeKey(toid, eventIndex)
-}
-
-// DecodeKeyFull extracts all components from a 10-byte RocksDB key.
-// Returns ledger, tx, op, and event index.
-func DecodeKeyFull(key []byte) (ledger uint32, tx uint32, op uint32, eventIndex uint16) {
-	toid, eventIndex := DecodeKey(key)
-	ledger, tx, op = DecodeTOID(toid)
-	return
-}
-
-// =============================================================================
 // V2 Event Key Functions (Sequential Event IDs)
 // =============================================================================
 // V2 key format: [ledger:4][event_seq:2] = 6 bytes
@@ -108,19 +46,19 @@ func LocalIDToKeyV2(segmentStart uint32, localID uint32) []byte {
 }
 
 // =============================================================================
-// Posting List Bucket Local ID Functions
+// Posting List Segment Local ID Functions
 // =============================================================================
-// For posting lists using bucket-based storage with 32-bit local IDs.
+// For posting lists using segment-based storage with 32-bit local IDs.
 
-// EncodeLocalIDForBucket computes the 32-bit local ID for a posting list bucket.
-func EncodeLocalIDForBucket(ledger uint32, eventSeq uint16, bucketStart uint32) uint32 {
-	ledgerOffset := uint16(ledger - bucketStart)
+// EncodeLocalIDForSegment computes the 32-bit local ID for a posting list segment.
+func EncodeLocalIDForSegment(ledger uint32, eventSeq uint16, segmentStart uint32) uint32 {
+	ledgerOffset := uint16(ledger - segmentStart)
 	return EncodeBitmap32LocalID(ledgerOffset, eventSeq)
 }
 
-// DecodeLocalIDForBucket extracts ledger and eventSeq from a local ID and bucket start.
-func DecodeLocalIDForBucket(localID uint32, bucketStart uint32) (ledger uint32, eventSeq uint16) {
+// DecodeLocalIDForSegment extracts ledger and eventSeq from a local ID and segment start.
+func DecodeLocalIDForSegment(localID uint32, segmentStart uint32) (ledger uint32, eventSeq uint16) {
 	ledgerOffset, eventSeq := DecodeBitmap32LocalID(localID)
-	ledger = bucketStart + uint32(ledgerOffset)
+	ledger = segmentStart + uint32(ledgerOffset)
 	return
 }

@@ -8,7 +8,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/urvisavla/stellar-events/internal/zstd"
 )
 
 const (
@@ -21,19 +21,14 @@ const (
 // LedgerReader reads ledgers from the file-based storage
 type LedgerReader struct {
 	dataDir string
-	decoder *zstd.Decoder
+	decoder *zstd.Decompressor
 }
 
 // NewLedgerReader creates a new ledger reader
 func NewLedgerReader(dataDir string) (*LedgerReader, error) {
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
-	}
-
 	return &LedgerReader{
 		dataDir: dataDir,
-		decoder: decoder,
+		decoder: zstd.NewDecompressor(),
 	}, nil
 }
 
@@ -136,7 +131,7 @@ func (r *LedgerReader) GetLedgerWithTiming(sequence uint32) ([]byte, *LedgerTimi
 	decompressStart := time.Now()
 
 	// Decompress
-	decompressed, err := r.decoder.DecodeAll(compressed, nil)
+	decompressed, err := r.decoder.Decode(nil, compressed)
 	if err != nil {
 		return nil, timing, fmt.Errorf("failed to decompress ledger: %w", err)
 	}
@@ -163,7 +158,7 @@ type LedgerIterator struct {
 	offsetSize     uint8
 
 	// Decoder (reused)
-	decoder *zstd.Decoder
+	decoder *zstd.Decompressor
 }
 
 // NewLedgerIterator creates a new iterator for the given range
@@ -172,18 +167,13 @@ func NewLedgerIterator(dataDir string, startSeq, endSeq uint32) (*LedgerIterator
 		return nil, fmt.Errorf("invalid start sequence: must be >= %d (Stellar starts at ledger 2)", FirstLedgerSequence)
 	}
 
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create zstd decoder: %w", err)
-	}
-
 	return &LedgerIterator{
 		dataDir:        dataDir,
 		startSeq:       startSeq,
 		endSeq:         endSeq,
 		currentSeq:     startSeq,
 		currentChunkID: ^uint32(0), // Invalid chunk ID to force initial load
-		decoder:        decoder,
+		decoder:        zstd.NewDecompressor(),
 	}, nil
 }
 
@@ -219,7 +209,7 @@ func (it *LedgerIterator) Next() ([]byte, uint32, bool, error) {
 	}
 
 	// Decompress
-	decompressed, err := it.decoder.DecodeAll(compressed, nil)
+	decompressed, err := it.decoder.Decode(nil, compressed)
 	if err != nil {
 		return nil, ledgerSeq, false, fmt.Errorf("failed to decompress ledger %d: %w", ledgerSeq, err)
 	}

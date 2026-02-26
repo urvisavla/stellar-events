@@ -2,10 +2,6 @@
 
 High-performance event indexing and querying system for Stellar blockchain contract events.
 
-## Overview
-
-Stellar Events ingests contract events from Stellar ledger files and stores them in RocksDB with multiple index types optimized for different query patterns. The system supports both V1 (TOID-based) and V2 (sequential ID-based) storage formats.
-
 ## Prerequisites
 
 ### RocksDB
@@ -27,169 +23,148 @@ make deps
 make build
 ```
 
-## Storage Architecture
+## Design
 
-### Column Families
+### Segments
 
-Events are stored in RocksDB with separate column families for primary storage and indexes:
+Events are partitioned into **segments** of 10,000 ledgers each (~14 hours at ~5s/ledger). Each segment is identified by `segmentID = ledger / 10,000`.
 
-| Column Family | Purpose |
-|---------------|---------|
-| `events` | Primary event storage (XDR or binary format) |
-| `default` | Metadata (last processed ledger, etc.) |
-| `unique` | Unique value counts for statistics |
+Within a segment, each event gets a **dense local ID** — a sequential 32-bit integer assigned in ingestion order. The `segment.meta` file maps dense IDs back to `(ledger, eventSeq)` pairs.
 
-### V1 Index Column Families
+### Storage Modes
 
-| Column Family | Purpose |
-|---------------|---------|
-| `contracts_pl`, `topics_pl` | Posting list indexes (TOID-based) |
-| `contracts_bm`, `topics_bm` | 32-bit ledger-level bitmap indexes |
-| `contracts_bm64`, `topics_bm64` | 64-bit event-level bitmap indexes |
+Two storage backends can be used independently or together:
 
-### V2 Index Column Families
+| Mode | Config | Description |
+|------|--------|-------------|
+| **RocksDB** | `storage.rocksdb = true` | Events + bitmap indexes in RocksDB column families |
+| **Segment files** | `storage.segment_files = true` | Self-contained flat file directories per segment |
 
-| Column Family | Purpose |
-|---------------|---------|
-| `contracts_bm32`, `topics_bm32` | 32-bit event-level bitmap indexes |
-| `contracts_plv2`, `topics_plv2` | V2 posting list indexes (local ID-based) |
+Segment file mode produces a directory per segment with all data needed for queries without RocksDB.
 
-V1 and V2 indexes are mutually exclusive due to different event key formats.
-
-## Key Structures
-
-### V1 Event Key (10 bytes)
-
-Used when V1 indexes are enabled:
+### Segment Directory Layout
 
 ```
-[TOID:8][event_index:2]
+<segment_path>/NNNNNN/
+  events.dat         — block-compressed event data
+  events.idx         — block offset index for events.dat
+  contracts.hash     — MPHF index (contract term hash → slot)
+  contracts.pack     — roaring bitmaps ordered by MPHF slot
+  topic0.hash        — MPHF index for topic position 0
+  topic0.pack
+  topic1.hash
+  topic1.pack
+  topic2.hash
+  topic2.pack
+  topic3.hash
+  topic3.pack
+  segment.meta       — dense ID → (ledger, seq) cumulative array
 ```
 
-**TOID (Transaction Order ID):**
-- Bits 63-32: ledger sequence (32 bits)
-- Bits 31-12: transaction index (20 bits, max 1,048,575)
-- Bits 11-0: operation index (12 bits, max 4,095)
+## File Formats
 
-**event_index:** 16-bit index within the operation
+### events.dat — Block-Compressed Event Data
 
-Multiple events can share the same TOID (same operation), requiring range scans during fetch.
+Events are grouped into blocks (default 128 events), each independently zstd-compressed. This enables random access to any event by reading and decompressing only its block.
 
-### V2 Event Key (6 bytes)
-
-Used when V2 indexes are enabled:
-
+**Block layout (uncompressed):**
 ```
-[ledger:4][event_seq:2]
+[event₀ bytes][event₁ bytes]...[eventₙ₋₁ bytes][FOR index]
 ```
 
-- **ledger**: 32-bit ledger sequence number
-- **event_seq**: 16-bit sequential event number within the ledger (0, 1, 2, ...)
-
-Each V2 key maps to exactly one event, enabling point lookups instead of range scans.
-
-### Index Key (36 bytes)
-
-Used by all posting list indexes:
+The **FOR (Frame-of-Reference) index** is a compact encoding of per-event sizes appended to the raw event data. Layout within the block:
 
 ```
-[term_key:32][bucket_id:4]
+Offset (from block end)    Content
+─────────────────────────────────────────────
+end - 1                    W (1 byte) — bits per residual
+end - 1 - packSize         packed residuals (ceil(W×N/8) bytes)
+end - 1 - packSize - 4     min_size (4 bytes, uint32 LE)
 ```
 
-- **term_key**: SHA-256 hash of the indexed value (contract ID or topic XDR)
-- **bucket_id**: ledger / 10,000
+Encoding:
+1. `min_size` = min event size in block, `max_size` = max
+2. `W` = `max(1, bits.Len32(max_size - min_size))`
+3. Each event's size stored as `(size - min_size)` in W bits, packed little-endian
+4. `packSize` = `ceil(W × N / 8)`
 
-## Bucketing
+To read event `i` in a block: decode all sizes from the FOR index, compute prefix sum to get byte offset and length.
 
-All indexes are partitioned into buckets of 10,000 ledgers each (~14 hours at ~5 seconds/ledger).
+### events.idx — Block Offset Index
 
-**Benefits:**
-- Bounded memory usage during ingestion
-- Efficient range queries (only relevant buckets scanned)
-- Incremental updates (new data only affects current bucket)
-- Natural time-based partitioning
-
-### Local IDs (V2)
-
-Within a bucket, events are identified by 32-bit local IDs:
+Fixed-size header followed by an array of block offsets into `events.dat`.
 
 ```
-local_id = (ledger_offset << 16) | event_seq
+Offset  Size    Type        Field
+──────────────────────────────────────────────
+0       4       uint32 LE   magic (0x45494458 = "EIDX")
+4       4       uint32 LE   total_events
+8       4       uint32 LE   block_size (events per block)
+12      4       uint32 LE   flags (bit 0: 1=uncompressed)
+16      4       uint32 LE   block_count
+20      4       —           reserved (zero)
+24      8×(block_count+1)   int64 LE offsets
 ```
 
-- **ledger_offset**: ledger - bucket_start (0-9,999, fits in 14 bits)
-- **event_seq**: sequential event number within ledger (0-65,535)
+`offsets[i]` is the byte offset in `events.dat` where block `i` starts. `offsets[block_count]` is the total data size (sentinel).
 
-This compact 32-bit representation enables efficient bitmap and posting list storage while maintaining event-level granularity.
+**Read path for event at index `i`:**
+1. `blockIdx = i / block_size`, `localIdx = i % block_size`
+2. Read compressed bytes from `offsets[blockIdx]..offsets[blockIdx+1]`
+3. Decompress, decode FOR index, prefix-sum to locate event `localIdx`
 
-## Index Design
+### .hash / .pack — MPHF Bitmap Index
 
-### Posting Lists
+Each index type (contracts, topic0–topic3) is stored as a `.hash` + `.pack` pair.
 
-Posting lists map index terms (contract IDs, topics) to event locations using delta-varint encoding for compression.
+**.hash** — A [streamhash](https://github.com/tamirms/streamhash) minimal perfect hash function mapping 32-byte term keys (SHA-256 of contract ID or topic XDR) to dense slot indices.
 
-**V1 Format:** Stores 64-bit TOIDs
+**.pack** — Roaring bitmaps ordered by MPHF slot, followed by an offset trailer:
 ```
-[count:varint][first_toid:8][delta1:varint][delta2:varint]...
-```
-
-**V2 Format:** Stores 32-bit local IDs
-```
-[count:varint][first_id:8][delta1:varint][delta2:varint]...
+[bitmap₀ bytes][bitmap₁ bytes]...[bitmapₙ₋₁ bytes]
+[offset₀: uint64 LE][offset₁: uint64 LE]...[offsetₙ: uint64 LE]
 ```
 
-Delta encoding exploits the sequential nature of events — consecutive events have small deltas, often encoding in 1-2 bytes instead of 4-8.
+The trailer has N+1 entries; `offset[N]` is the sentinel (end of last bitmap). Bitmap `i` spans bytes `offset[i]..offset[i+1]`.
 
-**Query Optimizations:**
-- Parallel reads: contract and topic posting lists read concurrently
-- Guided intersection: lists sorted by size, smallest intersected first
-- Streaming: single-filter queries fetch bucket-by-bucket with early termination
+**Lookup:**
+1. `slot = hash.Query(termKey)` — O(1), with fingerprint check for false positives
+2. Read `offsets[slot]` and `offsets[slot+1]` from the pack trailer
+3. `pread(pack, offset, length)` → roaring bitmap bytes
+4. `roaring.UnmarshalBinary(bytes)` → set of matching dense local IDs
 
-### Bitmap Indexes
+### segment.meta — Ledger Map
 
-Bitmap indexes use Roaring Bitmaps for space-efficient set operations.
+A fixed 40,000-byte cumulative count array (10,000 × uint32 LE).
 
-**32-bit Ledger Bitmap:** Maps terms to ledger numbers. Returns matching ledgers, then events within those ledgers are scanned. Good for high-selectivity queries.
+Entry `i` = total events in ledgers at offsets 0 through `i` (inclusive cumulative sum). Used to convert between dense local IDs and `(ledger, eventSeq)` pairs:
 
-**64-bit Event Bitmap:** Maps terms to TOIDs. Event-level granularity but with 64-bit storage overhead.
-
-**32-bit Event Bitmap (V2):** Maps terms to local IDs. Event-level granularity with compact 32-bit storage. Best query performance when combined with V2 event keys.
+- **Ledger range → ID range** — O(1) lookup for query range trimming
+- **Dense ID → (ledger, seq)** — O(log N) binary search for result decoding
 
 ## Configuration
 
-### Index Selection
-
-In `config.toml` under `[ingestion]`:
-
 ```toml
-[ingestion]
-# V1 indexes (10-byte TOID-based event keys)
-bitmap_indexes = false        # ledger-level bitmap
-bitmap64_indexes = false      # event-level bitmap (64-bit TOIDs)
-posting_list_indexes = false  # TOID-based posting lists
+[source]
+ledger_dir = "./data/ledgers"
+network = "mainnet"
 
-# V2 indexes (6-byte sequential event keys)
-v2_indexes = true             # enables bitmap32-event + posting-v2
-```
-
-V1 and V2 cannot be enabled simultaneously — they use incompatible event key formats.
-
-### Storage Options
-
-```toml
 [storage]
-db_path = "./events.db"
-event_format = "binary"       # "xdr" or "binary" (binary is faster for queries)
-compression = "zstd"
-```
+db_path = "./rocksdb/events"
+rocksdb = true                 # write to RocksDB
+segment_files = false          # write segment flat files
+segment_path = "./data/segments"
+compress_data = false          # zstd compress events.dat blocks
+block_size = 128               # events per compression block
 
-### Performance Tuning
-
-```toml
 [ingestion]
-workers = 8                   # parallel ledger readers
-batch_size = 100              # ledgers per write batch
-index_flush_interval = 10000  # flush indexes every N ledgers
+workers = 0                    # 0 = all CPUs
+batch_size = 100               # ledgers per write batch
+unique_indexes = false         # maintain unique value counts
+
+[query]
+max_ledger_range = 100000
+default_limit = 100
 ```
 
 ## Usage
@@ -223,128 +198,21 @@ index_flush_interval = 10000  # flush indexes every N ledgers
 ./stellar-events stats
 ```
 
-Shows event counts, ledger range, and column family sizes.
-
-## Benchmarking
-
-### 1. Generate Test Data File
-
-Create a benchmark data file with contract IDs and topics to test:
-
-```bash
-./stellar-events benchmark --generate > benchmark_test.json
-```
-
-Edit `benchmark_test.json` to include actual contract IDs and topics from your data, categorized by cardinality (high/medium/low event counts).
-
-### 2. Run Benchmarks
-
-```bash
-# Test all index types
-./stellar-events benchmark --data benchmark_test.json --index all
-
-# Test specific index type
-./stellar-events benchmark --data benchmark_test.json --index posting-v2
-
-# With custom options
-./stellar-events benchmark --data benchmark_test.json \
-  --index posting-v2 \
-  --iterations 10 \
-  --warmup 2 \
-  --limit 1000 \
-  --timeout 30s
-```
-
-### 3. Output Formats
-
-```bash
-# Table format (default, to stdout)
-./stellar-events benchmark --data benchmark_test.json
-
-# CSV format
-./stellar-events benchmark --data benchmark_test.json --format csv
-
-# JSON format
-./stellar-events benchmark --data benchmark_test.json --format json
-
-# Write results to file
-./stellar-events benchmark --data benchmark_test.json --output results.csv
-```
-
-### Available Index Types
-
-| Index Type | Description |
-|------------|-------------|
-| `posting` | V1 posting list (sequential reads) |
-| `posting-parallel` | V1 posting list (parallel reads + guided intersection) |
-| `posting-v2` | V2 posting list (parallel + point gets) |
-| `bitmap32` | Ledger-level bitmap |
-| `bitmap64` | Event-level bitmap (TOID-based) |
-| `bitmap32-event` | Event-level bitmap (local ID-based, V2) |
-| `all` | Run all index types |
-
-### Benchmark Options
-
-| Flag | Description |
-|------|-------------|
-| `--data` | Path to benchmark data JSON file (required) |
-| `--index` | Index type(s) to test (default: all) |
-| `--iterations` | Number of iterations per query (default: 5) |
-| `--warmup` | Warmup iterations not counted (default: 1) |
-| `--limit` | Max events to fetch per query (default: 1000) |
-| `--timeout` | Timeout per query (default: 30s) |
-| `--fixed-range` | Use same ledger range for all queries |
-| `--max-combinations` | Max query combinations to test (default: 50) |
-| `--seed` | Random seed for reproducibility |
-| `--log` | Log file for per-query details |
-| `--output` | Output file for results |
-| `--format` | Output format: table, csv, json |
-
-### Benchmark Output Metrics
-
-| Metric | Description |
-|--------|-------------|
-| P50/P99 Time | Query latency percentiles |
-| Index Matches | TOIDs, local IDs, or ledgers matched by index |
-| Events Scanned | Events read from storage |
-| Events Returned | Events after filtering |
-| Index Bytes | Bytes read from index |
-| Event Bytes | Bytes read from event storage |
-| Index Read Time | I/O time reading index |
-| Index Decode Time | CPU time decoding index |
-
-### Tips
-
-- Use `--fixed-range` when comparing index types to ensure identical query ranges
-- Use `--warmup 2` to prime OS and RocksDB caches
-- Check `--log` output for per-query debugging
-- V2 indexes (`posting-v2`, `bitmap32-event`) require data ingested with `v2_indexes = true`
-
-## Performance Comparison
-
-| Index Type | Granularity | Event Fetch | Best For |
-|------------|-------------|-------------|----------|
-| `bitmap32` | Ledger | Scan all events in ledger | High selectivity (few ledgers match) |
-| `bitmap64` | Operation | Range scan per TOID | Medium selectivity |
-| `bitmap32-event` | Event | Point get | Low selectivity, V2 data |
-| `posting` | Operation | Range scan per TOID | Multi-filter queries |
-| `posting-v2` | Event | Point get | Multi-filter queries, V2 data |
-
-V2 indexes provide the best query performance due to point gets, but require re-ingesting data with `v2_indexes = true`.
-
 ## Project Structure
 
 ```
 stellar-events/
-├── cmd/                      # CLI commands
+├── cmd/                        # CLI commands
 ├── internal/
-│   ├── config/               # TOML configuration
-│   ├── index/                # Bitmap and posting list indexes
-│   ├── ingest/               # Parallel ingestion pipeline
-│   ├── query/                # Query types and engine
-│   ├── reader/               # Ledger file reader
-│   └── store/                # RocksDB storage layer
+│   ├── config/                 # TOML configuration
+│   ├── eventstore/             # Block-compressed event file reader/writer
+│   ├── ingest/                 # Parallel ingestion pipeline
+│   ├── packfile/               # FOR (Frame-of-Reference) codec
+│   ├── query/                  # Query types and engine
+│   ├── reader/                 # Ledger file reader
+│   ├── store/                  # RocksDB storage, bitmap indexes, segment files
+│   └── zstd/                   # Zstd compression wrapper
 ├── configs/
-│   └── config.example.toml   # Example configuration
+│   └── config.example.toml
 └── Makefile
 ```

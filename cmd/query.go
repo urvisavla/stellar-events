@@ -24,8 +24,7 @@ func runQuery(cfg *config.Config, args []string) {
 
 	contract := fs.String("contract", "", "Contract ID (C... strkey format)")
 	topics := fs.String("topics", "", "Comma-separated topics (base64), position-independent AND logic")
-	useBitmap := fs.Bool("bitmap", false, "Use 32-bit bitmap index (ledger-level, positional topics)")
-	useSegmentFile := fs.Bool("segment-file", false, "Use segment flat file index (positional topics)")
+	useSegment := fs.Bool("segment", false, "Use segment flat file index (positional topics)")
 	topic0 := fs.String("topic0", "", "Topic0 (base64) - positional filter at position 0")
 	topic1 := fs.String("topic1", "", "Topic1 (base64) - positional filter at position 1")
 	topic2 := fs.String("topic2", "", "Topic2 (base64) - positional filter at position 2")
@@ -40,9 +39,8 @@ func runQuery(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "Arguments:\n")
 		fmt.Fprintf(os.Stderr, "  <start>           Start ledger (required)\n")
 		fmt.Fprintf(os.Stderr, "  [end]             End ledger (default: start + %d from config)\n\n", cfg.Query.MaxLedgerRange)
-		fmt.Fprintf(os.Stderr, "Index options (default: V2 posting list):\n")
-		fmt.Fprintf(os.Stderr, "  --bitmap          Use 32-bit bitmap (ledger-level, positional topics)\n")
-		fmt.Fprintf(os.Stderr, "  --segment-file    Use segment flat file index (positional topics)\n")
+		fmt.Fprintf(os.Stderr, "Index options (default: bitmap32):\n")
+		fmt.Fprintf(os.Stderr, "  --segment    Use segment flat file index (positional topics)\n")
 		fmt.Fprintf(os.Stderr, "\nFilter options:\n")
 		fmt.Fprintf(os.Stderr, "  --contract <id>   Filter by contract ID (C... strkey format)\n")
 		fmt.Fprintf(os.Stderr, "  --topics <list>   Comma-separated topics (base64), position-independent AND\n")
@@ -57,8 +55,8 @@ func runQuery(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "\nTiming stats are always shown.\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  query 55000000                                  # Query all events in range\n")
-		fmt.Fprintf(os.Stderr, "  query 55000000 --contract C...                  # V2 posting list (default)\n")
-		fmt.Fprintf(os.Stderr, "  query 55000000 --topic0 <b64> --bitmap          # 32-bit bitmap (ledger-level)\n")
+		fmt.Fprintf(os.Stderr, "  query 55000000 --contract C...                  # bitmap32 (default)\n")
+		fmt.Fprintf(os.Stderr, "  query 55000000 --topic0 <b64>                  # bitmap32 with positional topic\n")
 	}
 
 	// Custom parsing to handle positional args before flags
@@ -128,13 +126,10 @@ func runQuery(cfg *config.Config, args []string) {
 		queryLimit = cfg.Query.DefaultLimit
 	}
 
-	// Determine index type: posting-v2 (default), bitmap32, or segment-file
-	indexType := "posting-v2"
-	if *useBitmap {
-		indexType = "bitmap32"
-	}
-	if *useSegmentFile {
-		indexType = "segment-file"
+	// Determine index type: bitmap32 (default) or segment-index
+	indexType := "bitmap32"
+	if *useSegment {
+		indexType = "segment-index"
 	}
 
 	cmdQuery(cfg, uint32(startLedger), uint32(endLedger), *contract, *topics, *topic0, *topic1, *topic2, *topic3, queryLimit, indexType, *compareDB, *compareFormat)
@@ -165,8 +160,8 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 			return
 		}
 
-		if indexType == "segment-file" {
-			runSegmentFileUnfilteredQuery(eventStore, startLedger, endLedger, limit)
+		if indexType == "segment-index" {
+			runSegmentDataUnfilteredQuery(eventStore, startLedger, endLedger, limit)
 			return
 		}
 
@@ -220,24 +215,20 @@ func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, top
 		}
 
 		switch indexType {
-		case "posting-v2":
-			runPostingV2PositionalQuery(eventStore, filter, startLedger, endLedger, limit)
 		case "bitmap32":
 			runBitmap32PositionalQuery(eventStore, filter, startLedger, endLedger, limit)
-		case "segment-file":
-			runSegmentFilePositionalQuery(eventStore, filter, startLedger, endLedger, limit)
+		case "segment-index":
+			runSegmentIndexPositionalQuery(eventStore, filter, startLedger, endLedger, limit)
 		}
 		return
 	}
 
 	// --topics CSV flag: parse as positional (topic0,topic1,topic2,topic3)
 	switch indexType {
-	case "posting-v2":
-		runPostingV2Query(eventStore, contractID, topicsCSV, startLedger, endLedger, limit)
 	case "bitmap32":
 		runBitmap32NonPositionalQuery(eventStore, contractID, topicsCSV, startLedger, endLedger, limit)
-	case "segment-file":
-		runSegmentFileNonPositionalQuery(eventStore, contractID, topicsCSV, startLedger, endLedger, limit)
+	case "segment-index":
+		runSegmentIndexNonPositionalQuery(eventStore, contractID, topicsCSV, startLedger, endLedger, limit)
 	}
 }
 
@@ -293,34 +284,8 @@ func buildFilter(contractID, topic0, topic1, topic2, topic3 string) *query.Filte
 	return filter
 }
 
-// runPostingV2PositionalQuery runs a query using V2 posting list indexes with positional topic filters.
-func runPostingV2PositionalQuery(eventStore *store.RocksDBEventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) {
-	fmt.Fprintf(os.Stderr, "Querying with V2 posting list in ledgers %d-%d...\n", startLedger, endLedger)
-
-	topicGroups := filter.TopicGroups()
-	stats, events, err := eventStore.QueryEventsWithPostingListV2Timing(filter.ContractID, topicGroups, startLedger, endLedger, limit)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	printUnifiedResult(stats.ToUnified())
-
-	if events == nil {
-		fmt.Println("[]")
-		return
-	}
-
-	output, err := json.MarshalIndent(events, "", "  ")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to marshal events: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println(string(output))
-}
-
 // runBitmap32PositionalQuery runs a query using V2 bitmap32 index with positional topic filters.
-func runBitmap32PositionalQuery(eventStore *store.RocksDBEventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) {
+func runBitmap32PositionalQuery(eventStore *store.EventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) {
 	fmt.Fprintf(os.Stderr, "Querying with V2 bitmap32 index in ledgers %d-%d...\n", startLedger, endLedger)
 
 	topicGroups := filter.TopicGroups()
@@ -346,7 +311,7 @@ func runBitmap32PositionalQuery(eventStore *store.RocksDBEventStore, filter *que
 }
 
 // runBitmap32NonPositionalQuery runs a query using V2 bitmap32 index with non-positional topics
-func runBitmap32NonPositionalQuery(eventStore *store.RocksDBEventStore, contractID, topicsCSV string, startLedger, endLedger uint32, limit int) {
+func runBitmap32NonPositionalQuery(eventStore *store.EventStore, contractID, topicsCSV string, startLedger, endLedger uint32, limit int) {
 	fmt.Fprintf(os.Stderr, "Querying with V2 bitmap32 index in ledgers %d-%d...\n", startLedger, endLedger)
 
 	// Parse contract ID (strkey format)
@@ -410,18 +375,18 @@ func runBitmap32NonPositionalQuery(eventStore *store.RocksDBEventStore, contract
 	fmt.Println(string(output))
 }
 
-// runSegmentFilePositionalQuery runs a query using segment flat file indexes with positional topic filters.
-func runSegmentFilePositionalQuery(eventStore *store.RocksDBEventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) {
-	fmt.Fprintf(os.Stderr, "Querying with segment file index in ledgers %d-%d...\n", startLedger, endLedger)
+// runSegmentIndexPositionalQuery runs a query using segment flat file indexes with positional topic filters.
+func runSegmentIndexPositionalQuery(eventStore *store.EventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) {
+	fmt.Fprintf(os.Stderr, "Querying with segment index in ledgers %d-%d...\n", startLedger, endLedger)
 
 	topicGroups := filter.TopicGroups()
-	stats, events, err := eventStore.QueryEventsWithSegmentVolume(filter.ContractID, topicGroups, startLedger, endLedger, limit)
+	stats, events, err := eventStore.QueryEventsWithSegmentData(filter.ContractID, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	printUnifiedResult(store.SegmentVolumeToUnified(stats))
+	printUnifiedResult(store.SegmentDataToUnified(stats))
 
 	if events == nil {
 		fmt.Println("[]")
@@ -436,17 +401,17 @@ func runSegmentFilePositionalQuery(eventStore *store.RocksDBEventStore, filter *
 	fmt.Println(string(output))
 }
 
-// runSegmentFileUnfilteredQuery runs an unfiltered range query using flat file volumes (no index, no RocksDB).
-func runSegmentFileUnfilteredQuery(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, limit int) {
-	fmt.Fprintf(os.Stderr, "Querying all events from segment volume in ledgers %d-%d...\n", startLedger, endLedger)
+// runSegmentDataUnfilteredQuery runs an unfiltered range query using segment data (no index, no RocksDB).
+func runSegmentDataUnfilteredQuery(eventStore *store.EventStore, startLedger, endLedger uint32, limit int) {
+	fmt.Fprintf(os.Stderr, "Querying all events from segment data in ledgers %d-%d...\n", startLedger, endLedger)
 
-	stats, events, err := eventStore.GetEventsInRangeFromVolume(startLedger, endLedger, limit)
+	stats, events, err := eventStore.GetEventsInRangeFromSegmentData(startLedger, endLedger, limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	printUnifiedResult(store.SegmentVolumeToUnified(stats))
+	printUnifiedResult(store.SegmentDataToUnified(stats))
 
 	if events == nil {
 		fmt.Println("[]")
@@ -461,9 +426,9 @@ func runSegmentFileUnfilteredQuery(eventStore *store.RocksDBEventStore, startLed
 	fmt.Println(string(output))
 }
 
-// runSegmentFileNonPositionalQuery runs a query using segment flat file indexes with non-positional topics
-func runSegmentFileNonPositionalQuery(eventStore *store.RocksDBEventStore, contractID, topicsCSV string, startLedger, endLedger uint32, limit int) {
-	fmt.Fprintf(os.Stderr, "Querying with segment file index in ledgers %d-%d...\n", startLedger, endLedger)
+// runSegmentIndexNonPositionalQuery runs a query using segment flat file indexes with non-positional topics
+func runSegmentIndexNonPositionalQuery(eventStore *store.EventStore, contractID, topicsCSV string, startLedger, endLedger uint32, limit int) {
+	fmt.Fprintf(os.Stderr, "Querying with segment index in ledgers %d-%d...\n", startLedger, endLedger)
 
 	var contractBytes []byte
 	if contractID != "" {
@@ -501,72 +466,13 @@ func runSegmentFileNonPositionalQuery(eventStore *store.RocksDBEventStore, contr
 		os.Exit(2)
 	}
 
-	stats, events, err := eventStore.QueryEventsWithSegmentVolume(contractBytes, topicGroups, startLedger, endLedger, limit)
+	stats, events, err := eventStore.QueryEventsWithSegmentData(contractBytes, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	printUnifiedResult(store.SegmentVolumeToUnified(stats))
-
-	if events == nil {
-		fmt.Println("[]")
-		return
-	}
-
-	output, err := json.MarshalIndent(events, "", "  ")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to marshal events: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println(string(output))
-}
-
-// runPostingV2Query runs a query using V2 posting list indexes
-func runPostingV2Query(eventStore *store.RocksDBEventStore, contractID, topicsCSV string, startLedger, endLedger uint32, limit int) {
-	fmt.Fprintf(os.Stderr, "Querying with V2 posting list index in ledgers %d-%d...\n", startLedger, endLedger)
-
-	// Parse contract ID (strkey format)
-	var contractBytes []byte
-	if contractID != "" {
-		var err error
-		contractBytes, err = decodeContractID(contractID)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: invalid contract ID (expected C... format): %v\n", err)
-			os.Exit(2)
-		}
-	}
-
-	// Parse comma-separated topics (base64, positional: topic0,topic1,topic2,topic3)
-	var topicGroups [4][][]byte
-	if topicsCSV != "" {
-		topicStrs := strings.Split(topicsCSV, ",")
-		for i, topicStr := range topicStrs {
-			if i >= 4 {
-				break
-			}
-			topicStr = strings.TrimSpace(topicStr)
-			if topicStr == "" {
-				continue
-			}
-			topicBytes, err := decodeBase64(topicStr)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid topic (expected base64): %v\n", err)
-				os.Exit(2)
-			}
-			topicGroups[i] = [][]byte{topicBytes}
-		}
-	}
-
-	// Query using V2 posting list index with detailed stats
-	stats, events, err := eventStore.QueryEventsWithPostingListV2Timing(contractBytes, topicGroups, startLedger, endLedger, limit)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Print detailed results using unified format
-	printUnifiedResult(stats.ToUnified())
+	printUnifiedResult(store.SegmentDataToUnified(stats))
 
 	if events == nil {
 		fmt.Println("[]")
@@ -586,21 +492,19 @@ func printUnifiedResult(r *store.UnifiedQueryResult) {
 	// Header with index type
 	var header string
 	switch r.IndexType {
-	case "posting-v2":
-		header = "V2 Posting List"
 	case "bitmap32":
 		header = "32-bit Bitmap"
-	case "segment-file":
-		header = "Segment File"
-	case "segment-volume":
-		header = "Segment Volume"
+	case "segment-index":
+		header = "Segment Index"
+	case "segment-data":
+		header = "Segment Data"
 	default:
 		header = r.IndexType
 	}
 
 	fmt.Fprintf(os.Stderr, "\n=== %s Query Results ===\n", header)
 	fmt.Fprintf(os.Stderr, "  Ledger range:      %d ledgers\n", r.LedgerRange)
-	fmt.Fprintf(os.Stderr, "  Buckets touched:   %d\n", r.BucketsTouched)
+	fmt.Fprintf(os.Stderr, "  Segments touched:  %d\n", r.SegmentsTouched)
 	fmt.Fprintf(os.Stderr, "  Index matches:     %d %s\n", r.IndexMatches, r.MatchUnitName)
 	fmt.Fprintf(os.Stderr, "  Events scanned:    %d\n", r.EventsScanned)
 	fmt.Fprintf(os.Stderr, "  Events returned:   %d\n", r.EventsReturned)
@@ -640,9 +544,9 @@ func printUnifiedResult(r *store.UnifiedQueryResult) {
 }
 
 // runComparisonQuery runs the same query against two databases and compares
-func runComparisonQuery(cfg *config.Config, primaryStore *store.RocksDBEventStore, compareDBPath, compareFormat string, filter *query.Filter, startLedger, endLedger uint32, limit int) {
+func runComparisonQuery(cfg *config.Config, primaryStore *store.EventStore, compareDBPath, compareFormat string, filter *query.Filter, startLedger, endLedger uint32, limit int) {
 	// Run query on primary database
-	fmt.Fprintf(os.Stderr, "=== Primary Database (%s format) ===\n", cfg.Storage.EventFormat)
+	fmt.Fprintf(os.Stderr, "=== Primary Database ===\n")
 	primaryResult := executeQuery(primaryStore, filter, startLedger, endLedger, limit)
 	if primaryResult == nil {
 		return
@@ -657,13 +561,8 @@ func runComparisonQuery(cfg *config.Config, primaryStore *store.RocksDBEventStor
 	}
 	defer compareStore.Close()
 
-	// Set format for comparison store
-	if compareFormat != "" {
-		compareStore.SetEventFormat(compareFormat)
-	}
-
 	// Run query on comparison database
-	fmt.Fprintf(os.Stderr, "\n=== Comparison Database (%s format) ===\n", compareStore.GetEventFormat())
+	fmt.Fprintf(os.Stderr, "\n=== Comparison Database ===\n")
 	compareResult := executeQuery(compareStore, filter, startLedger, endLedger, limit)
 	if compareResult == nil {
 		return
@@ -672,13 +571,13 @@ func runComparisonQuery(cfg *config.Config, primaryStore *store.RocksDBEventStor
 
 	// Print comparison
 	fmt.Fprintf(os.Stderr, "\n=== Performance Comparison ===\n")
-	printPerformanceComparison(primaryResult, compareResult, cfg.Storage.EventFormat, compareStore.GetEventFormat())
+	printPerformanceComparison(primaryResult, compareResult, "xdr", "xdr")
 }
 
 // runUnfilteredComparisonQuery runs unfiltered queries against two databases and compares
-func runUnfilteredComparisonQuery(cfg *config.Config, primaryStore *store.RocksDBEventStore, compareDBPath, compareFormat string, startLedger, endLedger uint32, limit int) {
+func runUnfilteredComparisonQuery(cfg *config.Config, primaryStore *store.EventStore, compareDBPath, compareFormat string, startLedger, endLedger uint32, limit int) {
 	// Run query on primary database
-	fmt.Fprintf(os.Stderr, "=== Primary Database (%s format) ===\n", cfg.Storage.EventFormat)
+	fmt.Fprintf(os.Stderr, "=== Primary Database ===\n")
 	fmt.Fprintf(os.Stderr, "Querying all events in ledgers %d-%d...\n", startLedger, endLedger)
 	primaryResult := executeUnfilteredQuery(primaryStore, startLedger, endLedger, limit)
 	if primaryResult == nil {
@@ -694,13 +593,8 @@ func runUnfilteredComparisonQuery(cfg *config.Config, primaryStore *store.RocksD
 	}
 	defer compareStore.Close()
 
-	// Set format for comparison store
-	if compareFormat != "" {
-		compareStore.SetEventFormat(compareFormat)
-	}
-
 	// Run query on comparison database
-	fmt.Fprintf(os.Stderr, "\n=== Comparison Database (%s format) ===\n", compareStore.GetEventFormat())
+	fmt.Fprintf(os.Stderr, "\n=== Comparison Database ===\n")
 	fmt.Fprintf(os.Stderr, "Querying all events in ledgers %d-%d...\n", startLedger, endLedger)
 	compareResult := executeUnfilteredQuery(compareStore, startLedger, endLedger, limit)
 	if compareResult == nil {
@@ -710,11 +604,11 @@ func runUnfilteredComparisonQuery(cfg *config.Config, primaryStore *store.RocksD
 
 	// Print comparison
 	fmt.Fprintf(os.Stderr, "\n=== Performance Comparison ===\n")
-	printUnfilteredPerformanceComparison(primaryResult, compareResult, cfg.Storage.EventFormat, compareStore.GetEventFormat())
+	printUnfilteredPerformanceComparison(primaryResult, compareResult, "xdr", "xdr")
 }
 
 // executeUnfilteredQuery runs an unfiltered range query and returns the result
-func executeUnfilteredQuery(eventStore *store.RocksDBEventStore, startLedger, endLedger uint32, limit int) *query.Result {
+func executeUnfilteredQuery(eventStore *store.EventStore, startLedger, endLedger uint32, limit int) *query.Result {
 	startTime := time.Now()
 	rangeResult, err := eventStore.GetEventsInRangeWithTiming(startLedger, endLedger, limit)
 	if err != nil {
@@ -821,23 +715,24 @@ func printUnfilteredPerformanceComparison(primary, compare *query.Result, primar
 	}
 }
 
-// executeQuery runs a query using V2 posting list and returns the result
-func executeQuery(eventStore *store.RocksDBEventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) *query.Result {
+// executeQuery runs a query using bitmap32 and returns the result
+func executeQuery(eventStore *store.EventStore, filter *query.Filter, startLedger, endLedger uint32, limit int) *query.Result {
 	topicGroups := filter.TopicGroups()
-	stats, events, err := eventStore.QueryEventsWithPostingListV2Timing(filter.ContractID, topicGroups, startLedger, endLedger, limit)
+	stats, events, err := eventStore.QueryEventsWithBitmap32EventIndex(filter.ContractID, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		return nil
 	}
 
+	unified := stats.ToUnified()
 	return &query.Result{
-		LedgerRange:     stats.LedgerRange,
-		EventsScanned:   int64(stats.EventsScanned),
-		EventsReturned:  stats.EventsReturned,
-		Events:          events,
-		TotalTime:       stats.TotalTime,
-		EventFetchTime:  stats.EventFetchTime,
-		BytesRead:       stats.EventBytesRead,
+		LedgerRange:    unified.LedgerRange,
+		EventsScanned:  int64(unified.EventsScanned),
+		EventsReturned: unified.EventsReturned,
+		Events:         events,
+		TotalTime:      unified.TotalTime,
+		EventFetchTime: unified.EventFetchTime,
+		BytesRead:      unified.EventBytesRead,
 	}
 }
 
