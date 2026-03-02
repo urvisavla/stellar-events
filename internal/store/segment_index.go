@@ -437,8 +437,9 @@ func EncodeSegmentLedgerMap(segmentID uint32, ledgerEventCounts [SegmentSize]uin
 }
 
 // MergeSegmentLedgerMapData merges new per-ledger event counts into an existing
-// cumulative array. The existing data is read, counts are added at the specified
-// offsets, and the cumulative sums are recomputed from the point of first change.
+// cumulative array. For ledger offsets present in both old and new data, the new
+// count REPLACES the old (idempotent on re-ingestion). For offsets only in the
+// existing data, old counts are preserved (supports continuation after restart).
 // Returns a new 40,000-byte cumulative array.
 func MergeSegmentLedgerMapData(existing []byte, newCounts map[uint16]uint32) []byte {
 	if len(existing) < SegmentLedgerMapSize {
@@ -460,9 +461,15 @@ func MergeSegmentLedgerMapData(existing []byte, newCounts map[uint16]uint32) []b
 		prev = cum
 	}
 
-	// Add new counts
+	// Merge: replace overlapping offsets (idempotent), add new-only offsets
 	for off, count := range newCounts {
-		counts[off] += count
+		if counts[off] > 0 {
+			// Re-ingested ledger: replace to avoid double-counting
+			counts[off] = count
+		} else {
+			// New ledger (continuation): add
+			counts[off] = count
+		}
 	}
 
 	// Re-encode

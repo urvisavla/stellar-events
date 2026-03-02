@@ -422,53 +422,9 @@ func uniqueKey(uniqueType byte, value []byte) []byte {
 	return key
 }
 
-// parseRawXDRToQueryEvent converts raw XDR bytes to a query.Event
-func parseRawXDRToQueryEvent(rawXDR []byte, ledger uint32, tx, op uint32, eventIdx uint16) (*query.Event, error) {
-	var xdrEvent xdr.ContractEvent
-	if err := xdrEvent.UnmarshalBinary(rawXDR); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal XDR event: %w", err)
-	}
-
-	ev := &query.Event{
-		LedgerSequence:   ledger,
-		TransactionIndex: int(tx),
-		OperationIndex:   int(op),
-		EventIndex:       int(eventIdx),
-	}
-
-	// Extract contract ID if present - encode as strkey (C...)
-	if xdrEvent.ContractId != nil {
-		if encoded, err := strkey.Encode(strkey.VersionByteContract, xdrEvent.ContractId[:]); err == nil {
-			ev.ContractID = encoded
-		}
-	}
-
-	// Event type
-	switch xdrEvent.Type {
-	case xdr.ContractEventTypeContract:
-		ev.Type = "contract"
-	case xdr.ContractEventTypeSystem:
-		ev.Type = "system"
-	case xdr.ContractEventTypeDiagnostic:
-		ev.Type = "diagnostic"
-	}
-
-	// Extract topics and data from event body
-	if xdrEvent.Body.V == 0 {
-		body := xdrEvent.Body.MustV0()
-
-		// Topics
-		for _, topic := range body.Topics {
-			topicBytes, _ := topic.MarshalBinary()
-			ev.Topics = append(ev.Topics, base64.StdEncoding.EncodeToString(topicBytes))
-		}
-
-		// Data
-		dataBytes, _ := body.Data.MarshalBinary()
-		ev.Data = base64.StdEncoding.EncodeToString(dataBytes)
-	}
-
-	return ev, nil
+// parseRawXDRToQueryEvent converts binary event bytes to a query.Event.
+func parseRawXDRToQueryEvent(data []byte, ledger uint32, tx, op uint32, eventIdx uint16) (*query.Event, error) {
+	return event.DecodeBinaryToQueryEvent(data, ledger, eventIdx)
 }
 
 // EventStore manages storing events in RocksDB
@@ -645,9 +601,6 @@ func (es *EventStore) StoreEvents(events []*event.IngestEvent, opts *StoreOption
 	// Map from unique key -> count to add
 	countUpdates := make(map[string]uint64)
 
-	// Track event sequence counters per ledger for V2 keys
-	eventSeqCounters := make(map[uint32]uint16)
-
 	for _, ev := range events {
 		// Skip diagnostic events if configured
 		if opts.ExcludeDiagnostic && ev.EventType == 2 {
@@ -662,21 +615,18 @@ func (es *EventStore) StoreEvents(events []*event.IngestEvent, opts *StoreOption
 			}
 		}
 
-		// V2 key format: [ledger:4][event_seq:2]
-		eventSeq := eventSeqCounters[ev.LedgerSequence]
-		key := event.EncodeKeyV2(ev.LedgerSequence, eventSeq)
-		eventSeqCounters[ev.LedgerSequence] = eventSeq + 1
-
-		value := ev.RawXDR
-		if es.writeRocksDB {
-			batch.PutCF(es.cfEvents, key, value)
-		}
-		totalBytes += int64(len(value))
-
 		// Assign dense local ID and update bitmap + posting list indexes
 		if es.indexStore != nil {
 			segmentID := SegmentID(ev.LedgerSequence)
 			denseLocalID := es.indexStore.AssignDenseLocalID(segmentID, ev.LedgerSequence)
+
+			// Key: [segmentID:4][denseID:4], value: binary event
+			key := event.EncodeKey(segmentID, denseLocalID)
+			value := event.EncodeBinaryEvent(ev)
+			if es.writeRocksDB {
+				batch.PutCF(es.cfEvents, key, value)
+			}
+			totalBytes += int64(len(value))
 
 			// Index contract ID -> dense local ID (bitmap32)
 			if len(ev.ContractID) > 0 {
@@ -701,7 +651,7 @@ func (es *EventStore) StoreEvents(events []*event.IngestEvent, opts *StoreOption
 						return 0, fmt.Errorf("failed to start segment data chunk %d: %w", segmentID, err)
 					}
 				}
-				v4Data := event.EncodeBinaryEventV4(ev)
+				v4Data := event.EncodeBinaryEvent(ev)
 				if err := es.segmentDataWriter.AppendEvent(denseLocalID, v4Data); err != nil {
 					return 0, fmt.Errorf("failed to append event to file store: %w", err)
 				}
@@ -775,8 +725,8 @@ func (es *EventStore) GetEventsInRangeWithTiming(startLedger, endLedger uint32, 
 		Timing: query.FetchTiming{},
 	}
 
-	// Use V2 key (6 bytes) for seeking — works as prefix for both V2 and TOID keys
-	startKey := event.EncodeKeyV2(startLedger, 0)
+	// Seek to start of segment containing startLedger
+	startKey := event.EncodeKey(SegmentID(startLedger), 0)
 
 	// Time iterator creation and seek
 	diskStart := time.Now()
@@ -784,6 +734,9 @@ func (es *EventStore) GetEventsInRangeWithTiming(startLedger, endLedger uint32, 
 	defer it.Close()
 	it.Seek(startKey)
 	result.Timing.DiskReadTime += time.Since(diskStart)
+
+	var currentSegID uint32 = ^uint32(0)
+	var lm *SegmentLedgerMap
 
 	for it.Valid() {
 		// Check limit
@@ -796,19 +749,40 @@ func (es *EventStore) GetEventsInRangeWithTiming(startLedger, endLedger uint32, 
 		key := it.Key().Data()
 		result.Timing.DiskReadTime += time.Since(diskStart)
 
-		if len(key) < 6 {
+		if len(key) < 8 {
 			break
 		}
 
-		// Compare ledger (bytes 0-3, same position in both V2 and TOID keys)
-		keyLedger := binary.BigEndian.Uint32(key[0:4])
-		if keyLedger > endLedger {
+		// Decode key: [segmentID:4][denseID:4]
+		segID, denseID := event.DecodeKey(key)
+
+		// Stop if past the end segment
+		if segID > SegmentID(endLedger) {
 			break
 		}
 
-		// Decode V2 key: [ledger:4][event_seq:2]
-		var eventIdx uint16
-		eventIdx = binary.BigEndian.Uint16(key[4:6])
+		// Load ledger map for new segment
+		if segID != currentSegID {
+			currentSegID = segID
+			lm, _ = es.LoadSegmentLedgerMap(segID)
+		}
+		if lm == nil {
+			diskStart = time.Now()
+			it.Next()
+			result.Timing.DiskReadTime += time.Since(diskStart)
+			continue
+		}
+
+		ledger, eventSeq := lm.DenseIDToLedgerAndSeq(denseID)
+		if ledger < startLedger {
+			diskStart = time.Now()
+			it.Next()
+			result.Timing.DiskReadTime += time.Since(diskStart)
+			continue
+		}
+		if ledger > endLedger {
+			break
+		}
 
 		// Time value access (disk read)
 		diskStart = time.Now()
@@ -820,7 +794,7 @@ func (es *EventStore) GetEventsInRangeWithTiming(startLedger, endLedger uint32, 
 		unmarshalStart := time.Now()
 		var ev *query.Event
 		var err error
-		ev, err = parseRawXDRToQueryEvent(valueData, keyLedger, 0, 0, eventIdx)
+		ev, err = parseRawXDRToQueryEvent(valueData, ledger, 0, 0, eventSeq)
 		result.Timing.UnmarshalTime += time.Since(unmarshalStart)
 
 		result.EventsScanned++
@@ -852,29 +826,40 @@ func (es *EventStore) GetEventsInRangeWithTiming(startLedger, endLedger uint32, 
 func (es *EventStore) GetEventsInLedger(ledger uint32) ([]*query.Event, error) {
 	var events []*query.Event
 
-	startKey := event.EncodeKeyV2(ledger, 0)
+	segID := SegmentID(ledger)
+	startKey := event.EncodeKey(segID, 0)
+	lm, _ := es.LoadSegmentLedgerMap(segID)
+	if lm == nil {
+		return events, nil
+	}
+
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
 	defer it.Close()
 
 	for it.Seek(startKey); it.Valid(); it.Next() {
 		key := it.Key().Data()
-		if len(key) < 6 {
+		if len(key) < 8 {
 			break
 		}
 
-		keyLedger := binary.BigEndian.Uint32(key[0:4])
+		keySegID, denseID := event.DecodeKey(key)
+		if keySegID != segID {
+			break
+		}
+
+		keyLedger, eventSeq := lm.DenseIDToLedgerAndSeq(denseID)
+		if keyLedger < ledger {
+			continue
+		}
 		if keyLedger != ledger {
 			break
 		}
-
-		// Decode V2 key: [ledger:4][event_seq:2]
-		eventIdx := binary.BigEndian.Uint16(key[4:6])
 
 		valueData := it.Value().Data()
 
 		var ev *query.Event
 		var err error
-		ev, err = parseRawXDRToQueryEvent(valueData, ledger, 0, 0, eventIdx)
+		ev, err = parseRawXDRToQueryEvent(valueData, ledger, 0, 0, eventSeq)
 		if err != nil {
 			continue
 		}
@@ -895,7 +880,9 @@ func (es *EventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.FetchRe
 		Timing: query.FetchTiming{},
 	}
 
-	startKey := event.EncodeKeyV2(ledger, 0)
+	segID := SegmentID(ledger)
+	startKey := event.EncodeKey(segID, 0)
+	lm, _ := es.LoadSegmentLedgerMap(segID)
 
 	// Time iterator creation and seek
 	diskStart := time.Now()
@@ -910,17 +897,29 @@ func (es *EventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.FetchRe
 		key := it.Key().Data()
 		result.Timing.DiskReadTime += time.Since(diskStart)
 
-		if len(key) < 6 {
+		if len(key) < 8 {
 			break
 		}
 
-		keyLedger := binary.BigEndian.Uint32(key[0:4])
+		keySegID, denseID := event.DecodeKey(key)
+		if keySegID != segID {
+			break
+		}
+
+		if lm == nil {
+			break
+		}
+
+		keyLedger, eventSeq := lm.DenseIDToLedgerAndSeq(denseID)
+		if keyLedger < ledger {
+			diskStart = time.Now()
+			it.Next()
+			result.Timing.DiskReadTime += time.Since(diskStart)
+			continue
+		}
 		if keyLedger != ledger {
 			break
 		}
-
-		// Decode V2 key: [ledger:4][event_seq:2]
-		eventIdx := binary.BigEndian.Uint16(key[4:6])
 
 		// Time value access (disk read)
 		diskStart = time.Now()
@@ -932,7 +931,7 @@ func (es *EventStore) GetEventsInLedgerWithTiming(ledger uint32) (*query.FetchRe
 		unmarshalStart := time.Now()
 		var ev *query.Event
 		var err error
-		ev, err = parseRawXDRToQueryEvent(valueData, ledger, 0, 0, eventIdx)
+		ev, err = parseRawXDRToQueryEvent(valueData, keyLedger, 0, 0, eventSeq)
 		result.Timing.UnmarshalTime += time.Since(unmarshalStart)
 
 		if err != nil {
@@ -1035,7 +1034,7 @@ func (es *EventStore) BuildIndexes(workers int, opts *BuildIndexOptions, progres
 // buildIndexesForRange reads events for a ledger range and sends index data to collector.
 // Unique indexes are still handled locally (no lock contention issue with RocksDB merge).
 func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *BuildIndexOptions, entryCh chan<- *indexEntry) error {
-	startKey := event.EncodeKeyV2(startLedger, 0)
+	startKey := event.EncodeKey(SegmentID(startLedger), 0)
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
 	defer it.Close()
 
@@ -1045,26 +1044,48 @@ func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *
 		counts = make(map[string]uint64)
 	}
 
+	var currentSegID uint32 = ^uint32(0)
+	var lm *SegmentLedgerMap
+
 	for it.Seek(startKey); it.Valid(); it.Next() {
 		key := it.Key().Data()
-		if len(key) < 6 {
+		if len(key) < 8 {
 			break
 		}
 
-		// Parse key: V2 = [ledger:4][eventSeq:2], TOID = [ledger:4][tx:2][op:2][event:2]
-		ledger := binary.BigEndian.Uint32(key[0:4])
+		// Decode key: [segmentID:4][denseID:4]
+		segID, denseID := event.DecodeKey(key)
+		if segID > SegmentID(endLedger) {
+			break
+		}
+
+		// Load ledger map for new segment
+		if segID != currentSegID {
+			currentSegID = segID
+			lm, _ = es.LoadSegmentLedgerMap(segID)
+		}
+		if lm == nil {
+			continue
+		}
+
+		ledger, eventSeq := lm.DenseIDToLedgerAndSeq(denseID)
+		if ledger < startLedger {
+			continue
+		}
 		if ledger > endLedger {
 			break
 		}
 
-		// Decode V2 key: [ledger:4][event_seq:2]
-		eventIdx := binary.BigEndian.Uint16(key[4:6])
-		var txIdx, opIdx uint16
-
-		var xdrEvent xdr.ContractEvent
-		if err := xdrEvent.UnmarshalBinary(it.Value().Data()); err != nil {
+		// Strip header, unmarshal DiagnosticEvent XDR
+		valueData := it.Value().Data()
+		if len(valueData) < event.BinaryHeaderSize {
 			continue
 		}
+		var diagEvent xdr.DiagnosticEvent
+		if err := diagEvent.UnmarshalBinary(valueData[event.BinaryHeaderSize:]); err != nil {
+			continue
+		}
+		xdrEvent := diagEvent.Event
 
 		// Extract contract ID
 		var contractID []byte
@@ -1117,9 +1138,9 @@ func (es *EventStore) buildIndexesForRange(startLedger, endLedger uint32, opts *
 		if entryCh != nil && (len(contractID) > 0 || len(topics) > 0) {
 			entryCh <- &indexEntry{
 				Ledger:     ledger,
-				TxIdx:      txIdx,
-				OpIdx:      opIdx,
-				EventIdx:   eventIdx,
+				TxIdx:      0,
+				OpIdx:      0,
+				EventIdx:   eventSeq,
 				ContractID: contractID,
 				Topics:     topics,
 			}
@@ -2267,26 +2288,58 @@ func (es *EventStore) computeStatsForRange(startLedger, endLedger uint32) struct
 		topic3s:   make(map[string]struct{}),
 	}
 
-	startKey := event.EncodeKeyV2(startLedger, 0)
+	startKey := event.EncodeKey(SegmentID(startLedger), 0)
 	it := es.db.NewIteratorCF(es.ro, es.cfEvents)
 	defer it.Close()
 
+	var currentSegID uint32 = ^uint32(0)
+	var lm *SegmentLedgerMap
+
 	for it.Seek(startKey); it.Valid(); it.Next() {
 		key := it.Key().Data()
-		if len(key) < 4 {
+		if len(key) < 8 {
 			break
 		}
 
-		ledger := binary.BigEndian.Uint32(key[0:4])
+		segID, denseID := event.DecodeKey(key)
+		if segID > SegmentID(endLedger) {
+			break
+		}
+
+		// Load ledger map for new segment
+		if segID != currentSegID {
+			currentSegID = segID
+			lm, _ = es.LoadSegmentLedgerMap(segID)
+		}
+		if lm == nil {
+			continue
+		}
+
+		ledger, _ := lm.DenseIDToLedgerAndSeq(denseID)
+		if ledger < startLedger {
+			continue
+		}
 		if ledger > endLedger {
 			break
 		}
 
 		result.stats.TotalEvents++
 
+		// Strip header, unmarshal DiagnosticEvent XDR
+		valueData := it.Value().Data()
 		var xdrEvent xdr.ContractEvent
-		if err := xdrEvent.UnmarshalBinary(it.Value().Data()); err != nil {
-			continue
+		if len(valueData) >= event.BinaryHeaderSize && valueData[0] == event.BinaryFormatVersion {
+			var diagEvent xdr.DiagnosticEvent
+			if err := diagEvent.UnmarshalBinary(valueData[event.BinaryHeaderSize:]); err != nil {
+				continue
+			}
+			xdrEvent = diagEvent.Event
+		} else {
+			var diagEvent xdr.DiagnosticEvent
+			if err := diagEvent.UnmarshalBinary(valueData); err != nil {
+				continue
+			}
+			xdrEvent = diagEvent.Event
 		}
 
 		switch xdrEvent.Type {
@@ -2403,6 +2456,32 @@ func (es *EventStore) QueryEventsWithBitmap32EventIndex(contractID []byte, topic
 			continue
 		}
 
+		// Verify ledger map: count actual keys in this segment
+		actualCount := 0
+		verifyIter := es.db.NewIteratorCF(es.ro, es.cfEvents)
+		verifyIter.Seek(event.EncodeKey(segID, 0))
+		for verifyIter.Valid() {
+			k := verifyIter.Key()
+			if k == nil || len(k.Data()) < 8 {
+				break
+			}
+			kSegID := binary.BigEndian.Uint32(k.Data()[:4])
+			if kSegID != segID {
+				break
+			}
+			actualCount++
+			verifyIter.Next()
+		}
+		verifyIter.Close()
+		lmTotal := lm.TotalEvents()
+		if uint32(actualCount) != lmTotal {
+			fmt.Fprintf(os.Stderr, "  [MISMATCH] seg=%d ledgerMap=%d actualKeys=%d (diff=%d)\n",
+				segID, lmTotal, actualCount, int(lmTotal)-actualCount)
+		} else {
+			fmt.Fprintf(os.Stderr, "  [verify] seg=%d ledgerMap=%d actualKeys=%d OK\n",
+				segID, lmTotal, actualCount)
+		}
+
 		bitmap := queryResult.PerSegment[segID]
 		bitmapIter := bitmap.Iterator()
 		for bitmapIter.HasNext() {
@@ -2411,8 +2490,24 @@ func (es *EventStore) QueryEventsWithBitmap32EventIndex(contractID []byte, topic
 			}
 			denseID := bitmapIter.Next()
 			ledger, eventSeq := lm.DenseIDToLedgerAndSeq(denseID)
-			allKeys = append(allKeys, event.EncodeKeyV2(ledger, eventSeq))
+			fmt.Fprintf(os.Stderr, "  [dense-debug] seg=%d denseID=%d → ledger=%d seq=%d (totalEvents=%d)\n",
+				segID, denseID, ledger, eventSeq, lm.TotalEvents())
+			allKeys = append(allKeys, event.EncodeKey(segID, denseID))
 			allMetas = append(allMetas, bitmapEvtMeta{ledger: ledger, eventSeq: eventSeq})
+		}
+	}
+
+	// Pre-compute filter strings for post-filter verification
+	var filterContractID string
+	if len(contractID) > 0 {
+		if encoded, err := strkey.Encode(strkey.VersionByteContract, contractID); err == nil {
+			filterContractID = encoded
+		}
+	}
+	var filterTopics [4]string
+	for pos, tg := range topicGroups {
+		if len(tg) > 0 && len(tg[0]) > 0 {
+			filterTopics[pos] = base64.StdEncoding.EncodeToString(tg[0])
 		}
 	}
 
@@ -2433,6 +2528,7 @@ func (es *EventStore) QueryEventsWithBitmap32EventIndex(contractID []byte, topic
 		filterTime time.Duration
 		bytesRead  int64
 		scanned    int
+		filtered   int
 	}
 
 	results := make([]workerResult, numWorkers)
@@ -2504,6 +2600,34 @@ func (es *EventStore) QueryEventsWithBitmap32EventIndex(contractID []byte, topic
 					continue
 				}
 
+				// Post-filter: verify decoded event matches the query filters
+				filterStart := time.Now()
+				matched := true
+				if filterContractID != "" && ev.ContractID != filterContractID {
+					matched = false
+				}
+				if matched {
+					for pos, ft := range filterTopics {
+						if ft == "" {
+							continue
+						}
+						if pos >= len(ev.Topics) || ev.Topics[pos] != ft {
+							matched = false
+							break
+						}
+					}
+				}
+				r.filterTime += time.Since(filterStart)
+
+				if !matched {
+					r.filtered++
+					if r.filtered <= 3 {
+						fmt.Fprintf(os.Stderr, "  [filter-debug] rejected ledger=%d seq=%d: contract=%s topics=%v\n",
+							meta.ledger, meta.eventSeq, ev.ContractID, ev.Topics)
+					}
+					continue
+				}
+
 				r.events = append(r.events, ev)
 			}
 		}(w, start, end)
@@ -2513,6 +2637,7 @@ func (es *EventStore) QueryEventsWithBitmap32EventIndex(contractID []byte, topic
 
 	// Merge results - use max of per-worker times since workers run in parallel
 	var fetchTime, decodeTime, filterTime time.Duration
+	var totalFiltered int
 	events := make([]*query.Event, 0, fetchCap)
 	for _, r := range results {
 		events = append(events, r.events...)
@@ -2527,6 +2652,11 @@ func (es *EventStore) QueryEventsWithBitmap32EventIndex(contractID []byte, topic
 		}
 		result.EventBytesRead += r.bytesRead
 		result.EventsScanned += r.scanned
+		totalFiltered += r.filtered
+	}
+	if totalFiltered > 0 {
+		fmt.Fprintf(os.Stderr, "  Post-filter: %d/%d events rejected (index false positives)\n", totalFiltered, result.EventsScanned)
+		fmt.Fprintf(os.Stderr, "  Expected: contract=%q topics=%v\n", filterContractID, filterTopics)
 	}
 	if limit > 0 && len(events) > limit {
 		events = events[:limit]
@@ -2629,7 +2759,7 @@ func (es *EventStore) QueryEventsWithBitmap32MultiFilter(
 			}
 			denseID := bitmapIter.Next()
 			ledger, eventSeq := lm.DenseIDToLedgerAndSeq(denseID)
-			allKeys = append(allKeys, event.EncodeKeyV2(ledger, eventSeq))
+			allKeys = append(allKeys, event.EncodeKey(segID, denseID))
 			allMetas = append(allMetas, bitmapEvtMeta{ledger: ledger, eventSeq: eventSeq})
 		}
 	}

@@ -324,8 +324,17 @@ func (s *IndexStore) QueryEventKeysMultiFilter(
 		}
 	}
 
-	// Parallel intersection: OR within each group, then AND across groups
+	// Parallel intersection: parallel OR within groups, then AND across groups
 	intersectStart := time.Now()
+
+	// Pre-build ordered group list for indexed parallel access
+	type groupBitmaps struct {
+		perSeg map[uint32][]*roaring.Bitmap
+	}
+	groupList := make([]groupBitmaps, 0, len(groups))
+	for _, g := range groups {
+		groupList = append(groupList, groupBitmaps{perSeg: g.bitmaps})
+	}
 
 	type segAndResult struct {
 		segID uint32
@@ -341,22 +350,28 @@ func (s *IndexStore) QueryEventKeysMultiFilter(
 		andWg.Add(1)
 		go func(idx int, sid uint32) {
 			defer andWg.Done()
-			var groupUnions []*roaring.Bitmap
-			for _, g := range groups {
-				bms := g.bitmaps[sid]
-				if len(bms) == 0 {
-					groupUnions = nil
-					break
+			// Check all groups have data for this segment
+			for _, g := range groupList {
+				if len(g.perSeg[sid]) == 0 {
+					return
 				}
+			}
+			// Parallel OR within groups
+			groupUnions := make([]*roaring.Bitmap, len(groupList))
+			var orWg sync.WaitGroup
+			for gIdx := range groupList {
+				bms := groupList[gIdx].perSeg[sid]
 				if len(bms) == 1 {
-					groupUnions = append(groupUnions, bms[0])
+					groupUnions[gIdx] = bms[0]
 				} else {
-					groupUnions = append(groupUnions, roaring.FastOr(bms...))
+					orWg.Add(1)
+					go func(oi int, bmaps []*roaring.Bitmap) {
+						defer orWg.Done()
+						groupUnions[oi] = roaring.FastOr(bmaps...)
+					}(gIdx, bms)
 				}
 			}
-			if len(groupUnions) == 0 {
-				return
-			}
+			orWg.Wait()
 			intersected := roaring.FastAnd(groupUnions...)
 			if !intersected.IsEmpty() {
 				andResults[idx] = segAndResult{segID: sid, bm: intersected}

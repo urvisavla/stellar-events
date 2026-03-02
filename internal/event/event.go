@@ -39,7 +39,7 @@ type IngestEvent struct {
 	Successful     bool      // True if event is from a successful contract call
 }
 
-// Binary event format V4 stores raw DiagnosticEvent XDR as-is with a small
+// Binary event format stores raw DiagnosticEvent XDR as-is with a small
 // metadata header containing fields NOT present in the XDR.
 //
 // Format (47-byte fixed header + raw XDR):
@@ -52,24 +52,25 @@ type IngestEvent struct {
 //	[raw_xdr_bytes...]    = DiagnosticEvent XDR (contains InSuccessfulContractCall + ContractEvent)
 //
 // Fields derived from key (NOT stored in value):
-//   - ledger: from key bytes 0-3
-//   - event_index: from key bytes 4-5
+//   - segmentID: from key bytes 0-3
+//   - denseID: from key bytes 4-7
+//   - ledger + event_index: resolved via SegmentLedgerMap
 //
 // Fields extracted from XDR at decode time (NOT in header):
 //   - contractID, eventType, topics, data, inSuccessfulContractCall
 const (
-	BinaryFormatVersionV4 = 0x04
-	BinaryHeaderSizeV4    = 47 // version(1) + tx_hash(32) + ledger_closed_at(8) + tx_index(4) + op_index(2)
+	BinaryFormatVersion = 0x04
+	BinaryHeaderSize    = 47 // version(1) + tx_hash(32) + ledger_closed_at(8) + tx_index(4) + op_index(2)
 )
 
-// EncodeBinaryEventV4 encodes an IngestEvent to binary format V4.
+// EncodeBinaryEvent encodes an IngestEvent to binary format.
 // Stores a 47-byte metadata header followed by the raw DiagnosticEvent XDR bytes.
-func EncodeBinaryEventV4(ev *IngestEvent) []byte {
-	totalSize := BinaryHeaderSizeV4 + len(ev.RawXDR)
+func EncodeBinaryEvent(ev *IngestEvent) []byte {
+	totalSize := BinaryHeaderSize + len(ev.RawXDR)
 	buf := make([]byte, totalSize)
 
 	// Version
-	buf[0] = BinaryFormatVersionV4
+	buf[0] = BinaryFormatVersion
 
 	// Transaction hash (32 bytes)
 	if len(ev.TxHash) >= 32 {
@@ -91,16 +92,16 @@ func EncodeBinaryEventV4(ev *IngestEvent) []byte {
 	return buf
 }
 
-// DecodeBinaryToQueryEventV4 converts V4 binary format to query.Event.
+// DecodeBinaryToQueryEvent converts binary format to query.Event.
 // Parses the 47-byte header for metadata and unmarshals the DiagnosticEvent XDR
 // payload for contractID, eventType, topics, data, and inSuccessfulContractCall.
-func DecodeBinaryToQueryEventV4(data []byte, ledger uint32, eventSeq uint16) (*query.Event, error) {
-	if len(data) < BinaryHeaderSizeV4 {
-		return nil, fmt.Errorf("V4 data too short: %d < %d", len(data), BinaryHeaderSizeV4)
+func DecodeBinaryToQueryEvent(data []byte, ledger uint32, eventSeq uint16) (*query.Event, error) {
+	if len(data) < BinaryHeaderSize {
+		return nil, fmt.Errorf("data too short: %d < %d", len(data), BinaryHeaderSize)
 	}
 
-	if data[0] != BinaryFormatVersionV4 {
-		return nil, fmt.Errorf("expected V4 format (0x%02x), got 0x%02x", BinaryFormatVersionV4, data[0])
+	if data[0] != BinaryFormatVersion {
+		return nil, fmt.Errorf("expected format version 0x%02x, got 0x%02x", BinaryFormatVersion, data[0])
 	}
 
 	txHash := data[1:33]
@@ -118,7 +119,7 @@ func DecodeBinaryToQueryEventV4(data []byte, ledger uint32, eventSeq uint16) (*q
 	}
 
 	// Unmarshal DiagnosticEvent XDR payload
-	rawXDR := data[BinaryHeaderSizeV4:]
+	rawXDR := data[BinaryHeaderSize:]
 	var diagEvent xdr.DiagnosticEvent
 	if err := diagEvent.UnmarshalBinary(rawXDR); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal DiagnosticEvent XDR: %w", err)
