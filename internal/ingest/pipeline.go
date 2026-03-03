@@ -18,17 +18,7 @@ type PipelineConfig struct {
 	QueueSize         int    // Channel buffer size
 	DataDir           string // Ledger data directory
 	NetworkPassphrase string // Network passphrase for XDR parsing
-	MaintainUniqueIdx bool   // Maintain unique indexes during ingestion
-
-	// ExcludeTopic0 is a set of topic0 values to skip during ingestion.
-	// Keys are the raw topic0 bytes as strings.
-	ExcludeTopic0 map[string]struct{}
-
-	// ExcludeDiagnostic skips diagnostic events during ingestion.
-	ExcludeDiagnostic bool
-
-	// SegmentFiles enables writing flat file indexes and event data at segment boundaries.
-	SegmentFiles bool
+	MaintainUniqueIdx bool // Maintain unique indexes during ingestion
 }
 
 // PipelineStats tracks pipeline performance
@@ -186,7 +176,7 @@ func (p *Pipeline) processLedger(ledgerReader *LedgerReader, seq uint32) *Ledger
 
 	// Parse XDR and extract events (use fast mode - events are written immediately)
 	unmarshalStart := time.Now()
-	events, err := ExtractEventsFastFiltered(xdrBytes, p.config.NetworkPassphrase, result.Stats, p.config.ExcludeDiagnostic)
+	events, err := ExtractEventsFast(xdrBytes, p.config.NetworkPassphrase, result.Stats)
 	result.UnmarshalTime = time.Since(unmarshalStart)
 
 	if err != nil {
@@ -269,19 +259,12 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 			if (batchFull || atEnd) && len(eventBatch) > 0 {
 				writeStart := time.Now()
 				_, err := p.store.StoreEvents(eventBatch, &store.StoreOptions{
-					UniqueIndexes:     p.config.MaintainUniqueIdx,
-					ExcludeTopic0:     p.config.ExcludeTopic0,
-					ExcludeDiagnostic: p.config.ExcludeDiagnostic,
+					UniqueIndexes: p.config.MaintainUniqueIdx,
 				})
 				atomic.AddInt64(&p.stats.WriteTimeNs, time.Since(writeStart).Nanoseconds())
 
 				if err != nil {
 					return fmt.Errorf("failed to store events for ledgers %d-%d: %w", batchStartSeq, nextSeq-1, err)
-				}
-
-				// Update last processed ledger
-				if err := p.store.SetLastProcessedLedger(nextSeq - 1); err != nil {
-					return fmt.Errorf("failed to update last processed ledger: %w", err)
 				}
 
 				// Reuse slice capacity to avoid allocation overhead
@@ -291,62 +274,10 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 
 			}
 
-			// Check for segment boundary crossing — write flat files for completed segment
-			if p.config.SegmentFiles {
-				prevLedger := nextSeq - 1 // the ledger we just processed
-				prevSegment := store.SegmentID(prevLedger)
-				_, segmentEnd := store.SegmentRange(prevSegment)
-
-				// Segment is complete when the last processed ledger equals the segment's last ledger
-				if prevLedger >= segmentEnd {
-					// Force-write any pending event batch so StoreEvents populates
-					// the in-memory bitmaps for all ledgers up to the boundary.
-					if len(eventBatch) > 0 {
-						writeStart := time.Now()
-						_, err := p.store.StoreEvents(eventBatch, &store.StoreOptions{
-							UniqueIndexes:     p.config.MaintainUniqueIdx,
-							ExcludeTopic0:     p.config.ExcludeTopic0,
-							ExcludeDiagnostic: p.config.ExcludeDiagnostic,
-						})
-						atomic.AddInt64(&p.stats.WriteTimeNs, time.Since(writeStart).Nanoseconds())
-						if err != nil {
-							return fmt.Errorf("failed to store events at segment boundary %d: %w", prevSegment, err)
-						}
-						if err := p.store.SetLastProcessedLedger(nextSeq - 1); err != nil {
-							return fmt.Errorf("failed to update last processed ledger: %w", err)
-						}
-						eventBatch = eventBatch[:0]
-						batchRawBytes = 0
-						batchStartSeq = nextSeq
-					}
-
-					// Flush in-memory bitmaps to RocksDB so WriteSegmentDir can scan them
-					if err := p.store.FlushBitmapIndexes(); err != nil {
-						return fmt.Errorf("failed to flush bitmap indexes before segment file write: %w", err)
-					}
-
-					if err := p.store.WriteSegmentDir(prevSegment); err != nil {
-						return fmt.Errorf("failed to write segment dir %d: %w", prevSegment, err)
-					}
-				}
-			}
-
 			// Progress callback every 1000 ledgers
 			if p.onProgress != nil && ledgersProcessed%1000 == 0 {
 				p.onProgress(nextSeq-1, ledgersProcessed, totalEvents, aggStats)
 			}
-		}
-	}
-
-	// Flush bitmap indexes
-	if err := p.store.FlushBitmapIndexes(); err != nil {
-		return fmt.Errorf("failed to flush bitmap indexes: %w", err)
-	}
-
-	// Finalize any active segment data chunk
-	if p.config.SegmentFiles {
-		if err := p.store.FinalizeSegmentData(); err != nil {
-			return fmt.Errorf("failed to finalize segment data: %w", err)
 		}
 	}
 
@@ -356,13 +287,6 @@ func (p *Pipeline) collector(startLedger, endLedger uint32, _ int) error {
 	}
 
 	return nil
-}
-
-// Stop stops the pipeline
-func (p *Pipeline) Stop() {
-	p.stopOnce.Do(func() {
-		close(p.stopCh)
-	})
 }
 
 // GetStats returns the current pipeline stats

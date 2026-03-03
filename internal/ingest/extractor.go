@@ -11,15 +11,16 @@ import (
 	"github.com/urvisavla/stellar-events/internal/event"
 )
 
-// ExtractEventsFastFiltered extracts events without defensive memory copies, with optional diagnostic filtering.
-func ExtractEventsFastFiltered(xdrBytes []byte, networkPassphrase string, stats *LedgerStats, excludeDiagnostic bool) ([]*event.IngestEvent, error) {
-	return ExtractEventsWithOptions(xdrBytes, networkPassphrase, stats, true, excludeDiagnostic)
+// ExtractEventsFast extracts events without defensive memory copies.
+// Diagnostic events (type=2) are always excluded.
+func ExtractEventsFast(xdrBytes []byte, networkPassphrase string, stats *LedgerStats) ([]*event.IngestEvent, error) {
+	return ExtractEventsWithOptions(xdrBytes, networkPassphrase, stats, true)
 }
 
 // ExtractEventsWithOptions extracts events with configurable memory behavior.
 // When fastMode is true, skips defensive copies for better performance during bulk ingestion.
-// When excludeDiagnostic is true, skips diagnostic events (type=2).
-func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *LedgerStats, fastMode bool, excludeDiagnostic bool) ([]*event.IngestEvent, error) {
+// Diagnostic events (type=2) are always excluded.
+func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *LedgerStats, fastMode bool) ([]*event.IngestEvent, error) {
 	var lcm xdr.LedgerCloseMeta
 	if err := lcm.UnmarshalBinary(xdrBytes); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal LedgerCloseMeta: %w", err)
@@ -78,8 +79,8 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 
 		// Process transaction-level events
 		for eventIndex, ev := range txEvents.TransactionEvents {
-			// Skip diagnostic events if configured
-			if excludeDiagnostic && ev.Event.Type == xdr.ContractEventTypeDiagnostic {
+			// Always skip diagnostic events
+			if ev.Event.Type == xdr.ContractEventTypeDiagnostic {
 				continue
 			}
 
@@ -138,8 +139,8 @@ func ExtractEventsWithOptions(xdrBytes []byte, networkPassphrase string, stats *
 		// Process operation-level events
 		for opIndex, opEvents := range txEvents.OperationEvents {
 			for eventIndex, ev := range opEvents {
-				// Skip diagnostic events if configured
-				if excludeDiagnostic && ev.Type == xdr.ContractEventTypeDiagnostic {
+				// Always skip diagnostic events
+				if ev.Type == xdr.ContractEventTypeDiagnostic {
 					continue
 				}
 

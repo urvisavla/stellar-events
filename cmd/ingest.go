@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"flag"
 	"fmt"
 	"os"
@@ -106,31 +105,13 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		fmt.Fprintf(os.Stderr, "Progress file: %s\n", cfg.Ingestion.ProgressFile)
 	}
 
-	// Build exclude topic0 filter from config
-	var excludeTopic0 map[string]struct{}
-	if len(cfg.Ingestion.ExcludeTopic0) > 0 {
-		excludeTopic0 = make(map[string]struct{})
-		for _, b64 := range cfg.Ingestion.ExcludeTopic0 {
-			decoded, err := base64.StdEncoding.DecodeString(b64)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: invalid exclude_topic0 value %q: %v\n", b64, err)
-				continue
-			}
-			excludeTopic0[string(decoded)] = struct{}{}
-		}
-		fmt.Fprintf(os.Stderr, "Excluding %d topic0 values from ingestion\n", len(excludeTopic0))
-	}
-
 	pipelineConfig := ingest.PipelineConfig{
-		Workers:            workers,
-		BatchSize:          batchSize,
-		QueueSize:          queueSize,
-		DataDir:            cfg.Source.LedgerDir,
-		NetworkPassphrase:  networkPassphrase,
+		Workers:           workers,
+		BatchSize:         batchSize,
+		QueueSize:         queueSize,
+		DataDir:           cfg.Source.LedgerDir,
+		NetworkPassphrase: networkPassphrase,
 		MaintainUniqueIdx: cfg.Ingestion.UniqueIndexes,
-		ExcludeTopic0:     excludeTopic0,
-		ExcludeDiagnostic:  cfg.Ingestion.ExcludeDiagnostic,
-		SegmentFiles: cfg.Storage.SegmentFiles,
 	}
 
 	pipeline := ingest.NewPipeline(pipelineConfig, eventStore)
@@ -173,6 +154,11 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		os.Exit(1)
 	}
 
+	// Finalize the last segment (flush bitmap indexes + write flat file data)
+	if err := eventStore.Finalize(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to finalize last segment: %v\n", err)
+	}
+
 	// Write completion to progress file
 	if progressWriter != nil {
 		pipeStats := pipeline.GetStats()
@@ -194,8 +180,10 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 
 	// Flush memtables to SST files before getting accurate storage stats
 	fmt.Fprintf(os.Stderr, "\nFlushing memtables to disk...\n")
-	if err := eventStore.Flush(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to flush memtables: %v\n", err)
+	if db := eventStore.RocksDB(); db != nil {
+		if err := db.Flush(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to flush memtables: %v\n", err)
+		}
 	}
 
 	// =========================================================================
@@ -206,9 +194,12 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	rawDataMB := float64(rawBytesTotal) / (1024 * 1024)
 
 	// Get pre-compaction storage snapshot
-	preSnapshot, err := eventStore.GetStorageSnapshot()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to get storage stats: %v\n", err)
+	var preSnapshot *store.StorageSnapshot
+	if db := eventStore.RocksDB(); db != nil {
+		preSnapshot, err = db.GetStorageSnapshot()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to get storage stats: %v\n", err)
+		}
 	}
 
 	summary.WriteString("\n")
@@ -264,9 +255,9 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	var postSummary strings.Builder
 
 	// Run compaction if enabled
-	if cfg.Ingestion.FinalCompaction {
+	if cfg.Ingestion.FinalCompaction && eventStore.RocksDB() != nil {
 		fmt.Fprintf(os.Stderr, "\nRunning final compaction...\n")
-		compactionSummary, err := eventStore.CompactAllWithStats()
+		compactionSummary, err := eventStore.RocksDB().CompactAllWithStats()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: compaction failed: %v\n", err)
 		} else {
@@ -276,11 +267,11 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	}
 
 	// Compute event stats if enabled
-	if cfg.Ingestion.ComputeStats {
+	if cfg.Ingestion.ComputeStats && eventStore.RocksDB() != nil {
 		fmt.Fprintf(os.Stderr, "\nComputing event statistics using %d workers...\n", workers)
 
 		statsStart := time.Now()
-		eventStats, err := eventStore.ComputeEventStats(workers)
+		eventStats, err := eventStore.RocksDB().ComputeEventStats(workers)
 		statsTime := time.Since(statsStart)
 		fmt.Fprintf(os.Stderr, "Stats computed in %s\n", formatElapsed(statsTime))
 

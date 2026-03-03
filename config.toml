@@ -20,18 +20,18 @@ network = "mainnet"
 
 # --- Backend Selection ---
 # Enable RocksDB backend
-rocksdb = true
+rocksdb = false
 
 # Enable flat file segment backend
-segment_files = false
+segment_files = true
 
 # --- RocksDB Options (ignored when rocksdb = false) ---
 # Path to RocksDB database directory
 db_path = "./rocksdb/events"
 
 # Write performance
-write_buffer_size_mb = 256
-max_write_buffer_number = 4
+write_buffer_size_mb = 2048
+max_write_buffer_number = 8
 min_write_buffer_number_to_merge = 2
 
 # Read performance
@@ -51,19 +51,19 @@ disable_wal = true
 
 # Compaction
 disable_auto_compaction = true
-target_file_size_mb = 256
-max_bytes_for_level_base_mb = 1024
+target_file_size_mb = 1024
+max_bytes_for_level_base_mb = 20480
 
 
 # --- Flat File Segment Options (ignored when segment_files = false) ---
 # Base directory for segment flat files (required if segment_files = true)
-# segment_path = "./data/segments"
+segment_path = "./lfs/events"
 
 # Zstd compress event data blocks
-# compress_data = false
+compress_data = true
 
 # Events per compression block (default: 128)
-# block_size = 128
+block_size = 128
 
 # =============================================================================
 # Ingestion
@@ -90,7 +90,7 @@ queue_size = 0    # 0 = workers * 2
 # =============================================================================
 [query]
 # Max ledgers to scan if end not specified
-max_ledger_range = 100000
+max_ledger_range = 10000
 
 # Default max events to return
 default_limit = 100

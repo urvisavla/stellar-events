@@ -18,31 +18,6 @@ type Filter struct {
 	Topic3     []byte // Filter by topic at position 3
 }
 
-// IsEmpty returns true if no filters are specified.
-func (f *Filter) IsEmpty() bool {
-	return len(f.ContractID) == 0 &&
-		len(f.Topic0) == 0 &&
-		len(f.Topic1) == 0 &&
-		len(f.Topic2) == 0 &&
-		len(f.Topic3) == 0
-}
-
-// HasContractFilter returns true if contract ID filter is set.
-func (f *Filter) HasContractFilter() bool {
-	return len(f.ContractID) > 0
-}
-
-// HasTopicFilter returns true if any topic filter is set.
-func (f *Filter) HasTopicFilter() bool {
-	return len(f.Topic0) > 0 || len(f.Topic1) > 0 ||
-		len(f.Topic2) > 0 || len(f.Topic3) > 0
-}
-
-// TopicFilters returns topics as a slice for iteration.
-func (f *Filter) TopicFilters() [][]byte {
-	return [][]byte{f.Topic0, f.Topic1, f.Topic2, f.Topic3}
-}
-
 // TopicGroups returns topics as positional groups for index queries.
 // Each position has 0 or 1 entries (single-value filter per position).
 func (f *Filter) TopicGroups() [4][][]byte {
@@ -71,13 +46,6 @@ type Options struct {
 	Limit      int  // Maximum events to return (0 = no limit)
 	IncludeXDR bool // Include raw XDR in results
 	CountOnly  bool // Only count matches, don't fetch events
-}
-
-// DefaultOptions returns default query options.
-func DefaultOptions() *Options {
-	return &Options{
-		Limit: 100,
-	}
 }
 
 // =============================================================================

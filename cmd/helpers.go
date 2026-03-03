@@ -19,34 +19,19 @@ import (
 
 // openEventStore opens the event store with config options
 func openEventStore(cfg *config.Config) (*store.EventStore, error) {
-	es, err := store.NewEventStoreWithOptions(
-		cfg.Storage.DBPath,
-		configToRocksDBOptions(&cfg.Storage),
-		configToIndexOptions(&cfg.Indexes),
-	)
-	if err != nil {
-		return nil, err
+	opts := store.EventStoreOptions{
+		SegmentPath:       cfg.Storage.SegmentPath,
+		WriteSegmentFiles: cfg.Storage.SegmentFiles,
+		CompressData:      cfg.Storage.CompressData,
+		BlockSize:         cfg.Storage.BlockSize,
 	}
 
-	// Set segment file path if configured
-	if cfg.Storage.SegmentPath != "" {
-		es.SetSegmentPath(cfg.Storage.SegmentPath)
+	if cfg.Storage.RocksDB {
+		opts.DBPath = cfg.Storage.DBPath
+		opts.RocksOpts = configToRocksDBOptions(&cfg.Storage)
 	}
 
-	// Configure write targets based on storage destination flags
-	segPath := ""
-	if cfg.Storage.SegmentFiles {
-		segPath = cfg.Storage.SegmentPath
-	}
-	es.SetLedgerMapWriteConfig(segPath, cfg.Storage.RocksDB)
-	es.SetWriteRocksDB(cfg.Storage.RocksDB)
-
-	// Enable segment data writer if segment files are enabled
-	if cfg.Storage.SegmentFiles {
-		es.EnableSegmentData(cfg.Storage.CompressData, cfg.Storage.BlockSize)
-	}
-
-	return es, nil
+	return store.NewEventStore(opts)
 }
 
 // configToRocksDBOptions converts config.StorageConfig to store.RocksDBOptions
@@ -65,14 +50,6 @@ func configToRocksDBOptions(cfg *config.StorageConfig) *store.RocksDBOptions {
 		DisableAutoCompaction:       cfg.DisableAutoCompaction,
 		TargetFileSizeMB:            cfg.TargetFileSizeMB,
 		MaxBytesForLevelBaseMB:      cfg.MaxBytesForLevelBaseMB,
-	}
-}
-
-// configToIndexOptions converts config.IndexConfig to store.IndexConfig
-func configToIndexOptions(cfg *config.IndexConfig) *store.IndexConfig {
-	return &store.IndexConfig{
-		ContractID: cfg.ContractID,
-		Topics:     cfg.Topics,
 	}
 }
 

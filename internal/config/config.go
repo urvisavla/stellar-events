@@ -23,7 +23,6 @@ type Config struct {
 	Storage   StorageConfig   `toml:"storage"`
 	Ingestion IngestionConfig `toml:"ingestion"`
 	Query     QueryConfig     `toml:"query"`
-	Indexes   IndexConfig     `toml:"indexes"`
 }
 
 // =============================================================================
@@ -37,11 +36,17 @@ type SourceConfig struct {
 }
 
 // =============================================================================
-// Storage Config (flattened - RocksDB only)
+// Storage Config
 // =============================================================================
 
-// StorageConfig contains storage settings
+// StorageConfig contains storage settings.
+// At least one backend (RocksDB or flat files) must be enabled.
 type StorageConfig struct {
+	// --- Backend selection ---
+	RocksDB      bool `toml:"rocksdb"`       // Enable RocksDB backend (default: true)
+	SegmentFiles bool `toml:"segment_files"` // Enable flat file segment backend (default: false)
+
+	// --- RocksDB options (ignored when rocksdb = false) ---
 	DBPath string `toml:"db_path"` // Path to RocksDB database directory
 
 	// Write performance
@@ -69,14 +74,10 @@ type StorageConfig struct {
 	TargetFileSizeMB       int  `toml:"target_file_size_mb"`         // Target SST file size (default: 256)
 	MaxBytesForLevelBaseMB int  `toml:"max_bytes_for_level_base_mb"` // Max bytes for L1 (default: 1024)
 
-	// Storage destinations
-	RocksDB      bool `toml:"rocksdb"`       // Write events, indexes, ledger maps to RocksDB (default: true)
-	SegmentFiles bool `toml:"segment_files"` // Write events, indexes, ledger maps to segment flat files (default: false)
-
-	// Flat file segment options
+	// --- Flat file segment options (ignored when segment_files = false) ---
 	SegmentPath  string `toml:"segment_path"`  // Base directory for segment flat files (required if segment_files = true)
-	CompressData bool   `toml:"compress_data"` // Zstd compress per-event blobs in event file store
-	BlockSize    int    `toml:"block_size"`    // Events per compression block (default: 1 = per-event)
+	CompressData bool   `toml:"compress_data"` // Zstd compress event data blocks (default: false)
+	BlockSize    int    `toml:"block_size"`    // Events per compression block (default: 128)
 }
 
 // =============================================================================
@@ -100,11 +101,6 @@ type IngestionConfig struct {
 	BatchSize int `toml:"batch_size"` // Ledgers per batch (default: 100)
 	QueueSize int `toml:"queue_size"` // Pipeline buffer (0 = workers * 2)
 
-	// Event filtering - skip events with these topic0 values (base64-encoded)
-	ExcludeTopic0 []string `toml:"exclude_topic0"`
-
-	// Event type filtering - skip diagnostic events (default: false)
-	ExcludeDiagnostic bool `toml:"exclude_diagnostic"`
 }
 
 // =============================================================================
@@ -115,16 +111,6 @@ type IngestionConfig struct {
 type QueryConfig struct {
 	MaxLedgerRange int `toml:"max_ledger_range"` // Max ledgers if end not specified (default: 100000)
 	DefaultLimit   int `toml:"default_limit"`    // Default max events to return (default: 100)
-}
-
-// =============================================================================
-// Index Config
-// =============================================================================
-
-// IndexConfig contains index settings
-type IndexConfig struct {
-	ContractID bool `toml:"contract_id"` // Index by contract ID
-	Topics     bool `toml:"topics"`      // Index by topic0-3
 }
 
 // =============================================================================
@@ -139,29 +125,28 @@ func DefaultConfig() *Config {
 			Network:   "mainnet",
 		},
 		Storage: StorageConfig{
-			DBPath: "./events.db",
-			// Write performance
+			// Backend selection
+			RocksDB:      true,
+			SegmentFiles: false,
+			// RocksDB options
+			DBPath:                      "./events.db",
 			WriteBufferSizeMB:           64,
 			MaxWriteBufferNumber:        2,
 			MinWriteBufferNumberToMerge: 1,
-			// Read performance
-			BlockCacheSizeMB:          64,
-			BloomFilterBitsPerKey:     10,
-			CacheIndexAndFilterBlocks: true,
-			// Background jobs
-			MaxBackgroundJobs: 4,
-			// Compression
-			Compression:           "zstd",
-			BottommostCompression: "zstd",
-			// WAL
-			DisableWAL: false,
-			// Compaction
-			DisableAutoCompaction:  false,
-			TargetFileSizeMB:       256,
-			MaxBytesForLevelBaseMB: 1024,
-			// Storage destinations
-			RocksDB:      true,
-			SegmentFiles: false,
+			BlockCacheSizeMB:            64,
+			BloomFilterBitsPerKey:       10,
+			CacheIndexAndFilterBlocks:   true,
+			MaxBackgroundJobs:           4,
+			Compression:                 "zstd",
+			BottommostCompression:       "zstd",
+			DisableWAL:                  false,
+			DisableAutoCompaction:       false,
+			TargetFileSizeMB:            256,
+			MaxBytesForLevelBaseMB:      1024,
+			// Flat file segment options
+			SegmentPath:  "",
+			CompressData: false,
+			BlockSize:    128,
 		},
 		Ingestion: IngestionConfig{
 			ProgressFile:       "", // Empty = disabled
@@ -175,10 +160,6 @@ func DefaultConfig() *Config {
 		Query: QueryConfig{
 			MaxLedgerRange: 100000,
 			DefaultLimit:   100,
-		},
-		Indexes: IndexConfig{
-			ContractID: true,
-			Topics:     true,
 		},
 	}
 }
@@ -213,8 +194,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("source.ledger_dir is required")
 	}
 
-	if c.Storage.DBPath == "" {
-		return fmt.Errorf("storage.db_path is required")
+	if c.Storage.RocksDB && c.Storage.DBPath == "" {
+		return fmt.Errorf("storage.db_path is required when storage.rocksdb is true")
 	}
 
 	if c.Source.Network == "" {

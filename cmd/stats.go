@@ -54,7 +54,7 @@ func cmdStats(cfg *config.Config, top, bottom int) {
 
 	fmt.Fprintf(os.Stderr, "Calculating statistics...\n")
 
-	dbStats, err := eventStore.GetStats()
+	dbStats, err := eventStore.RocksDB().GetStats()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get stats: %v\n", err)
 		os.Exit(1)
@@ -71,7 +71,7 @@ func cmdStats(cfg *config.Config, top, bottom int) {
 
 	// Ledger transaction stats
 	fmt.Fprintf(os.Stderr, "Scanning ledger transaction counts...\n")
-	ledgerTxStats, err := eventStore.GetLedgerTxStats()
+	ledgerTxStats, err := eventStore.RocksDB().GetLedgerTxStats()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to get ledger tx stats: %v\n", err)
 	} else if ledgerTxStats != nil {
@@ -79,7 +79,7 @@ func cmdStats(cfg *config.Config, top, bottom int) {
 	}
 
 	// Per-column-family storage stats
-	snapshot, err := eventStore.GetStorageSnapshot()
+	snapshot, err := eventStore.RocksDB().GetStorageSnapshot()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get storage stats: %v\n", err)
 	} else {
@@ -110,7 +110,7 @@ func cmdStats(cfg *config.Config, top, bottom int) {
 
 	// Unique index counts
 	fmt.Fprintf(os.Stderr, "Counting unique index entries...\n")
-	uniqueCounts, err := eventStore.CountUniqueIndexes()
+	uniqueCounts, err := eventStore.RocksDB().CountUniqueIndexes()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to count unique indexes: %v\n", err)
 	} else if uniqueCounts != nil {
@@ -124,7 +124,7 @@ func cmdStats(cfg *config.Config, top, bottom int) {
 
 	// Distribution stats
 	fmt.Fprintf(os.Stderr, "Computing distribution statistics (top %d, bottom %d)...\n", top, bottom)
-	dist, err := eventStore.GetIndexDistribution(top, bottom)
+	dist, err := eventStore.RocksDB().GetIndexDistribution(top, bottom)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to get distribution: %v\n", err)
 	} else {

@@ -72,7 +72,7 @@ type QuerySpec struct {
 type BenchmarkResult struct {
 	// Query identification
 	Query       QuerySpec
-	IndexType   string
+	Datastore   string
 	StartLedger uint32 // Ledger range used for this query
 	EndLedger   uint32
 
@@ -118,7 +118,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 	fs.SetOutput(os.Stderr)
 
 	dataFile := fs.String("data", "", "Benchmark data file (JSON)")
-	indexTypes := fs.String("index", "all", "Index types to benchmark: rocksdb,flat-idx,flat-all,all")
+	datastoreFlag := fs.String("datastore", "all", "Datastore to benchmark: rocksdb,flatfiles,all")
 	iterations := fs.Int("iterations", 5, "Number of iterations per query")
 	warmup := fs.Int("warmup", 1, "Warmup iterations (not counted)")
 	outputFormat := fs.String("format", "table", "Output format: table, csv, json")
@@ -134,13 +134,13 @@ func runBenchmark(cfg *config.Config, args []string) {
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: benchmark [options]\n\n")
-		fmt.Fprintf(os.Stderr, "Benchmarks query performance across different index types.\n\n")
+		fmt.Fprintf(os.Stderr, "Benchmarks query performance across different datastores.\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
 		fmt.Fprintf(os.Stderr, "  benchmark --generate > benchmark_data.json  # Generate sample data file\n")
 		fmt.Fprintf(os.Stderr, "  benchmark --data benchmark_data.json        # Run benchmarks\n")
-		fmt.Fprintf(os.Stderr, "  benchmark --data data.json --index rocksdb  # Only test bitmap32\n")
+		fmt.Fprintf(os.Stderr, "  benchmark --data data.json --datastore rocksdb  # Only test rocksdb\n")
 		fmt.Fprintf(os.Stderr, "  benchmark --data data.json --format csv     # CSV output\n")
 	}
 
@@ -183,37 +183,18 @@ func runBenchmark(cfg *config.Config, args []string) {
 			originalStartLedger, originalEndLedger, originalEndLedger-originalStartLedger, maxLedgerRange)
 	}
 
-	// Parse index types
-	// Map user-facing names to internal names
-	indexNameToInternal := map[string]string{
-		"rocksdb":  "bitmap32",
-		"flat-idx": "segment-index",
-		"flat-all": "segment-data",
-	}
-	internalToDisplay := map[string]string{
-		"bitmap32":       "rocksdb",
-		"segment-index":   "flat-idx",
-		"segment-data": "flat-all",
-	}
-
-	var indexes []string
-	if *indexTypes == "all" {
-		indexes = []string{"bitmap32", "segment-index", "segment-data"}
+	// Parse datastores
+	var datastores []string
+	if *datastoreFlag == "all" {
+		datastores = []string{"rocksdb", "flatfiles"}
 	} else {
-		for _, name := range strings.Split(*indexTypes, ",") {
-			internal, ok := indexNameToInternal[name]
-			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: invalid index type: %s (valid: rocksdb, flat-idx, flat-all)\n", name)
+		for _, name := range strings.Split(*datastoreFlag, ",") {
+			if name != "rocksdb" && name != "flatfiles" {
+				fmt.Fprintf(os.Stderr, "Error: invalid datastore: %s (valid: rocksdb, flatfiles)\n", name)
 				os.Exit(2)
 			}
-			indexes = append(indexes, internal)
+			datastores = append(datastores, name)
 		}
-	}
-
-	// Build display names for each index
-	displayIndexes := make([]string, len(indexes))
-	for i, idx := range indexes {
-		displayIndexes[i] = internalToDisplay[idx]
 	}
 
 	// Set random seed
@@ -240,7 +221,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		}
 		defer logWriter.Close()
 		// Write CSV header
-		fmt.Fprintln(logWriter, "timestamp,query_name,index_type,events_returned,index_matches,segments_touched,index_bytes,event_bytes,groups_decompressed,p99_idx_read_ms,p99_idx_decode_ms,p99_idx_intersect_ms,p99_idx_ms,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,p99_total_ms,error")
+		fmt.Fprintln(logWriter, "timestamp,query_name,datastore,events_returned,index_matches,segments_touched,index_bytes,event_bytes,groups_decompressed,p99_idx_read_ms,p99_idx_decode_ms,p99_idx_intersect_ms,p99_idx_ms,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,p99_total_ms,error")
 		logWriter.Sync()
 	}
 
@@ -266,7 +247,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		defer outputWriter.Close()
 		// Write CSV header for results
 		if outputFileFormat == "csv" {
-			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,index_type,start_ledger,end_ledger,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
+			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,datastore,start_ledger,end_ledger,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
 			outputWriter.Sync()
 		}
 		fmt.Fprintf(os.Stderr, "Output file: %s (format: %s)\n", *outputFile, outputFileFormat)
@@ -289,7 +270,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 	}
 	fmt.Fprintf(os.Stderr, "Generated %d query combinations (%d multi-value OR)\n", len(queries), multiValueCount)
 	fmt.Fprintf(os.Stderr, "Benchmarking with %d iterations per query (+%d warmup)\n", *iterations, *warmup)
-	fmt.Fprintf(os.Stderr, "Index types: %v\n", indexes)
+	fmt.Fprintf(os.Stderr, "Datastores: %v\n", datastores)
 	fmt.Fprintf(os.Stderr, "Ledger range: %d - %d (max per query: %d)\n\n", originalStartLedger, originalEndLedger, maxLedgerRange)
 
 	// Acquire sudo credentials once upfront for cold cache mode
@@ -307,7 +288,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 
 	// Run benchmarks
 	var results []BenchmarkResult
-	totalQueries := len(queries) * len(indexes)
+	totalQueries := len(queries) * len(datastores)
 	completed := 0
 
 	// Pre-compute fixed range if requested
@@ -339,17 +320,16 @@ func runBenchmark(cfg *config.Config, args []string) {
 			}
 		}
 
-		for _, idxType := range indexes {
+		for _, ds := range datastores {
 			completed++
-			displayName := internalToDisplay[idxType]
-			fmt.Fprintf(os.Stderr, "\r[%d/%d] Running: %s (%s) [%d-%d]...    ", completed, totalQueries, q.Name, displayName, queryStart, queryEnd)
+			fmt.Fprintf(os.Stderr, "\r[%d/%d] Running: %s (%s) [%d-%d]...    ", completed, totalQueries, q.Name, ds, queryStart, queryEnd)
 
 			// Create a temporary data struct with the random range
 			queryData := &BenchmarkData{
 				StartLedger: queryStart,
 				EndLedger:   queryEnd,
 			}
-			result := runQueryBenchmark(eventStore, queryData, q, idxType, displayName, *iterations, *warmup, *limit, *timeout, *coldCache)
+			result := runQueryBenchmark(eventStore, queryData, q, ds, *iterations, *warmup, *limit, *timeout, *coldCache)
 			results = append(results, result)
 
 			// Log query result
@@ -358,7 +338,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 				fmt.Fprintf(logWriter, "%s,%s,%s,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s\n",
 					time.Now().Format(time.RFC3339),
 					result.Query.Name,
-					result.IndexType,
+					result.Datastore,
 					result.EventsReturned,
 					result.IndexMatches,
 					result.SegmentsTouched,
@@ -395,7 +375,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		fmt.Fprintf(os.Stderr, "Results written to: %s\n", *outputFile)
 		// Still print summary statistics for table format
 		if *outputFormat == "table" {
-			printSummaryStats(results, indexes)
+			printSummaryStats(results, datastores)
 		}
 	} else {
 		switch *outputFormat {
@@ -404,7 +384,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		case "json":
 			outputJSON(results)
 		default:
-			outputTable(results, displayIndexes)
+			outputTable(results, datastores)
 		}
 	}
 }
@@ -846,10 +826,10 @@ func purgePageCache() error {
 	return fmt.Errorf("unsupported OS for cache purge: %s", runtime.GOOS)
 }
 
-func runQueryBenchmark(eventStore *store.EventStore, data *BenchmarkData, spec QuerySpec, indexType, displayName string, iterations, warmup, limit int, timeout time.Duration, coldCache bool) BenchmarkResult {
+func runQueryBenchmark(eventStore *store.EventStore, data *BenchmarkData, spec QuerySpec, datastore string, iterations, warmup, limit int, timeout time.Duration, coldCache bool) BenchmarkResult {
 	result := BenchmarkResult{
 		Query:       spec,
-		IndexType:   displayName,
+		Datastore:   datastore,
 		StartLedger: data.StartLedger,
 		EndLedger:   data.EndLedger,
 		Iterations:  iterations,
@@ -907,7 +887,7 @@ func runQueryBenchmark(eventStore *store.EventStore, data *BenchmarkData, spec Q
 		}
 		resultChan := make(chan *QueryResult, 1)
 		go func() {
-			resultChan <- executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicGroups, indexType, limit)
+			resultChan <- executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicGroups, limit)
 		}()
 		select {
 		case <-resultChan:
@@ -929,7 +909,7 @@ func runQueryBenchmark(eventStore *store.EventStore, data *BenchmarkData, spec Q
 
 		resultChan := make(chan *QueryResult, 1)
 		go func() {
-			resultChan <- executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicGroups, indexType, limit)
+			resultChan <- executeQueryBenchmark(eventStore, data.StartLedger, data.EndLedger, contractBytes, topicGroups, limit)
 		}()
 
 		var qr *QueryResult
@@ -1046,106 +1026,16 @@ type QueryResult struct {
 	Error error
 }
 
-func executeQueryBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, indexType string, limit int) *QueryResult {
-	// Determine if this is a multi-value query (OR within any group)
-	isMultiValue := len(contractIDs) > 1
-	if !isMultiValue {
-		for _, tg := range topicGroups {
-			if len(tg) > 1 {
-				isMultiValue = true
-				break
-			}
-		}
-	}
-
-	// For single-value queries, use the original (optimized) functions
-	if !isMultiValue {
-		var singleContract []byte
-		if len(contractIDs) == 1 {
-			singleContract = contractIDs[0]
-		}
-
-		switch indexType {
-		case "bitmap32":
-			return executeBitmap32QueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
-		case "segment-index":
-			return executeSegmentIndexQueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
-		case "segment-data":
-			return executeSegmentDataQueryBenchmark(eventStore, startLedger, endLedger, singleContract, topicGroups, limit)
-		}
-		return nil
-	}
-
-	// Multi-value: use new multi-filter functions
-	switch indexType {
-	case "bitmap32":
-		return executeBitmap32MultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
-	case "segment-index":
-		return executeSegmentIndexMultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
-	case "segment-data":
-		return executeSegmentDataMultiFilterBenchmark(eventStore, startLedger, endLedger, contractIDs, topicGroups, limit)
-	}
-	return nil
-}
-
-func executeBitmap32QueryBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithBitmap32EventIndex(contractID, topicGroups, startLedger, endLedger, limit)
+func executeQueryBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
+	stats, events, err := eventStore.QueryEvents(contractIDs, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		return &QueryResult{Error: err}
 	}
 
 	return &QueryResult{
-		EventsReturned:     len(events),
-		EventsScanned:      stats.EventsScanned,
+		EventsReturned:      len(events),
+		EventsScanned:       stats.EventsScanned,
 		SegmentsTouched:     stats.SegmentsTouched,
-		IndexBytes:         stats.IndexBytesRead,
-		EventBytes:         stats.EventBytesRead,
-		IndexMatches:       stats.MatchingLocalIDs,
-		IndexTime:          stats.IndexLookupTime,
-		IndexReadTime:      stats.IndexReadTime,
-		IndexDecodeTime:    stats.IndexDecodeTime,
-		IndexIntersectTime: stats.IndexIntersectTime,
-		EventTime:          stats.EventFetchTime,
-		EventFetchTime:     stats.EventFetchTime,
-		EventDecodeTime:    stats.DecodeTime,
-		EventFilterTime:    stats.FilterTime,
-	}
-}
-
-func executeBitmap32MultiFilterBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithBitmap32MultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
-	if err != nil {
-		return &QueryResult{Error: err}
-	}
-
-	return &QueryResult{
-		EventsReturned:     len(events),
-		EventsScanned:      stats.EventsScanned,
-		SegmentsTouched:     stats.SegmentsTouched,
-		IndexBytes:         stats.IndexBytesRead,
-		EventBytes:         stats.EventBytesRead,
-		IndexMatches:       stats.MatchingLocalIDs,
-		IndexTime:          stats.IndexLookupTime,
-		IndexReadTime:      stats.IndexReadTime,
-		IndexDecodeTime:    stats.IndexDecodeTime,
-		IndexIntersectTime: stats.IndexIntersectTime,
-		EventTime:          stats.EventFetchTime,
-		EventFetchTime:     stats.EventFetchTime,
-		EventDecodeTime:    stats.DecodeTime,
-		EventFilterTime:    stats.FilterTime,
-	}
-}
-
-func executeSegmentIndexQueryBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithSegmentIndex(contractID, topicGroups, startLedger, endLedger, limit)
-	if err != nil {
-		return &QueryResult{Error: err}
-	}
-
-	return &QueryResult{
-		EventsReturned:      len(events),
-		EventsScanned:       stats.EventsScanned,
-		SegmentsTouched:      stats.SegmentsTouched,
 		IndexBytes:          stats.IndexBytesRead,
 		EventBytes:          stats.EventBytesRead,
 		IndexMatches:        stats.MatchingLocalIDs,
@@ -1153,91 +1043,6 @@ func executeSegmentIndexQueryBenchmark(eventStore *store.EventStore, startLedger
 		IndexReadTime:       stats.IndexReadTime,
 		IndexDecodeTime:     stats.IndexDecodeTime,
 		IndexIntersectTime:  stats.IndexIntersectTime,
-
-		EventTime:           stats.EventFetchTime,
-		EventFetchTime:      stats.EventFetchTime,
-		EventDecodeTime:     stats.DecodeTime,
-		EventFilterTime:     stats.FilterTime,
-		EventDecompressTime: stats.DecompressTime,
-		EventDiskReadTime:   stats.EventDiskReadTime,
-		GroupsDecompressed:  stats.GroupsDecompressed,
-	}
-}
-
-func executeSegmentIndexMultiFilterBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithSegmentIndexMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
-	if err != nil {
-		return &QueryResult{Error: err}
-	}
-
-	return &QueryResult{
-		EventsReturned:      len(events),
-		EventsScanned:       stats.EventsScanned,
-		SegmentsTouched:      stats.SegmentsTouched,
-		IndexBytes:          stats.IndexBytesRead,
-		EventBytes:          stats.EventBytesRead,
-		IndexMatches:        stats.MatchingLocalIDs,
-		IndexTime:           stats.IndexLookupTime,
-		IndexReadTime:       stats.IndexReadTime,
-		IndexDecodeTime:     stats.IndexDecodeTime,
-		IndexIntersectTime:  stats.IndexIntersectTime,
-
-		EventTime:           stats.EventFetchTime,
-		EventFetchTime:      stats.EventFetchTime,
-		EventDecodeTime:     stats.DecodeTime,
-		EventFilterTime:     stats.FilterTime,
-		EventDecompressTime: stats.DecompressTime,
-		EventDiskReadTime:   stats.EventDiskReadTime,
-		GroupsDecompressed:  stats.GroupsDecompressed,
-	}
-}
-
-func executeSegmentDataQueryBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractID []byte, topicGroups [4][][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithSegmentData(contractID, topicGroups, startLedger, endLedger, limit)
-	if err != nil {
-		return &QueryResult{Error: err}
-	}
-
-	return &QueryResult{
-		EventsReturned:      len(events),
-		EventsScanned:       stats.EventsScanned,
-		SegmentsTouched:      stats.SegmentsTouched,
-		IndexBytes:          stats.IndexBytesRead,
-		EventBytes:          stats.EventBytesRead,
-		IndexMatches:        stats.MatchingLocalIDs,
-		IndexTime:           stats.IndexLookupTime,
-		IndexReadTime:       stats.IndexReadTime,
-		IndexDecodeTime:     stats.IndexDecodeTime,
-		IndexIntersectTime:  stats.IndexIntersectTime,
-
-		EventTime:           stats.EventFetchTime,
-		EventFetchTime:      stats.EventFetchTime,
-		EventDecodeTime:     stats.DecodeTime,
-		EventFilterTime:     stats.FilterTime,
-		EventDecompressTime: stats.DecompressTime,
-		EventDiskReadTime:   stats.EventDiskReadTime,
-		GroupsDecompressed:  stats.GroupsDecompressed,
-	}
-}
-
-func executeSegmentDataMultiFilterBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
-	stats, events, err := eventStore.QueryEventsWithSegmentDataMultiFilter(contractIDs, topicGroups, startLedger, endLedger, limit)
-	if err != nil {
-		return &QueryResult{Error: err}
-	}
-
-	return &QueryResult{
-		EventsReturned:      len(events),
-		EventsScanned:       stats.EventsScanned,
-		SegmentsTouched:      stats.SegmentsTouched,
-		IndexBytes:          stats.IndexBytesRead,
-		EventBytes:          stats.EventBytesRead,
-		IndexMatches:        stats.MatchingLocalIDs,
-		IndexTime:           stats.IndexLookupTime,
-		IndexReadTime:       stats.IndexReadTime,
-		IndexDecodeTime:     stats.IndexDecodeTime,
-		IndexIntersectTime:  stats.IndexIntersectTime,
-
 		EventTime:           stats.EventFetchTime,
 		EventFetchTime:      stats.EventFetchTime,
 		EventDecodeTime:     stats.DecodeTime,
@@ -1252,7 +1057,7 @@ func executeSegmentDataMultiFilterBenchmark(eventStore *store.EventStore, startL
 // Output Formatting
 // =============================================================================
 
-func outputTable(results []BenchmarkResult, indexes []string) {
+func outputTable(results []BenchmarkResult, datastores []string) {
 	// Group results by query
 	queryResults := make(map[string]map[string]BenchmarkResult)
 	var queryNames []string
@@ -1266,18 +1071,18 @@ func outputTable(results []BenchmarkResult, indexes []string) {
 			queryResults[key] = make(map[string]BenchmarkResult)
 			queryNames = append(queryNames, key)
 		}
-		queryResults[key][r.IndexType] = r
+		queryResults[key][r.Datastore] = r
 	}
 
 	// Print header
 	fmt.Printf("\n%-40s", "Query")
-	for _, idx := range indexes {
-		fmt.Printf(" | %8s p99", idx)
+	for _, ds := range datastores {
+		fmt.Printf(" | %8s p99", ds)
 	}
 	fmt.Printf(" | %6s/%6s | %4s | %8s | %8s | %8s\n", "EvtRet", "Scaned", "Segs", "IdxMatch", "IdxBytes", "EvtBytes")
 
 	fmt.Print(strings.Repeat("-", 40))
-	for range indexes {
+	for range datastores {
 		fmt.Print("-+-" + strings.Repeat("-", 12))
 	}
 	fmt.Println("-+-" + strings.Repeat("-", 13) + "-+-" + strings.Repeat("-", 4) + "-+-" + strings.Repeat("-", 8) + "-+-" + strings.Repeat("-", 8) + "-+-" + strings.Repeat("-", 8))
@@ -1289,8 +1094,8 @@ func outputTable(results []BenchmarkResult, indexes []string) {
 
 		var eventsReturned, eventsScanned, idxMatches, segmentsTouched int
 		var idxBytes, evtBytes int64
-		for _, idx := range indexes {
-			if r, ok := qr[idx]; ok {
+		for _, ds := range datastores {
+			if r, ok := qr[ds]; ok {
 				if r.Error != "" {
 					fmt.Printf(" | %12s", "ERROR")
 				} else {
@@ -1310,16 +1115,16 @@ func outputTable(results []BenchmarkResult, indexes []string) {
 	}
 
 	// Summary statistics
-	printSummaryStats(results, indexes)
+	printSummaryStats(results, datastores)
 }
 
-func printSummaryStats(results []BenchmarkResult, indexes []string) {
+func printSummaryStats(results []BenchmarkResult, datastores []string) {
 	fmt.Println()
 	fmt.Println("=== Summary Statistics ===")
-	for _, idx := range indexes {
+	for _, ds := range datastores {
 		var p50s, p99s []time.Duration
 		for _, r := range results {
-			if r.IndexType == idx && r.Error == "" {
+			if r.Datastore == ds && r.Error == "" {
 				p50s = append(p50s, r.P50Time)
 				p99s = append(p99s, r.P99Time)
 			}
@@ -1329,14 +1134,14 @@ func printSummaryStats(results []BenchmarkResult, indexes []string) {
 			sort.Slice(p99s, func(i, j int) bool { return p99s[i] < p99s[j] })
 			medP50 := p50s[len(p50s)/2]
 			medP99 := p99s[len(p99s)/2]
-			fmt.Printf("  %s: median_p50=%s, median_p99=%s (n=%d)\n", idx, formatBenchmarkDuration(medP50), formatBenchmarkDuration(medP99), len(p50s))
+			fmt.Printf("  %s: median_p50=%s, median_p99=%s (n=%d)\n", ds, formatBenchmarkDuration(medP50), formatBenchmarkDuration(medP99), len(p50s))
 		}
 	}
 }
 
 func outputCSV(results []BenchmarkResult) {
 	// Header: query | timing | index | event | test
-	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,index_type,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
+	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,datastore,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
 
 	for _, r := range results {
 		contractID := strings.Join(r.Query.ContractIDs, "|")
@@ -1357,7 +1162,7 @@ func outputCSV(results []BenchmarkResult) {
 			r.Query.Name,
 			contractID,
 			topics[0], topics[1], topics[2], topics[3],
-			r.IndexType,
+			r.Datastore,
 			float64(r.P50Time.Microseconds())/1000.0,
 			float64(r.P99Time.Microseconds())/1000.0,
 			float64(r.P99IndexTime.Microseconds())/1000.0,
@@ -1391,7 +1196,7 @@ func outputJSON(results []BenchmarkResult) {
 		QueryName   string     `json:"query_name"`
 		ContractIDs []string   `json:"contract_ids,omitempty"`
 		Topics      [][]string `json:"topics,omitempty"`
-		IndexType   string     `json:"index_type"`
+		Datastore   string     `json:"datastore"`
 
 		// Timing
 		P50Ms float64 `json:"p50_total_ms"`
@@ -1431,7 +1236,7 @@ func outputJSON(results []BenchmarkResult) {
 			QueryName:        r.Query.Name,
 			ContractIDs:      r.Query.ContractIDs,
 			Topics:           r.Query.Topics,
-			IndexType:        r.IndexType,
+			Datastore:        r.Datastore,
 			P50Ms:            float64(r.P50Time.Microseconds()) / 1000.0,
 			P99Ms:            float64(r.P99Time.Microseconds()) / 1000.0,
 			P99IndexMs:       float64(r.P99IndexTime.Microseconds()) / 1000.0,
@@ -1472,7 +1277,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			QueryName   string     `json:"query_name"`
 			ContractIDs []string   `json:"contract_ids,omitempty"`
 			Topics      [][]string `json:"topics,omitempty"`
-			IndexType   string     `json:"index_type"`
+			Datastore   string     `json:"datastore"`
 			StartLedger uint32     `json:"start_ledger"`
 			EndLedger   uint32     `json:"end_ledger"`
 
@@ -1510,7 +1315,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			QueryName:        r.Query.Name,
 			ContractIDs:      r.Query.ContractIDs,
 			Topics:           r.Query.Topics,
-			IndexType:        r.IndexType,
+			Datastore:        r.Datastore,
 			StartLedger:      r.StartLedger,
 			EndLedger:        r.EndLedger,
 			P50Ms:            float64(r.P50Time.Microseconds()) / 1000.0,
@@ -1557,7 +1362,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			r.Query.Name,
 			contractID,
 			topics[0], topics[1], topics[2], topics[3],
-			r.IndexType,
+			r.Datastore,
 			r.StartLedger,
 			r.EndLedger,
 			float64(r.P50Time.Microseconds())/1000.0,
