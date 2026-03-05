@@ -5,32 +5,19 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/RoaringBitmap/roaring"
 
+	"github.com/urvisavla/stellar-events/internal/event"
 	"github.com/urvisavla/stellar-events/internal/query"
 )
 
 // =============================================================================
 // Configuration Types
 // =============================================================================
-
-// BuildIndexOptions controls which indexes to build during rebuild.
-type BuildIndexOptions struct {
-	UniqueIndexes bool // Build unique value counts (for stats)
-}
-
-// indexEntry holds extracted data for index updates (used by collector pattern)
-type indexEntry struct {
-	Ledger     uint32
-	TxIdx      uint16
-	OpIdx      uint16
-	EventIdx   uint16
-	ContractID []byte   // nil if no contract
-	Topics     [][]byte // up to 4 topics
-}
 
 // Unique index type prefixes within CFUnique
 const (
@@ -59,13 +46,6 @@ const (
 // SegmentID calculates the segment ID for a given ledger sequence.
 func SegmentID(ledgerSeq uint32) uint32 {
 	return ledgerSeq / SegmentSize
-}
-
-// SegmentRange returns the ledger range covered by a segment.
-func SegmentRange(segmentID uint32) (start, end uint32) {
-	start = segmentID * SegmentSize
-	end = start + SegmentSize - 1
-	return
 }
 
 // GetSegmentsForRange returns all segment IDs that cover the given ledger range.
@@ -118,10 +98,10 @@ type EventIterator interface {
 	Close()
 }
 
-// LedgerMapLoader loads segment ledger maps from a storage backend.
+// LedgerOffsetsLoader loads segment ledger offsetss from a storage backend.
 // Implementations: RocksDBIndexStore (from RocksDB), SegmentReader (from mmap'd flat files).
-type LedgerMapLoader interface {
-	LoadSegmentLedgerMap(segmentID uint32) (*SegmentLedgerMap, error)
+type LedgerOffsetsLoader interface {
+	LoadSegmentLedgerOffsets(segmentID uint32) (*SegmentLedgerOffsets, error)
 }
 
 // QueryBackend provides a unified query interface over a storage backend.
@@ -178,7 +158,7 @@ type QueryResult struct {
 	TotalTime          time.Duration // Total query time
 }
 
-// SegmentLedgerMap maps dense sequential local IDs to (ledger, eventSeq) pairs
+// SegmentLedgerOffsets maps dense sequential local IDs to (ledger, eventSeq) pairs
 // within a segment. Stored as a fixed-size cumulative array of event counts.
 //
 // Entry i = total events in ledgers at offsets 0 through i (inclusive cumulative sum).
@@ -186,31 +166,31 @@ type QueryResult struct {
 //
 // Key format in CFDefault: [0xFF][segmentID:4] — 5 bytes
 // Value: [cumulative_count:4] × SegmentSize — exactly 40,000 bytes (fixed)
-type SegmentLedgerMap struct {
+type SegmentLedgerOffsets struct {
 	SegmentID uint32
 	Data      []byte // raw 40,000-byte cumulative array (zero-copy from RocksDB)
 }
 
 const (
-	// SegmentLedgerMapSize is the size of the cumulative array in bytes.
-	SegmentLedgerMapSize = int(SegmentSize) * 4 // 40,000 bytes
+	// SegmentLedgerOffsetsSize is the size of the cumulative array in bytes.
+	SegmentLedgerOffsetsSize = int(SegmentSize) * 4 // 40,000 bytes
 
-	// segmentLedgerMapPrefix is the key prefix used to avoid collision with text keys in CFDefault.
-	segmentLedgerMapPrefix = 0xFF
+	// segmentLedgerOffsetsPrefix is the key prefix used to avoid collision with text keys in CFDefault.
+	segmentLedgerOffsetsPrefix = 0xFF
 )
 
-// SegmentLedgerMapKey returns the CFDefault key for a segment's ledger map.
+// SegmentLedgerOffsetsKey returns the CFDefault key for a segment's ledger offsets.
 // Format: [0xFF][segmentID:4] — 5 bytes
-func SegmentLedgerMapKey(segmentID uint32) []byte {
+func SegmentLedgerOffsetsKey(segmentID uint32) []byte {
 	key := make([]byte, 5)
-	key[0] = segmentLedgerMapPrefix
+	key[0] = segmentLedgerOffsetsPrefix
 	binary.BigEndian.PutUint32(key[1:5], segmentID)
 	return key
 }
 
 // TotalEvents returns the total number of events in this segment (last cumulative entry).
-func (m *SegmentLedgerMap) TotalEvents() uint32 {
-	if len(m.Data) < SegmentLedgerMapSize {
+func (m *SegmentLedgerOffsets) TotalEvents() uint32 {
+	if len(m.Data) < SegmentLedgerOffsetsSize {
 		return 0
 	}
 	return m.getCumulative(int(SegmentSize) - 1)
@@ -220,8 +200,8 @@ func (m *SegmentLedgerMap) TotalEvents() uint32 {
 // startOff and endOff are ledger offsets within the segment (0-based, inclusive).
 // Returns (startID, endID) where endID is inclusive. If the range has no events,
 // returns (0, 0) with startID > endID being impossible, so caller should check endID >= startID.
-func (m *SegmentLedgerMap) LedgerRangeToIDRange(startOff, endOff uint16) (uint32, uint32) {
-	if len(m.Data) < SegmentLedgerMapSize {
+func (m *SegmentLedgerOffsets) LedgerRangeToIDRange(startOff, endOff uint16) (uint32, uint32) {
+	if len(m.Data) < SegmentLedgerOffsetsSize {
 		return 0, 0
 	}
 
@@ -239,8 +219,8 @@ func (m *SegmentLedgerMap) LedgerRangeToIDRange(startOff, endOff uint16) (uint32
 
 // DenseIDToLedgerAndSeq converts a dense local ID to an absolute ledger sequence
 // and event sequence within that ledger. O(log N) via binary search.
-func (m *SegmentLedgerMap) DenseIDToLedgerAndSeq(denseID uint32) (ledger uint32, seq uint16) {
-	if len(m.Data) < SegmentLedgerMapSize {
+func (m *SegmentLedgerOffsets) DenseIDToLedgerAndSeq(denseID uint32) (ledger uint32, seq uint16) {
+	if len(m.Data) < SegmentLedgerOffsetsSize {
 		return 0, 0
 	}
 
@@ -267,16 +247,16 @@ func (m *SegmentLedgerMap) DenseIDToLedgerAndSeq(denseID uint32) (ledger uint32,
 }
 
 // getCumulative reads the cumulative count at offset i from the raw data.
-func (m *SegmentLedgerMap) getCumulative(i int) uint32 {
+func (m *SegmentLedgerOffsets) getCumulative(i int) uint32 {
 	off := i * 4
 	return binary.LittleEndian.Uint32(m.Data[off : off+4])
 }
 
-// EncodeSegmentLedgerMap builds a cumulative array from per-ledger event counts.
+// EncodeSegmentLedgerOffsets builds a cumulative array from per-ledger event counts.
 // ledgerEventCounts[i] = number of events at ledger offset i.
 // Returns the raw 40,000-byte cumulative array.
-func EncodeSegmentLedgerMap(segmentID uint32, ledgerEventCounts [SegmentSize]uint32) []byte {
-	data := make([]byte, SegmentLedgerMapSize)
+func EncodeSegmentLedgerOffsets(segmentID uint32, ledgerEventCounts [SegmentSize]uint32) []byte {
+	data := make([]byte, SegmentLedgerOffsetsSize)
 	var cumulative uint32
 	for i := uint32(0); i < SegmentSize; i++ {
 		cumulative += ledgerEventCounts[i]
@@ -286,19 +266,19 @@ func EncodeSegmentLedgerMap(segmentID uint32, ledgerEventCounts [SegmentSize]uin
 	return data
 }
 
-// MergeSegmentLedgerMapData merges new per-ledger event counts into an existing
+// MergeSegmentLedgerOffsetsData merges new per-ledger event counts into an existing
 // cumulative array. For ledger offsets present in both old and new data, the new
 // count REPLACES the old (idempotent on re-ingestion). For offsets only in the
 // existing data, old counts are preserved (supports continuation after restart).
 // Returns a new 40,000-byte cumulative array.
-func MergeSegmentLedgerMapData(existing []byte, newCounts map[uint16]uint32) []byte {
-	if len(existing) < SegmentLedgerMapSize {
+func MergeSegmentLedgerOffsetsData(existing []byte, newCounts map[uint16]uint32) []byte {
+	if len(existing) < SegmentLedgerOffsetsSize {
 		// No existing data — build from scratch
 		var counts [SegmentSize]uint32
 		for off, count := range newCounts {
 			counts[off] = count
 		}
-		return EncodeSegmentLedgerMap(0, counts)
+		return EncodeSegmentLedgerOffsets(0, counts)
 	}
 
 	// Decode existing cumulative into per-ledger counts
@@ -323,7 +303,7 @@ func MergeSegmentLedgerMapData(existing []byte, newCounts map[uint16]uint32) []b
 	}
 
 	// Re-encode
-	return EncodeSegmentLedgerMap(0, counts)
+	return EncodeSegmentLedgerOffsets(0, counts)
 }
 
 // segmentEventCounter tracks per-ledger event counts during ingestion for a single segment.
@@ -390,4 +370,417 @@ func (m *MmapFile) Len() int {
 // Data returns the underlying memory-mapped byte slice.
 func (m *MmapFile) Data() []byte {
 	return m.data
+}
+
+// =============================================================================
+// Store
+// =============================================================================
+
+// Store manages storing and querying events.
+// Coordinates RocksDB storage, in-memory bitmap indexes, and flat file segments.
+type Store struct {
+	rocksDB *RocksDBBackend // nil when RocksDB disabled
+
+	// Index coordinator (owns in-memory bitmap + delegates to IndexFlusher)
+	indexStore *IndexStore
+
+	// Flat file segment directory path (empty = disabled)
+	segmentPath string
+
+	// Unified query backend (RocksDB or flat files)
+	queryBackend QueryBackend
+
+	// Segment data writer for flat file event storage (nil = disabled)
+	segmentDataWriter *SegmentDataWriter
+
+	// Tracks the last segment ID seen during StoreEvents for auto-finalization.
+	lastSegmentID  uint32
+	hasLastSegment bool
+}
+
+// Config configures a Store.
+type Config struct {
+	// RocksDB (optional — nil disables RocksDB)
+	DBPath    string
+	RocksOpts *RocksDBOptions
+
+	// Flat file segments
+	SegmentPath       string // base directory for segment files (empty = disabled)
+	WriteSegmentFiles bool   // write index + data files during ingest
+	CompressData      bool   // zstd-compress event data in segment files
+	BlockSize         int    // group size for compressed event blocks
+}
+
+// New creates a Store from the given options.
+func New(opts Config) (*Store, error) {
+	es := &Store{
+		segmentPath: opts.SegmentPath,
+	}
+
+	if opts.RocksOpts != nil {
+		backend, err := NewRocksDBBackend(opts.DBPath, opts.RocksOpts)
+		if err != nil {
+			return nil, err
+		}
+		es.rocksDB = backend
+		es.indexStore = NewIndexStore(backend.bitmapStore, backend.bitmapStore, backend.bitmapStore)
+	} else {
+		flusher := &SegmentIndexFlusher{}
+		es.indexStore = NewIndexStore(flusher, nil, nil)
+	}
+
+	// Configure index write targets
+	segPath := ""
+	if opts.WriteSegmentFiles {
+		segPath = opts.SegmentPath
+	}
+	es.indexStore.SetWriteConfig(segPath, es.rocksDB != nil)
+
+	// Initialize segment data writer if segment files are enabled
+	if opts.WriteSegmentFiles && opts.SegmentPath != "" {
+		es.segmentDataWriter = NewSegmentDataWriter(opts.SegmentPath, opts.CompressData, opts.BlockSize)
+	}
+
+	// Initialize query backend
+	if opts.SegmentPath != "" {
+		es.queryBackend = NewSegmentReader(opts.SegmentPath)
+	} else if es.rocksDB != nil {
+		es.queryBackend = NewRocksDBReader(
+			es.indexStore.bitmap,
+			NewRocksDBEventFetcher(es.rocksDB.db, es.rocksDB.ro, es.rocksDB.cfEvents),
+			es.rocksDB.bitmapStore,
+		)
+	}
+
+	return es, nil
+}
+
+// RocksDB returns the underlying RocksDBBackend for direct access to stats methods.
+func (es *Store) RocksDB() *RocksDBBackend {
+	return es.rocksDB
+}
+
+// StoreEvents stores events with optional index updates based on options.
+// Automatically finalizes completed segments when a segment boundary is crossed.
+// Returns the number of bytes written.
+func (es *Store) StoreEvents(events []*event.IngestEvent, opts *StoreOptions) (int64, error) {
+	var totalBytes int64
+
+	if opts == nil {
+		opts = &StoreOptions{}
+	}
+
+	var kvs []EventKV
+	countUpdates := make(map[string]uint64)
+	var maxLedger uint32
+
+	for _, ev := range events {
+		if es.indexStore != nil {
+			segmentID := SegmentID(ev.LedgerSequence)
+			if ev.LedgerSequence > maxLedger {
+				maxLedger = ev.LedgerSequence
+			}
+
+			// Auto-finalize completed segment on boundary crossing.
+			if es.hasLastSegment && segmentID != es.lastSegmentID {
+				if err := es.finalizeCompletedSegment(es.lastSegmentID); err != nil {
+					return 0, fmt.Errorf("failed to finalize segment %d: %w", es.lastSegmentID, err)
+				}
+			}
+			es.lastSegmentID = segmentID
+			es.hasLastSegment = true
+
+			denseLocalID := es.indexStore.AssignDenseLocalID(segmentID, ev.LedgerSequence)
+
+			key := EncodeKey(segmentID, denseLocalID)
+			value := event.EncodeBinaryEvent(ev)
+			if es.rocksDB != nil {
+				kvs = append(kvs, EventKV{Key: key, Value: value})
+			}
+			totalBytes += int64(len(value))
+
+			if len(ev.ContractID) > 0 {
+				es.indexStore.AddContractEvent(ev.ContractID, segmentID, denseLocalID)
+			}
+
+			for pos, topicBytes := range ev.Topics {
+				es.indexStore.AddTopicEvent(pos, topicBytes, segmentID, denseLocalID)
+			}
+
+			if es.segmentDataWriter != nil {
+				if !es.segmentDataWriter.IsActive() {
+					if err := es.segmentDataWriter.StartChunk(segmentID); err != nil {
+						return 0, fmt.Errorf("failed to start segment data chunk %d: %w", segmentID, err)
+					}
+				}
+				v4Data := event.EncodeBinaryEvent(ev)
+				if err := es.segmentDataWriter.AppendEvent(denseLocalID, v4Data); err != nil {
+					return 0, fmt.Errorf("failed to append event to file store: %w", err)
+				}
+			}
+		}
+
+		if opts.UniqueIndexes {
+			if len(ev.ContractID) > 0 {
+				uk := string(uniqueKey(UniqueTypeContract, ev.ContractID))
+				countUpdates[uk]++
+			}
+
+			for i, topicBytes := range ev.Topics {
+				if i > 3 {
+					break
+				}
+				var uniqueType byte
+				switch i {
+				case 0:
+					uniqueType = UniqueTypeTopic0
+				case 1:
+					uniqueType = UniqueTypeTopic1
+				case 2:
+					uniqueType = UniqueTypeTopic2
+				case 3:
+					uniqueType = UniqueTypeTopic3
+				}
+				uk := string(uniqueKey(uniqueType, topicBytes))
+				countUpdates[uk]++
+			}
+		}
+	}
+
+	if es.rocksDB != nil && (len(kvs) > 0 || len(countUpdates) > 0) {
+		if err := es.rocksDB.WriteEventBatch(kvs, countUpdates); err != nil {
+			return 0, err
+		}
+		if maxLedger > 0 {
+			if err := es.rocksDB.SetLastProcessedLedger(maxLedger); err != nil {
+				return 0, fmt.Errorf("failed to update last processed ledger: %w", err)
+			}
+		}
+	}
+
+	return totalBytes, nil
+}
+
+// finalizeCompletedSegment flushes in-memory bitmap indexes (for both RocksDB
+// and flat file paths) and, when segment files are configured, writes flat file
+// indexes for the given segment.
+func (es *Store) finalizeCompletedSegment(segmentID uint32) error {
+	if err := es.indexStore.Flush(); err != nil {
+		return fmt.Errorf("flush bitmap indexes: %w", err)
+	}
+	if es.segmentPath == "" {
+		return nil
+	}
+	return FinalizeSegment(es.indexStore, es.segmentPath, segmentID, es.segmentDataWriter)
+}
+
+// Finalize flushes in-memory bitmap indexes and finalizes the last segment.
+// Must be called after ingestion completes to ensure the final segment is written.
+func (es *Store) Finalize() error {
+	if !es.hasLastSegment {
+		return nil
+	}
+	return es.finalizeCompletedSegment(es.lastSegmentID)
+}
+
+// QueryEvents executes a query via the query backend.
+// When filters (contractIDs / topicGroups) are provided, uses bitmap indexes to
+// find matching events. Otherwise falls back to a sequential range scan.
+func (es *Store) QueryEvents(contractIDs [][]byte, topicGroups [4][][]byte, startLedger, endLedger uint32, limit int) (*QueryResult, []*query.Event, error) {
+	hasFilters := len(contractIDs) > 0
+	if !hasFilters {
+		for _, tg := range topicGroups {
+			if len(tg) > 0 {
+				hasFilters = true
+				break
+			}
+		}
+	}
+
+	if !hasFilters {
+		return es.queryBackend.FetchByRange(startLedger, endLedger, limit)
+	}
+
+	totalStart := time.Now()
+	result := &QueryResult{
+		LedgerRange: endLedger - startLedger + 1,
+	}
+
+	perSegment, err := collectBitmaps(es.queryBackend, contractIDs, topicGroups, startLedger, endLedger, result)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if result.MatchingLocalIDs == 0 {
+		result.TotalTime = time.Since(totalStart)
+		return result, nil, nil
+	}
+
+	events, err := es.queryBackend.FetchByIDs(perSegment, limit, result)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	result.TotalTime = time.Since(totalStart)
+	return result, events, nil
+}
+
+// Close closes the event store.
+func (es *Store) Close() {
+	if es.indexStore != nil {
+		es.indexStore.Close()
+	}
+
+	if es.queryBackend != nil {
+		es.queryBackend.Close()
+	}
+
+	if es.rocksDB != nil {
+		es.rocksDB.Close()
+	}
+}
+
+// collectBitmaps loads bitmaps for a query and intersects them per segment.
+// Contract IDs are OR'd within group 0, topic values are OR'd within each
+// positional group (1-4), and the resulting group bitmaps are AND'd per segment.
+// Returns the per-segment intersection bitmaps and populates index stats on result.
+func collectBitmaps(
+	loader BitmapLoader,
+	contractIDs [][]byte,
+	topicGroups [4][][]byte,
+	startLedger, endLedger uint32,
+	result *QueryResult,
+) (map[uint32]*roaring.Bitmap, error) {
+	segments := GetSegmentsForRange(startLedger, endLedger)
+	result.SegmentsTouched = len(segments)
+
+	indexStart := time.Now()
+
+	// Collect per-group, per-segment bitmaps.
+	// groupIdx 0 = contracts, 1-4 = topic positions.
+	type groupSegBitmaps struct {
+		bitmaps map[uint32][]*roaring.Bitmap
+	}
+	groups := make(map[int]*groupSegBitmaps)
+
+	// Query contract bitmaps (OR within contracts group).
+	if len(contractIDs) > 0 {
+		groups[0] = &groupSegBitmaps{bitmaps: make(map[uint32][]*roaring.Bitmap)}
+		for _, cid := range contractIDs {
+			termKey := ContractTermKey(cid)
+			for _, segID := range segments {
+				bm, stats, err := loader.LoadTermBitmap(segID, 0, termKey, startLedger, endLedger)
+				if err != nil {
+					continue
+				}
+				result.IndexBytesRead += stats.BytesRead
+				result.IndexReadTime += stats.ReadTime
+				result.IndexDecodeTime += stats.DecodeTime
+				if bm != nil && !bm.IsEmpty() {
+					result.SegmentsScanned++
+					groups[0].bitmaps[segID] = append(groups[0].bitmaps[segID], bm)
+				}
+			}
+		}
+	}
+
+	// Query topic bitmaps per position (OR within each position group).
+	for pos, tg := range topicGroups {
+		if len(tg) == 0 {
+			continue
+		}
+		groupIdx := pos + 1
+		groups[groupIdx] = &groupSegBitmaps{bitmaps: make(map[uint32][]*roaring.Bitmap)}
+		for _, topicXDR := range tg {
+			if len(topicXDR) == 0 {
+				continue
+			}
+			termKey := TopicTermKey(topicXDR)
+			for _, segID := range segments {
+				bm, stats, err := loader.LoadTermBitmap(segID, groupIdx, termKey, startLedger, endLedger)
+				if err != nil {
+					continue
+				}
+				result.IndexBytesRead += stats.BytesRead
+				result.IndexReadTime += stats.ReadTime
+				result.IndexDecodeTime += stats.DecodeTime
+				if bm != nil && !bm.IsEmpty() {
+					result.SegmentsScanned++
+					groups[groupIdx].bitmaps[segID] = append(groups[groupIdx].bitmaps[segID], bm)
+				}
+			}
+		}
+	}
+
+	// Collect all segment IDs across all groups.
+	allSegIDs := make(map[uint32]bool)
+	for _, g := range groups {
+		for segID := range g.bitmaps {
+			allSegIDs[segID] = true
+		}
+	}
+
+	// Parallel intersection: parallel OR within groups, then AND across groups.
+	intersectStart := time.Now()
+	perSegment := make(map[uint32]*roaring.Bitmap)
+
+	type groupBitmaps struct {
+		perSeg map[uint32][]*roaring.Bitmap
+	}
+	groupList := make([]groupBitmaps, 0, len(groups))
+	for _, g := range groups {
+		groupList = append(groupList, groupBitmaps{perSeg: g.bitmaps})
+	}
+
+	type segAndResult struct {
+		segID uint32
+		bm    *roaring.Bitmap
+	}
+	segIDList := make([]uint32, 0, len(allSegIDs))
+	for segID := range allSegIDs {
+		segIDList = append(segIDList, segID)
+	}
+	andResults := make([]segAndResult, len(segIDList))
+	var andWg sync.WaitGroup
+	for i, segID := range segIDList {
+		andWg.Add(1)
+		go func(idx int, sid uint32) {
+			defer andWg.Done()
+			for _, g := range groupList {
+				if len(g.perSeg[sid]) == 0 {
+					return
+				}
+			}
+			groupUnions := make([]*roaring.Bitmap, len(groupList))
+			var orWg sync.WaitGroup
+			for gIdx := range groupList {
+				bms := groupList[gIdx].perSeg[sid]
+				if len(bms) == 1 {
+					groupUnions[gIdx] = bms[0]
+				} else {
+					orWg.Add(1)
+					go func(oi int, bmaps []*roaring.Bitmap) {
+						defer orWg.Done()
+						groupUnions[oi] = roaring.FastOr(bmaps...)
+					}(gIdx, bms)
+				}
+			}
+			orWg.Wait()
+			intersected := roaring.FastAnd(groupUnions...)
+			if !intersected.IsEmpty() {
+				andResults[idx] = segAndResult{segID: sid, bm: intersected}
+			}
+		}(i, segID)
+	}
+	andWg.Wait()
+	for _, sr := range andResults {
+		if sr.bm != nil {
+			perSegment[sr.segID] = sr.bm
+			result.MatchingLocalIDs += int(sr.bm.GetCardinality())
+		}
+	}
+	result.IndexIntersectTime = time.Since(intersectStart)
+	result.IndexLookupTime = time.Since(indexStart)
+
+	return perSegment, nil
 }

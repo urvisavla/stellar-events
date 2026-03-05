@@ -10,26 +10,27 @@ import (
 
 	"github.com/tamirms/streamhash"
 
-	"github.com/urvisavla/stellar-events/internal/eventstore"
+	"github.com/tamir/events-analysis/eventstore"
+	"github.com/tamir/events-analysis/packfile"
 )
 
 // SegmentIndexFlusher is a flusher for segment-file-only mode.
-// Encodes ledger maps directly from counters (no RocksDB merge).
+// Encodes ledger offsetss directly from counters (no RocksDB merge).
 type SegmentIndexFlusher struct{}
 
 func (f *SegmentIndexFlusher) Flush(segments []bitmapChunk, counters map[uint32]*segmentEventCounter, _ bool) (map[uint32][]byte, error) {
-	ledgerMapData := make(map[uint32][]byte, len(counters))
+	ledgerOffsetsData := make(map[uint32][]byte, len(counters))
 	for segmentID, counter := range counters {
-		ledgerMapData[segmentID] = EncodeSegmentLedgerMap(segmentID, counter.eventCounts)
+		ledgerOffsetsData[segmentID] = EncodeSegmentLedgerOffsets(segmentID, counter.eventCounts)
 	}
-	return ledgerMapData, nil
+	return ledgerOffsetsData, nil
 }
 
 func (f *SegmentIndexFlusher) Close() error { return nil }
 
 // FinalizeSegment writes flat file indexes for a completed segment using cached data from Flush().
 // Returns nil if no cached data exists (caller should fall back to an alternative path).
-// The ledger map (segment.meta) is already written by IndexStore.Flush() — this only writes
+// The ledger offsets (segment.offsets) is already written by IndexStore.Flush() — this only writes
 // the MPHF bitmap indexes (.hash/.pack) and finalizes the event data chunk.
 func FinalizeSegment(indexStore *IndexStore, segmentPath string, segmentID uint32, sdw *SegmentDataWriter) error {
 	cached := indexStore.PopSegmentTerms(segmentID)
@@ -54,9 +55,7 @@ func FinalizeSegment(indexStore *IndexStore, segmentPath string, segmentID uint3
 
 
 const (
-	MaxEventsPerChunk   = 10_000_000
-	EventsDataFileName  = "events.dat"
-	EventsIndexFileName = "events.idx"
+	EventsFileName = "events.pack"
 )
 
 // SegmentDataWriter writes event data to flat files during ingestion.
@@ -74,7 +73,7 @@ type SegmentDataWriter struct {
 func NewSegmentDataWriter(basePath string, compressEvents bool, groupSize int) *SegmentDataWriter {
 	blockSize := groupSize
 	if blockSize <= 0 {
-		blockSize = eventstore.DefaultBlockSize
+		blockSize = eventstore.DefaultRecordSize
 	}
 	return &SegmentDataWriter{
 		basePath:       basePath,
@@ -93,9 +92,14 @@ func (w *SegmentDataWriter) StartChunk(chunkID uint32) error {
 		return fmt.Errorf("failed to create chunk dir %s: %w", dirPath, err)
 	}
 
-	ew, err := eventstore.Create(dirPath, eventstore.WriterOptions{
-		BlockSize:     w.blockSize,
-		NoCompression: !w.compressEvents,
+	var format packfile.RecordFormat
+	if !w.compressEvents {
+		format = packfile.Uncompressed
+	}
+
+	ew, err := eventstore.Create(filepath.Join(dirPath, EventsFileName), eventstore.WriterOptions{
+		RecordSize: w.blockSize,
+		Format:     format,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create eventstore: %w", err)
@@ -163,7 +167,7 @@ func (w *SegmentDataWriter) IsActive() bool {
 //     topic2.pack
 //     topic3.hash
 //     topic3.pack
-//     segment.meta       - 40,000 bytes cumulative count array
+//     segment.offsets       - 40,000 bytes cumulative count array
 //
 // .pack layout:
 //   [bitmap_0 bytes][bitmap_1 bytes]...[bitmap_{N-1} bytes]
@@ -176,12 +180,12 @@ func (w *SegmentDataWriter) IsActive() bool {
 //   4. roaring.UnmarshalBinary(bytes)
 
 const (
-	// LedgerMapFileName is the name of the ledger map file.
-	LedgerMapFileName = "segment.meta"
+	// LedgerOffsetsFileName is the name of the ledger offsets file.
+	LedgerOffsetsFileName = "segment.offsets"
 )
 
 // WriteSegmentDir writes MPHF bitmap indexes (.hash/.pack) for a segment.
-// The ledger map (segment.meta) is written separately by IndexStore.Flush().
+// The ledger offsets (segment.offsets) is written separately by IndexStore.Flush().
 func WriteSegmentDir(basePath string, segmentID uint32, contractTerms []SegmentTermData, topicsByPos [4][]SegmentTermData) error {
 	dirName := fmt.Sprintf("%06d", segmentID)
 	dirPath := filepath.Join(basePath, dirName)

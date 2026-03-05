@@ -48,7 +48,7 @@ type LedgerResult struct {
 type Pipeline struct {
 	config PipelineConfig
 	stats  PipelineStats
-	store  *store.EventStore
+	store  *store.Store
 
 	// Channels
 	jobs    chan uint32        // Ledger sequences to process
@@ -65,7 +65,7 @@ type Pipeline struct {
 }
 
 // NewPipeline creates a new parallel ingestion pipeline
-func NewPipeline(config PipelineConfig, store *store.EventStore) *Pipeline {
+func NewPipeline(config PipelineConfig, store *store.Store) *Pipeline {
 	if config.Workers <= 0 {
 		config.Workers = runtime.NumCPU()
 	}

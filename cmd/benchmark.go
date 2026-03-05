@@ -204,7 +204,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 	rand.Seed(*seed)
 
 	// Open event store
-	eventStore, err := openEventStore(cfg)
+	eventStore, err := openStore(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open event store: %v\n", err)
 		os.Exit(1)
@@ -826,7 +826,7 @@ func purgePageCache() error {
 	return fmt.Errorf("unsupported OS for cache purge: %s", runtime.GOOS)
 }
 
-func runQueryBenchmark(eventStore *store.EventStore, data *BenchmarkData, spec QuerySpec, datastore string, iterations, warmup, limit int, timeout time.Duration, coldCache bool) BenchmarkResult {
+func runQueryBenchmark(eventStore *store.Store, data *BenchmarkData, spec QuerySpec, datastore string, iterations, warmup, limit int, timeout time.Duration, coldCache bool) BenchmarkResult {
 	result := BenchmarkResult{
 		Query:       spec,
 		Datastore:   datastore,
@@ -1026,7 +1026,7 @@ type QueryResult struct {
 	Error error
 }
 
-func executeQueryBenchmark(eventStore *store.EventStore, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
+func executeQueryBenchmark(eventStore *store.Store, startLedger, endLedger uint32, contractIDs [][]byte, topicGroups [4][][]byte, limit int) *QueryResult {
 	stats, events, err := eventStore.QueryEvents(contractIDs, topicGroups, startLedger, endLedger, limit)
 	if err != nil {
 		return &QueryResult{Error: err}

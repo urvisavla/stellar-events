@@ -1074,7 +1074,7 @@ func (rb *RocksDBBackend) computeStatsForRange(startLedger, endLedger uint32) st
 	defer it.Close()
 
 	var currentSegID uint32 = ^uint32(0)
-	var lm *SegmentLedgerMap
+	var lm *SegmentLedgerOffsets
 
 	for it.Seek(startKey); it.Valid(); it.Next() {
 		key := it.Key().Data()
@@ -1087,10 +1087,10 @@ func (rb *RocksDBBackend) computeStatsForRange(startLedger, endLedger uint32) st
 			break
 		}
 
-		// Load ledger map for new segment
+		// Load ledger offsets for new segment
 		if segID != currentSegID {
 			currentSegID = segID
-			lm, _ = rb.bitmapStore.LoadSegmentLedgerMap(segID)
+			lm, _ = rb.bitmapStore.LoadSegmentLedgerOffsets(segID)
 		}
 		if lm == nil {
 			continue
@@ -1167,7 +1167,7 @@ func (rb *RocksDBBackend) computeStatsForRange(startLedger, endLedger uint32) st
 // Bitmap Stats and Metadata
 // =============================================================================
 
-func (es *EventStore) GetBitmapStats() *BitmapStats {
+func (es *Store) GetBitmapStats() *BitmapStats {
 	if es.indexStore == nil {
 		return nil
 	}

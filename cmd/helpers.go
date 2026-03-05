@@ -17,9 +17,9 @@ import (
 // Store Initialization
 // =============================================================================
 
-// openEventStore opens the event store with config options
-func openEventStore(cfg *config.Config) (*store.EventStore, error) {
-	opts := store.EventStoreOptions{
+// openStore opens the event store with config options.
+func openStore(cfg *config.Config) (*store.Store, error) {
+	opts := store.Config{
 		SegmentPath:       cfg.Storage.SegmentPath,
 		WriteSegmentFiles: cfg.Storage.SegmentFiles,
 		CompressData:      cfg.Storage.CompressData,
@@ -31,7 +31,7 @@ func openEventStore(cfg *config.Config) (*store.EventStore, error) {
 		opts.RocksOpts = configToRocksDBOptions(&cfg.Storage)
 	}
 
-	return store.NewEventStore(opts)
+	return store.New(opts)
 }
 
 // configToRocksDBOptions converts config.StorageConfig to store.RocksDBOptions
@@ -40,9 +40,7 @@ func configToRocksDBOptions(cfg *config.StorageConfig) *store.RocksDBOptions {
 		WriteBufferSizeMB:           cfg.WriteBufferSizeMB,
 		MaxWriteBufferNumber:        cfg.MaxWriteBufferNumber,
 		MinWriteBufferNumberToMerge: cfg.MinWriteBufferNumberToMerge,
-		BlockCacheSizeMB:            cfg.BlockCacheSizeMB,
 		BloomFilterBitsPerKey:       cfg.BloomFilterBitsPerKey,
-		CacheIndexAndFilterBlocks:   cfg.CacheIndexAndFilterBlocks,
 		MaxBackgroundJobs:           cfg.MaxBackgroundJobs,
 		Compression:                 cfg.Compression,
 		BottommostCompression:       cfg.BottommostCompression,

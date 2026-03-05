@@ -1,11 +1,13 @@
 module github.com/urvisavla/stellar-events
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/RoaringBitmap/roaring v1.9.4
 	github.com/stellar/go-stellar-sdk v0.1.0
+	github.com/tamir/events-analysis v0.0.0-20260303135025-d9bd75a6f8a5
+	github.com/tamirms/streamhash v0.0.0-20260227190507-b121da8d8320
 	golang.org/x/text v0.21.0
 )
 
@@ -38,7 +40,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.34.0 // indirect
 	github.com/aws/smithy-go v1.22.4 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/bits-and-blooms/bitset v1.12.0 // indirect
+	github.com/bits-and-blooms/bitset v1.24.2 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/creachadair/jrpc2 v1.2.0 // indirect
@@ -59,7 +61,7 @@ require (
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/klauspost/compress v1.18.3 // indirect
-	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
+	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
 	github.com/pelletier/go-toml v1.9.5 // indirect
@@ -72,8 +74,7 @@ require (
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
-	github.com/tamirms/streamhash v0.0.0-20260224125831-92eef2d6e54e // indirect
-	github.com/zeebo/xxh3 v1.0.2 // indirect
+	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.49.0 // indirect
@@ -102,7 +103,12 @@ require (
 )
 
 require (
-	github.com/linxGnu/grocksdb v1.10.3
+	github.com/linxGnu/grocksdb v1.10.7
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/stellar/go-xdr v0.0.0-20231122183749-b53fb00bcac2 // indirect
+)
+
+replace (
+	github.com/linxGnu/grocksdb => github.com/linxGnu/grocksdb v1.10.3
+	github.com/tamir/events-analysis => github.com/tamirms/event-analysis v0.0.0-20260303135025-d9bd75a6f8a5
 )

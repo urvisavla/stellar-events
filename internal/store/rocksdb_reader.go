@@ -33,10 +33,10 @@ func encodeTopicIndexKey(pos int, termKey [32]byte, segmentID uint32) []byte {
 }
 
 // =============================================================================
-// RocksDBIndexStore — RocksDB I/O for bitmap indexes and ledger maps
+// RocksDBIndexStore — RocksDB I/O for bitmap indexes and ledger offsetss
 // =============================================================================
 
-// RocksDBIndexStore implements IndexFlusher, bitmap32Loader, and ledgerMapLoader
+// RocksDBIndexStore implements IndexFlusher, bitmap32Loader, and ledgerOffsetsLoader
 // backed by RocksDB column families. Pure I/O layer — does NOT own the in-memory bitmap index.
 type RocksDBIndexStore struct {
 	db          *grocksdb.DB
@@ -77,12 +77,12 @@ func (s *RocksDBIndexStore) Close() error {
 	return nil
 }
 
-// LoadSegmentLedgerMap implements the ledgerMapLoader interface.
-func (s *RocksDBIndexStore) LoadSegmentLedgerMap(segmentID uint32) (*SegmentLedgerMap, error) {
-	key := SegmentLedgerMapKey(segmentID)
+// LoadSegmentLedgerOffsets implements the ledgerOffsetsLoader interface.
+func (s *RocksDBIndexStore) LoadSegmentLedgerOffsets(segmentID uint32) (*SegmentLedgerOffsets, error) {
+	key := SegmentLedgerOffsetsKey(segmentID)
 	data, err := s.db.GetCF(s.ro, s.cfDefault, key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load ledger map for segment %d: %w", segmentID, err)
+		return nil, fmt.Errorf("failed to load ledger offsets for segment %d: %w", segmentID, err)
 	}
 	defer data.Free()
 
@@ -93,7 +93,7 @@ func (s *RocksDBIndexStore) LoadSegmentLedgerMap(segmentID uint32) (*SegmentLedg
 	dataCopy := make([]byte, data.Size())
 	copy(dataCopy, data.Data())
 
-	return &SegmentLedgerMap{
+	return &SegmentLedgerOffsets{
 		SegmentID: segmentID,
 		Data:      dataCopy,
 	}, nil
@@ -160,7 +160,7 @@ func (s *RocksDBIndexStore) loadBitmap32FromCF(cf *grocksdb.ColumnFamilyHandle, 
 	return bitmap.Clone(), nil
 }
 
-// Flush persists bitmap segments and ledger maps to RocksDB, merging with existing data.
+// Flush persists bitmap segments and ledger offsetss to RocksDB, merging with existing data.
 // writeToStore controls whether data is actually written (allows RocksDB for reads only).
 func (s *RocksDBIndexStore) Flush(
 	segments []bitmapChunk,
@@ -212,15 +212,15 @@ func (s *RocksDBIndexStore) Flush(
 		}
 	}
 
-	ledgerMapData := make(map[uint32][]byte, len(counters))
+	ledgerOffsetsData := make(map[uint32][]byte, len(counters))
 	for segmentID, counter := range counters {
-		lmKey := SegmentLedgerMapKey(segmentID)
+		lmKey := SegmentLedgerOffsetsKey(segmentID)
 
 		var existingBytes []byte
 		if writeToStore {
 			existingData, err := s.db.GetCF(s.ro, s.cfDefault, lmKey)
 			if err != nil {
-				return nil, fmt.Errorf("failed to read existing ledger map for segment %d: %w", segmentID, err)
+				return nil, fmt.Errorf("failed to read existing ledger offsets for segment %d: %w", segmentID, err)
 			}
 			if existingData.Size() > 0 {
 				existingBytes = make([]byte, existingData.Size())
@@ -238,12 +238,12 @@ func (s *RocksDBIndexStore) Flush(
 
 		var finalData []byte
 		if len(existingBytes) > 0 {
-			finalData = MergeSegmentLedgerMapData(existingBytes, newCounts)
+			finalData = MergeSegmentLedgerOffsetsData(existingBytes, newCounts)
 		} else {
-			finalData = EncodeSegmentLedgerMap(segmentID, counter.eventCounts)
+			finalData = EncodeSegmentLedgerOffsets(segmentID, counter.eventCounts)
 		}
 
-		ledgerMapData[segmentID] = finalData
+		ledgerOffsetsData[segmentID] = finalData
 
 		if writeToStore {
 			batch.PutCF(s.cfDefault, lmKey, finalData)
@@ -256,20 +256,20 @@ func (s *RocksDBIndexStore) Flush(
 		}
 	}
 
-	return ledgerMapData, nil
+	return ledgerOffsetsData, nil
 }
 
 // RocksDBReader implements QueryBackend backed by RocksDB.
 // Loads bitmaps from the in-memory bitmap engine (hot cache) and RocksDBIndexStore (cold storage),
-// fetches events via RocksDB iterators, and resolves dense IDs via ledger maps.
+// fetches events via RocksDB iterators, and resolves dense IDs via ledger offsetss.
 type RocksDBReader struct {
 	bitmap   *eventBitmap32Index
 	fetcher  EventFetcher
-	lmLoader LedgerMapLoader
+	lmLoader LedgerOffsetsLoader
 }
 
 // NewRocksDBReader creates a QueryBackend backed by RocksDB.
-func NewRocksDBReader(bitmap *eventBitmap32Index, fetcher EventFetcher, lmLoader LedgerMapLoader) *RocksDBReader {
+func NewRocksDBReader(bitmap *eventBitmap32Index, fetcher EventFetcher, lmLoader LedgerOffsetsLoader) *RocksDBReader {
 	return &RocksDBReader{bitmap: bitmap, fetcher: fetcher, lmLoader: lmLoader}
 }
 
@@ -294,7 +294,7 @@ func (l *RocksDBReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey
 		return nil, stats, nil
 	}
 
-	// Trim to ledger range using dense ID boundaries from ledger map.
+	// Trim to ledger range using dense ID boundaries from ledger offsets.
 	segmentStart := segmentID * SegmentSize
 
 	var startOff uint16
@@ -307,10 +307,10 @@ func (l *RocksDBReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey
 	}
 
 	needsTrim := startOff > 0 || endOff < uint16(SegmentSize-1)
-	if needsTrim && l.bitmap.ledgerMapLoader != nil {
-		lm, lmErr := l.bitmap.ledgerMapLoader.LoadSegmentLedgerMap(segmentID)
+	if needsTrim && l.bitmap.ledgerOffsetsLoader != nil {
+		lm, lmErr := l.bitmap.ledgerOffsetsLoader.LoadSegmentLedgerOffsets(segmentID)
 		if lmErr != nil {
-			return nil, stats, fmt.Errorf("failed to load ledger map for segment %d: %w", segmentID, lmErr)
+			return nil, stats, fmt.Errorf("failed to load ledger offsets for segment %d: %w", segmentID, lmErr)
 		}
 
 		var startLocalID, endLocalID uint32
@@ -413,9 +413,9 @@ func (q *RocksDBReader) FetchByIDs(perSegment map[uint32]*roaring.Bitmap, limit 
 			break
 		}
 
-		lm, err := q.lmLoader.LoadSegmentLedgerMap(segID)
+		lm, err := q.lmLoader.LoadSegmentLedgerOffsets(segID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load ledger map for segment %d: %w", segID, err)
+			return nil, fmt.Errorf("failed to load ledger offsets for segment %d: %w", segID, err)
 		}
 		if lm == nil {
 			continue
@@ -490,7 +490,7 @@ func (q *RocksDBReader) FetchByRange(startLedger, endLedger uint32, limit int) (
 	result.EventFetchTime += time.Since(diskStart)
 
 	var currentSegID = ^uint32(0)
-	var lm *SegmentLedgerMap
+	var lm *SegmentLedgerOffsets
 	var events []*query.Event
 
 	for iter.Valid() {
@@ -511,7 +511,7 @@ func (q *RocksDBReader) FetchByRange(startLedger, endLedger uint32, limit int) (
 
 		if segID != currentSegID {
 			currentSegID = segID
-			lm, _ = q.lmLoader.LoadSegmentLedgerMap(segID)
+			lm, _ = q.lmLoader.LoadSegmentLedgerOffsets(segID)
 		}
 		if lm == nil {
 			diskStart = time.Now()
@@ -566,5 +566,5 @@ var (
 	_ QueryBackend    = (*RocksDBReader)(nil)
 	_ EventFetcher    = (*RocksDBEventFetcher)(nil)
 	_ EventIterator   = (*RocksDBEventIterator)(nil)
-	_ LedgerMapLoader = (*RocksDBIndexStore)(nil)
+	_ LedgerOffsetsLoader = (*RocksDBIndexStore)(nil)
 )

@@ -45,7 +45,7 @@ func runStats(cfg *config.Config, args []string) {
 func cmdStats(cfg *config.Config, top, bottom int) {
 	p := message.NewPrinter(language.English)
 
-	eventStore, err := openEventStore(cfg)
+	eventStore, err := openStore(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open event store: %v\n", err)
 		os.Exit(1)

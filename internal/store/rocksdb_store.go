@@ -25,9 +25,7 @@ type RocksDBOptions struct {
 	MaxWriteBufferNumber        int
 	MinWriteBufferNumberToMerge int
 
-	BlockCacheSizeMB          int
-	BloomFilterBitsPerKey     int
-	CacheIndexAndFilterBlocks bool
+	BloomFilterBitsPerKey int
 
 	MaxBackgroundJobs int
 
@@ -125,19 +123,16 @@ func (m *uint64AddMergeOperator) PartialMerge(_, leftOperand, rightOperand []byt
 }
 
 // RocksDBBackend encapsulates all grocksdb-owned resources so that higher-level
-// code (EventStore) can coordinate without importing grocksdb directly.
+// code (Store) can coordinate without importing grocksdb directly.
 type RocksDBBackend struct {
-	db     *grocksdb.DB
-	dbPath string
-	wo     *grocksdb.WriteOptions
+	db *grocksdb.DB
+	wo *grocksdb.WriteOptions
 	ro     *grocksdb.ReadOptions
 
 	cfHandles       []*grocksdb.ColumnFamilyHandle
-	cfDefault       *grocksdb.ColumnFamilyHandle
-	cfEvents        *grocksdb.ColumnFamilyHandle
-	cfUnique        *grocksdb.ColumnFamilyHandle
-	cfContractsBM32 *grocksdb.ColumnFamilyHandle
-	cfTopicsBM32    *grocksdb.ColumnFamilyHandle
+	cfDefault *grocksdb.ColumnFamilyHandle
+	cfEvents  *grocksdb.ColumnFamilyHandle
+	cfUnique  *grocksdb.ColumnFamilyHandle
 
 	baseOpts *grocksdb.Options
 	cfOpts   []*grocksdb.Options
@@ -223,16 +218,13 @@ func NewRocksDBBackend(dbPath string, rocksOpts *RocksDBOptions) (*RocksDBBacken
 	}
 
 	return &RocksDBBackend{
-		db:              db,
-		dbPath:          dbPath,
-		wo:              wo,
-		ro:              grocksdb.NewDefaultReadOptions(),
-		cfHandles:       cfHandles,
-		cfDefault:       cfHandles[0],
-		cfEvents:        cfHandles[1],
-		cfUnique:        cfHandles[2],
-		cfContractsBM32: cfHandles[3],
-		cfTopicsBM32:    cfHandles[4],
+		db:        db,
+		wo:        wo,
+		ro:        grocksdb.NewDefaultReadOptions(),
+		cfHandles: cfHandles,
+		cfDefault: cfHandles[0],
+		cfEvents:  cfHandles[1],
+		cfUnique:  cfHandles[2],
 		baseOpts:        baseOpts,
 		cfOpts:          cfOpts,
 		bbtoList:        bbtoList,

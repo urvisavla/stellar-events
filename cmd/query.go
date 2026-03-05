@@ -98,7 +98,7 @@ func runQuery(cfg *config.Config, args []string) {
 }
 
 func cmdQuery(cfg *config.Config, startLedger, endLedger uint32, contractID, topicsCSV, topic0, topic1, topic2, topic3 string, limit int) {
-	eventStore, err := openEventStore(cfg)
+	eventStore, err := openStore(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open event store: %v\n", err)
 		os.Exit(1)

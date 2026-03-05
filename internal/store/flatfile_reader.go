@@ -13,8 +13,9 @@ import (
 	"github.com/RoaringBitmap/roaring"
 	"github.com/tamirms/streamhash"
 
+	"github.com/tamir/events-analysis/eventstore"
+
 	"github.com/urvisavla/stellar-events/internal/event"
-	"github.com/urvisavla/stellar-events/internal/eventstore"
 	"github.com/urvisavla/stellar-events/internal/query"
 )
 
@@ -89,10 +90,10 @@ func (r *SegmentReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey
 	return bm, stats, nil
 }
 
-// LoadSegmentLedgerMap loads a ledger map from segment flat files via mmap cache.
-// Implements LedgerMapLoader.
-func (r *SegmentReader) LoadSegmentLedgerMap(segmentID uint32) (*SegmentLedgerMap, error) {
-	return r.loadLedgerMapFromFile(segmentID)
+// LoadSegmentLedgerOffsets loads a ledger offsets from segment flat files via mmap cache.
+// Implements LedgerOffsetsLoader.
+func (r *SegmentReader) LoadSegmentLedgerOffsets(segmentID uint32) (*SegmentLedgerOffsets, error) {
+	return r.loadLedgerOffsetsFromFile(segmentID)
 }
 
 // getMmap returns a cached mmap for the given path, opening it on first access.
@@ -135,30 +136,30 @@ func (r *SegmentReader) getEventstoreReader(dirPath string) (*eventstore.Reader,
 	if er, ok := r.eventCache[dirPath]; ok {
 		return er, nil
 	}
-	if _, err := os.Stat(filepath.Join(dirPath, EventsIndexFileName)); err != nil {
+	if _, err := os.Stat(filepath.Join(dirPath, EventsFileName)); err != nil {
 		return nil, err
 	}
-	er := eventstore.Open(dirPath)
+	er := eventstore.Open(filepath.Join(dirPath, EventsFileName))
 	r.eventCache[dirPath] = er
 	return er, nil
 }
 
-// loadLedgerMapFromFile reads a ledger map from segment flat files via mmap cache.
-func (r *SegmentReader) loadLedgerMapFromFile(segmentID uint32) (*SegmentLedgerMap, error) {
+// loadLedgerOffsetsFromFile reads a ledger offsets from segment flat files via mmap cache.
+func (r *SegmentReader) loadLedgerOffsetsFromFile(segmentID uint32) (*SegmentLedgerOffsets, error) {
 	dirName := fmt.Sprintf("%06d", segmentID)
-	path := filepath.Join(r.basePath, dirName, LedgerMapFileName)
+	path := filepath.Join(r.basePath, dirName, LedgerOffsetsFileName)
 
 	mm, err := r.getMmap(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to mmap ledger map: %w", err)
+		return nil, fmt.Errorf("failed to mmap ledger offsets: %w", err)
 	}
 
-	if mm.Len() != SegmentLedgerMapSize {
-		return nil, fmt.Errorf("invalid ledger map size: got %d, expected %d", mm.Len(), SegmentLedgerMapSize)
+	if mm.Len() != SegmentLedgerOffsetsSize {
+		return nil, fmt.Errorf("invalid ledger offsets size: got %d, expected %d", mm.Len(), SegmentLedgerOffsetsSize)
 	}
 
 	// Data points directly into the mmap region (zero-copy).
-	return &SegmentLedgerMap{SegmentID: segmentID, Data: mm.data}, nil
+	return &SegmentLedgerOffsets{SegmentID: segmentID, Data: mm.data}, nil
 }
 
 // loadBitmapFromFile loads a bitmap from segment MPHF index files via reader cache.
@@ -253,9 +254,9 @@ func (r *SegmentReader) trimToLedgerRange(segID uint32, bm *roaring.Bitmap, star
 		return bm
 	}
 
-	lm, err := r.loadLedgerMapFromFile(segID)
+	lm, err := r.loadLedgerOffsetsFromFile(segID)
 	if err != nil {
-		// Can't trim without ledger map — return full bitmap
+		// Can't trim without ledger offsets — return full bitmap
 		return bm
 	}
 
@@ -277,7 +278,7 @@ func (r *SegmentReader) trimToLedgerRange(segID uint32, bm *roaring.Bitmap, star
 }
 
 // FetchByRange reads all events in a ledger range via sequential scan (no index).
-// Uses the ledger map to determine the dense ID range per segment and reads sequentially.
+// Uses the ledger offsets to determine the dense ID range per segment and reads sequentially.
 func (r *SegmentReader) FetchByRange(startLedger, endLedger uint32, limit int) (*QueryResult, []*query.Event, error) {
 	totalStart := time.Now()
 	result := &QueryResult{
@@ -298,7 +299,7 @@ func (r *SegmentReader) FetchByRange(startLedger, endLedger uint32, limit int) (
 			break
 		}
 
-		lm, err := r.loadLedgerMapFromFile(segID)
+		lm, err := r.loadLedgerOffsetsFromFile(segID)
 		if err != nil {
 			continue // segment may not exist
 		}
@@ -337,9 +338,8 @@ func (r *SegmentReader) FetchByRange(startLedger, endLedger uint32, limit int) (
 		}
 
 		// Sequential range read using eventstore.ReadEvents
-		var ioStats eventstore.ReadStats
 		eventIdx := 0
-		for blob, readErr := range er.ReadEvents(int(startID), count, &ioStats) {
+		for blob, readErr := range er.ReadEvents(int(startID), count) {
 			if readErr != nil {
 				return nil, nil, fmt.Errorf("failed to read events from segment %d: %w", segID, readErr)
 			}
@@ -367,9 +367,6 @@ func (r *SegmentReader) FetchByRange(startLedger, endLedger uint32, limit int) (
 			events = append(events, ev)
 		}
 		result.EventFetchTime += time.Since(readStart)
-		result.DecompressTime += ioStats.DecompressTime
-		result.EventDiskReadTime += ioStats.DiskReadTime
-		result.GroupsDecompressed += ioStats.BlocksRead
 	}
 
 	if fetchCap > 0 && len(events) > fetchCap {
@@ -417,10 +414,10 @@ func (r *SegmentReader) FetchByIDs(perSegment map[uint32]*roaring.Bitmap, limit 
 			continue
 		}
 
-		// Load ledger map for this segment (needed for ledger/seq resolution)
-		lm, err := r.loadLedgerMapFromFile(segID)
+		// Load ledger offsets for this segment (needed for ledger/seq resolution)
+		lm, err := r.loadLedgerOffsetsFromFile(segID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load ledger map for segment %d: %w", segID, err)
+			return nil, fmt.Errorf("failed to load ledger offsets for segment %d: %w", segID, err)
 		}
 
 		// Open eventstore reader
@@ -440,9 +437,8 @@ func (r *SegmentReader) FetchByIDs(perSegment map[uint32]*roaring.Bitmap, limit 
 		}
 
 		// Use ReadIndices for parallel scattered event fetch
-		var ioStats eventstore.ReadStats
 		eventIdx := 0
-		for blob, readErr := range er.ReadIndices(context.Background(), indices, &ioStats) {
+		for blob, readErr := range er.ReadIndices(context.Background(), indices) {
 			if readErr != nil {
 				return nil, fmt.Errorf("failed to read events from segment %d: %w", segID, readErr)
 			}
@@ -466,9 +462,6 @@ func (r *SegmentReader) FetchByIDs(perSegment map[uint32]*roaring.Bitmap, limit 
 			events = append(events, ev)
 		}
 		result.EventFetchTime += time.Since(readStart)
-		result.DecompressTime += ioStats.DecompressTime
-		result.EventDiskReadTime += ioStats.DiskReadTime
-		result.GroupsDecompressed += ioStats.BlocksRead
 	}
 
 	if limit > 0 && len(events) > limit {

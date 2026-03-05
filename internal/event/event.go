@@ -54,7 +54,7 @@ type IngestEvent struct {
 // Fields derived from key (NOT stored in value):
 //   - segmentID: from key bytes 0-3
 //   - denseID: from key bytes 4-7
-//   - ledger + event_index: resolved via SegmentLedgerMap
+//   - ledger + event_index: resolved via SegmentLedgerOffsets
 //
 // Fields extracted from XDR at decode time (NOT in header):
 //   - contractID, eventType, topics, data, inSuccessfulContractCall

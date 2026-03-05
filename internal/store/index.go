@@ -62,9 +62,9 @@ func makeIndexKey(termKey [32]byte, segmentID uint32) [IndexKeySize]byte {
 	return key
 }
 
-// ledgerMapLoader loads a SegmentLedgerMap for a given segment from storage.
-type ledgerMapLoader interface {
-	LoadSegmentLedgerMap(segmentID uint32) (*SegmentLedgerMap, error)
+// ledgerOffsetsLoader loads a SegmentLedgerOffsets for a given segment from storage.
+type ledgerOffsetsLoader interface {
+	LoadSegmentLedgerOffsets(segmentID uint32) (*SegmentLedgerOffsets, error)
 }
 
 // eventBitmap32Index manages segmented 32-bit roaring bitmap indexes for event-level granularity.
@@ -87,12 +87,12 @@ type eventBitmap32Index struct {
 	// Dense ID assignment: per-segment event counters
 	segmentCounters map[uint32]*segmentEventCounter
 
-	// Ledger map loader for queries (range trimming)
-	ledgerMapLoader ledgerMapLoader
+	// Ledger offsets loader for queries (range trimming)
+	ledgerOffsetsLoader ledgerOffsetsLoader
 }
 
 // newEventBitmap32Index creates a new event-level bitmap32 index.
-func newEventBitmap32Index(loader bitmap32Loader, lmLoader ledgerMapLoader) *eventBitmap32Index {
+func newEventBitmap32Index(loader bitmap32Loader, lmLoader ledgerOffsetsLoader) *eventBitmap32Index {
 	return &eventBitmap32Index{
 		contracts:       make(map[[IndexKeySize]byte]*roaring.Bitmap),
 		topic0:          make(map[[IndexKeySize]byte]*roaring.Bitmap),
@@ -101,7 +101,7 @@ func newEventBitmap32Index(loader bitmap32Loader, lmLoader ledgerMapLoader) *eve
 		topic3:          make(map[[IndexKeySize]byte]*roaring.Bitmap),
 		loader:          loader,
 		segmentCounters: make(map[uint32]*segmentEventCounter),
-		ledgerMapLoader: lmLoader,
+		ledgerOffsetsLoader: lmLoader,
 	}
 }
 
@@ -204,7 +204,7 @@ func (bi *eventBitmap32Index) getSegmentWithStats(fieldIndex int, termKey [32]by
 
 // GetAndClearAllSegments gets and clears all hot segments and segment counters.
 // Serializes bitmaps using MarshalBinary (standard format, compatible with FromBuffer).
-// Also returns the segment event counters for ledger map flush.
+// Also returns the segment event counters for ledger offsets flush.
 func (bi *eventBitmap32Index) GetAndClearAllSegments() ([]bitmapChunk, map[uint32]*segmentEventCounter, error) {
 	type fieldMap struct {
 		m     map[[IndexKeySize]byte]*roaring.Bitmap
@@ -243,7 +243,7 @@ func (bi *eventBitmap32Index) GetAndClearAllSegments() ([]bitmapChunk, map[uint3
 
 	// Copy segment counters that have new events since the last flush.
 	// Skip stale entries (eventCounts all zero) to avoid overwriting
-	// previously correct ledger map files with empty data.
+	// previously correct ledger offsets files with empty data.
 	// nextDenseID must persist to ensure dense IDs continue after flush.
 	counters := make(map[uint32]*segmentEventCounter)
 	for segID, counter := range bi.segmentCounters {
@@ -298,7 +298,7 @@ func (bi *eventBitmap32Index) GetCurrentSegmentID() uint32 {
 // IndexStore — Coordinates In-Memory Index and Persistent Storage
 // =============================================================================
 
-// IndexFlusher persists bitmap segments and ledger maps from the in-memory index.
+// IndexFlusher persists bitmap segments and ledger offsetss from the in-memory index.
 type IndexFlusher interface {
 	Flush(segments []bitmapChunk, counters map[uint32]*segmentEventCounter, writeToStore bool) (map[uint32][]byte, error)
 	Close() error
@@ -324,7 +324,7 @@ type IndexStore struct {
 
 	// Write targets during Flush
 	segmentPath    string // base dir for segment files (empty = file writes disabled)
-	writeToRocksDB bool   // write bitmaps and ledger maps to RocksDB (default: true)
+	writeToRocksDB bool   // write bitmaps and ledger offsetss to RocksDB (default: true)
 
 	// Cache of flushed bitmap data, keyed by segment ID.
 	// Populated by Flush(), consumed by PopSegmentTerms().
@@ -334,22 +334,22 @@ type IndexStore struct {
 // NewIndexStore creates a new IndexStore with a pluggable flusher and loaders.
 // flusher — for persistence (RocksDB or segment-file-only).
 // loader — for cold bitmap loads during queries (can be nil for write-only).
-// lmLoader — for ledger map loads during queries (can be nil for write-only).
-func NewIndexStore(flusher IndexFlusher, loader bitmap32Loader, lmLoader ledgerMapLoader) *IndexStore {
+// lmLoader — for ledger offsets loads during queries (can be nil for write-only).
+func NewIndexStore(flusher IndexFlusher, loader bitmap32Loader, lmLoader ledgerOffsetsLoader) *IndexStore {
 	s := &IndexStore{flusher: flusher, writeToRocksDB: true}
 	s.bitmap = newEventBitmap32Index(loader, lmLoader)
 	return s
 }
 
-// SetWriteConfig configures where bitmaps and ledger maps are written during Flush().
+// SetWriteConfig configures where bitmaps and ledger offsetss are written during Flush().
 // segmentPath: base directory for segment flat files (empty = file writes disabled).
-// writeToRocksDB: if true, bitmaps and ledger maps are written to RocksDB.
+// writeToRocksDB: if true, bitmaps and ledger offsetss are written to RocksDB.
 func (s *IndexStore) SetWriteConfig(segmentPath string, writeToRocksDB bool) {
 	s.segmentPath = segmentPath
 	s.writeToRocksDB = writeToRocksDB
 }
 
-// Flush persists all hot segments and ledger maps.
+// Flush persists all hot segments and ledger offsetss.
 // Gets data from the in-memory index, passes to RocksDBIndexStore for RocksDB persistence,
 // then writes flat files if configured.
 func (s *IndexStore) Flush() error {
@@ -362,8 +362,8 @@ func (s *IndexStore) Flush() error {
 		return nil
 	}
 
-	// Persist via flusher (RocksDB or segment-file-only) and get back ledger map data
-	ledgerMapData, err := s.flusher.Flush(segments, counters, s.writeToRocksDB)
+	// Persist via flusher (RocksDB or segment-file-only) and get back ledger offsets data
+	ledgerOffsetsData, err := s.flusher.Flush(segments, counters, s.writeToRocksDB)
 	if err != nil {
 		return err
 	}
@@ -390,15 +390,15 @@ func (s *IndexStore) Flush() error {
 		}
 	}
 
-	// Write ledger maps to segment flat files if configured
+	// Write ledger offsetss to segment flat files if configured
 	if s.segmentPath != "" {
-		for segmentID, data := range ledgerMapData {
+		for segmentID, data := range ledgerOffsetsData {
 			dirPath := filepath.Join(s.segmentPath, fmt.Sprintf("%06d", segmentID))
 			if err := os.MkdirAll(dirPath, 0755); err != nil {
 				return fmt.Errorf("failed to create segment dir %s: %w", dirPath, err)
 			}
-			if err := writeFileAtomic(filepath.Join(dirPath, LedgerMapFileName), data); err != nil {
-				return fmt.Errorf("failed to write ledger map file for segment %d: %w", segmentID, err)
+			if err := writeFileAtomic(filepath.Join(dirPath, LedgerOffsetsFileName), data); err != nil {
+				return fmt.Errorf("failed to write ledger offsets file for segment %d: %w", segmentID, err)
 			}
 		}
 	}
