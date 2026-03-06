@@ -100,6 +100,22 @@ func cmdStats(cfg *config.Config, top, bottom int) {
 			bitmapStats.HotSegmentCount,
 			bitmapStats.HotSegmentCards,
 			float64(bitmapStats.HotSegmentMemBytes)/(1024*1024))
+		if len(bitmapStats.PerSegment) > 0 {
+			p.Printf("  Per-segment memory breakdown:\n")
+			p.Printf("    %-10s %8s %12s %12s %12s %12s %12s\n",
+				"Segment", "Entries", "BitmapData", "Overhead", "Counter", "Total", "Cards")
+			p.Printf("    ──────────────────────────────────────────────────────────────────────────────────\n")
+			for _, seg := range bitmapStats.PerSegment {
+				p.Printf("    %-10d %8d %10.2f KB %10.2f KB %10.2f KB %10.2f KB %12d\n",
+					seg.SegmentID,
+					seg.BitmapCount,
+					float64(seg.BitmapDataBytes)/1024,
+					float64(seg.OverheadBytes)/1024,
+					float64(seg.CounterBytes)/1024,
+					float64(seg.TotalEstimate)/1024,
+					seg.TotalCards)
+			}
+		}
 		p.Printf("  Stored bitmap segments:\n")
 		p.Printf("    Contracts: %d\n", bitmapStats.ContractIndexCount)
 		p.Printf("    Topics:    %d\n", bitmapStats.TopicIndexCount)

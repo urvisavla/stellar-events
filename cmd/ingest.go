@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"strings"
@@ -94,6 +96,14 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	if queueSize <= 0 {
 		queueSize = workers * 2
 	}
+
+	// Start pprof HTTP endpoint for heap profiling during ingestion
+	go func() {
+		fmt.Fprintf(os.Stderr, "pprof listening on localhost:6060\n")
+		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+			fmt.Fprintf(os.Stderr, "pprof server failed: %v\n", err)
+		}
+	}()
 
 	fmt.Fprintf(os.Stderr, "Ingesting events from ledgers %d to %d...\n", startLedger, endLedger)
 	fmt.Fprintf(os.Stderr, "Parallel mode: %d workers, batch size %d, queue size %d\n", workers, batchSize, queueSize)

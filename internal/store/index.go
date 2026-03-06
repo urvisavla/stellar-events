@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/RoaringBitmap/roaring"
@@ -289,6 +290,78 @@ func (bi *eventBitmap32Index) GetHotSegmentStats() (count int, totalCards uint64
 	return
 }
 
+// SegmentMemStats holds per-segment memory estimation for in-memory bitmap data.
+type SegmentMemStats struct {
+	SegmentID       uint32
+	BitmapCount     int    // entries across all 5 maps for this segment
+	BitmapDataBytes uint64 // sum of bitmap.GetSizeInBytes()
+	TotalCards      uint64 // sum of cardinalities
+	OverheadBytes   uint64 // map/key/pointer/object overhead (~194 per entry)
+	CounterBytes    uint64 // 40,004 if segmentEventCounter exists
+	TotalEstimate   uint64 // sum of all
+}
+
+// perEntryOverhead is the estimated overhead per map entry:
+// 36 (key) + 8 (pointer) + ~50 (map bucket) + ~100 (bitmap object) = 194
+const perEntryOverhead = 194
+
+// counterSize is the memory for a segmentEventCounter:
+// [SegmentSize]uint32 (4*10000=40000) + nextDenseID uint32 (4) = 40004
+const counterSize = 40004
+
+// GetPerSegmentMemStats returns per-segment memory estimates for all hot bitmap data.
+func (bi *eventBitmap32Index) GetPerSegmentMemStats() []SegmentMemStats {
+	type segAccum struct {
+		bitmapCount     int
+		bitmapDataBytes uint64
+		totalCards      uint64
+	}
+
+	accum := make(map[uint32]*segAccum)
+
+	allMaps := []map[[IndexKeySize]byte]*roaring.Bitmap{
+		bi.contracts, bi.topic0, bi.topic1, bi.topic2, bi.topic3,
+	}
+	for _, m := range allMaps {
+		for key, bitmap := range m {
+			segID := binary.BigEndian.Uint32(key[32:36])
+			a, ok := accum[segID]
+			if !ok {
+				a = &segAccum{}
+				accum[segID] = a
+			}
+			a.bitmapCount++
+			a.bitmapDataBytes += bitmap.GetSizeInBytes()
+			a.totalCards += bitmap.GetCardinality()
+		}
+	}
+
+	result := make([]SegmentMemStats, 0, len(accum))
+	for segID, a := range accum {
+		overhead := uint64(a.bitmapCount) * perEntryOverhead
+		var counterBytes uint64
+		if _, ok := bi.segmentCounters[segID]; ok {
+			counterBytes = counterSize
+		}
+		total := a.bitmapDataBytes + overhead + counterBytes
+		result = append(result, SegmentMemStats{
+			SegmentID:       segID,
+			BitmapCount:     a.bitmapCount,
+			BitmapDataBytes: a.bitmapDataBytes,
+			TotalCards:      a.totalCards,
+			OverheadBytes:   overhead,
+			CounterBytes:    counterBytes,
+			TotalEstimate:   total,
+		})
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].SegmentID < result[j].SegmentID
+	})
+
+	return result
+}
+
 // GetCurrentSegmentID returns the current segment ID being written to.
 func (bi *eventBitmap32Index) GetCurrentSegmentID() uint32 {
 	return bi.currentSegmentID
@@ -435,6 +508,11 @@ func (s *IndexStore) AssignDenseLocalID(segmentID uint32, ledger uint32) uint32 
 // GetHotSegmentStats returns statistics about hot segments.
 func (s *IndexStore) GetHotSegmentStats() (count int, totalCards uint64, memBytes uint64) {
 	return s.bitmap.GetHotSegmentStats()
+}
+
+// GetPerSegmentMemStats returns per-segment memory estimates.
+func (s *IndexStore) GetPerSegmentMemStats() []SegmentMemStats {
+	return s.bitmap.GetPerSegmentMemStats()
 }
 
 // GetCurrentSegmentID returns the current segment ID being written to.

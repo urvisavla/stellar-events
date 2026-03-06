@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"runtime"
 	"sort"
 	"sync"
 	"syscall"
@@ -563,15 +564,35 @@ func (es *Store) StoreEvents(events []*event.IngestEvent, opts *StoreOptions) (i
 
 // finalizeCompletedSegment flushes in-memory bitmap indexes (for both RocksDB
 // and flat file paths) and, when segment files are configured, writes flat file
-// indexes for the given segment.
+// indexes for the given segment. Logs heap memory freed by the flush.
 func (es *Store) finalizeCompletedSegment(segmentID uint32) error {
+	// Measure heap before flush
+	runtime.GC()
+	var memBefore runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
+
 	if err := es.indexStore.Flush(); err != nil {
 		return fmt.Errorf("flush bitmap indexes: %w", err)
 	}
-	if es.segmentPath == "" {
-		return nil
+
+	if es.segmentPath != "" {
+		if err := FinalizeSegment(es.indexStore, es.segmentPath, segmentID, es.segmentDataWriter); err != nil {
+			return err
+		}
 	}
-	return FinalizeSegment(es.indexStore, es.segmentPath, segmentID, es.segmentDataWriter)
+
+	// Measure heap after flush
+	runtime.GC()
+	var memAfter runtime.MemStats
+	runtime.ReadMemStats(&memAfter)
+
+	beforeMB := memBefore.HeapAlloc / (1024 * 1024)
+	afterMB := memAfter.HeapAlloc / (1024 * 1024)
+	freedMB := int64(beforeMB) - int64(afterMB)
+	fmt.Fprintf(os.Stderr, "segment %d finalized: heap freed %d MB (before: %d MB, after: %d MB)\n",
+		segmentID, freedMB, beforeMB, afterMB)
+
+	return nil
 }
 
 // Finalize flushes in-memory bitmap indexes and finalizes the last segment.

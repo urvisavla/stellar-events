@@ -135,12 +135,13 @@ type EventStats struct {
 
 // BitmapStats holds statistics about bitmap indexes.
 type BitmapStats struct {
-	CurrentSegmentID   uint32 `json:"current_segment_id"`
-	HotSegmentCount    int    `json:"hot_segment_count"`
-	HotSegmentCards    uint64 `json:"hot_segment_cards"`
-	HotSegmentMemBytes uint64 `json:"hot_segment_mem_bytes"`
-	ContractIndexCount int64  `json:"contract_index_count"`
-	TopicIndexCount    int64  `json:"topic_index_count"` // All topics (non-positional)
+	CurrentSegmentID   uint32           `json:"current_segment_id"`
+	HotSegmentCount    int              `json:"hot_segment_count"`
+	HotSegmentCards    uint64           `json:"hot_segment_cards"`
+	HotSegmentMemBytes uint64           `json:"hot_segment_mem_bytes"`
+	ContractIndexCount int64            `json:"contract_index_count"`
+	TopicIndexCount    int64            `json:"topic_index_count"` // All topics (non-positional)
+	PerSegment         []SegmentMemStats `json:"per_segment,omitempty"`
 }
 
 // LedgerTxStats holds statistics about transactions per ledger.
@@ -1173,9 +1174,10 @@ func (es *Store) GetBitmapStats() *BitmapStats {
 	}
 	count, cards, memBytes := es.indexStore.GetHotSegmentStats()
 	return &BitmapStats{
-		CurrentSegmentID:    es.indexStore.GetCurrentSegmentID(),
+		CurrentSegmentID:   es.indexStore.GetCurrentSegmentID(),
 		HotSegmentCount:    count,
 		HotSegmentCards:    cards,
 		HotSegmentMemBytes: memBytes,
+		PerSegment:         es.indexStore.GetPerSegmentMemStats(),
 	}
 }
