@@ -46,8 +46,9 @@ func runInspect(cfg *config.Config, args []string) {
 var indexNames = [5]string{"contracts", "topic0", "topic1", "topic2", "topic3"}
 
 type segmentInfo struct {
-	id     string
-	counts [5]uint64 // contracts, topic0..topic3
+	id         string
+	counts     [5]uint64 // contracts, topic0..topic3
+	eventCount uint32    // total events from segment.offsets
 }
 
 func cmdInspect(cfg *config.Config, segmentFilter int, verbose bool) {
@@ -127,6 +128,13 @@ func cmdInspect(cfg *config.Config, segmentFilter int, verbose bool) {
 			idx.Close()
 		}
 
+		// Read event count from segment.offsets
+		offsetsPath := filepath.Join(dirPath, store.LedgerOffsetsFileName)
+		if data, err := os.ReadFile(offsetsPath); err == nil && len(data) == store.SegmentLedgerOffsetsSize {
+			lm := &store.SegmentLedgerOffsets{Data: data}
+			info.eventCount = lm.TotalEvents()
+		}
+
 		for i := range totals {
 			totals[i] += info.counts[i]
 		}
@@ -134,26 +142,28 @@ func cmdInspect(cfg *config.Config, segmentFilter int, verbose bool) {
 	}
 
 	// Print table
-	p.Printf("\n%-8s  %10s  %10s  %10s  %10s  %10s  %10s\n",
-		"segment", "contracts", "topic0", "topic1", "topic2", "topic3", "total")
-	p.Printf("%s\n", strings.Repeat("─", 78))
+	p.Printf("\n%-8s  %10s  %10s  %10s  %10s  %10s  %10s  %10s\n",
+		"segment", "events", "contracts", "topic0", "topic1", "topic2", "topic3", "terms")
+	p.Printf("%s\n", strings.Repeat("─", 90))
 
+	var totalEvents uint64
 	for _, seg := range segments {
 		var rowTotal uint64
 		for _, c := range seg.counts {
 			rowTotal += c
 		}
-		p.Printf("%-8s  %10d  %10d  %10d  %10d  %10d  %10d\n",
-			seg.id, seg.counts[0], seg.counts[1], seg.counts[2], seg.counts[3], seg.counts[4], rowTotal)
+		totalEvents += uint64(seg.eventCount)
+		p.Printf("%-8s  %10d  %10d  %10d  %10d  %10d  %10d  %10d\n",
+			seg.id, seg.eventCount, seg.counts[0], seg.counts[1], seg.counts[2], seg.counts[3], seg.counts[4], rowTotal)
 	}
 
 	var grandTotal uint64
 	for _, c := range totals {
 		grandTotal += c
 	}
-	p.Printf("%s\n", strings.Repeat("─", 78))
-	p.Printf("%-8s  %10d  %10d  %10d  %10d  %10d  %10d\n",
-		"TOTAL", totals[0], totals[1], totals[2], totals[3], totals[4], grandTotal)
+	p.Printf("%s\n", strings.Repeat("─", 90))
+	p.Printf("%-8s  %10d  %10d  %10d  %10d  %10d  %10d  %10d\n",
+		"TOTAL", totalEvents, totals[0], totals[1], totals[2], totals[3], totals[4], grandTotal)
 
 	// Verbose: per-term bitmap stats
 	if verbose {
