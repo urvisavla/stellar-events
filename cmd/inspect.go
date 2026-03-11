@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/RoaringBitmap/roaring"
+	"github.com/tamir/events-analysis/packfile"
 	"github.com/tamirms/streamhash"
 	"github.com/urvisavla/stellar-events/internal/config"
 	"github.com/urvisavla/stellar-events/internal/store"
@@ -43,12 +44,10 @@ func runInspect(cfg *config.Config, args []string) {
 	cmdInspect(cfg, *segment, *verbose)
 }
 
-var indexNames = [5]string{"contracts", "topic0", "topic1", "topic2", "topic3"}
-
 type segmentInfo struct {
 	id         string
-	counts     [5]uint64 // contracts, topic0..topic3
-	eventCount uint32    // total events from segment.offsets
+	termCount  uint64 // combined term count from index.hash
+	eventCount uint32 // total events from events.pack appData
 }
 
 func cmdInspect(cfg *config.Config, segmentFilter int, verbose bool) {
@@ -107,77 +106,107 @@ func cmdInspect(cfg *config.Config, segmentFilter int, verbose bool) {
 	}
 
 	var segments []segmentInfo
-	var totals [5]uint64
+	var totalTerms uint64
 
 	for _, dir := range segDirs {
 		dirPath := filepath.Join(basePath, dir)
 		var info segmentInfo
 		info.id = dir
 
-		for i, name := range indexNames {
-			hashPath := filepath.Join(dirPath, name+".hash")
-			if _, err := os.Stat(hashPath); err != nil {
-				continue
-			}
+		hashPath := filepath.Join(dirPath, "index.hash")
+		if _, err := os.Stat(hashPath); err == nil {
 			idx, err := streamhash.Open(hashPath)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to open %s: %v\n", hashPath, err)
-				continue
+			} else {
+				info.termCount = idx.NumKeys()
+				idx.Close()
 			}
-			info.counts[i] = idx.NumKeys()
-			idx.Close()
 		}
 
-		// Read event count from segment.offsets
-		offsetsPath := filepath.Join(dirPath, store.LedgerOffsetsFileName)
-		if data, err := os.ReadFile(offsetsPath); err == nil && len(data) == store.SegmentLedgerOffsetsSize {
-			lm := &store.SegmentLedgerOffsets{Data: data}
-			info.eventCount = lm.TotalEvents()
+		// Read event count from events.pack appData (embedded ledger offsets)
+		eventsPath := filepath.Join(dirPath, store.EventsFileName)
+		if _, err := os.Stat(eventsPath); err == nil {
+			pr := packfile.Open(eventsPath)
+			if appData, err := pr.AppData(); err == nil && len(appData) == store.SegmentLedgerOffsetsSize {
+				lm := &store.SegmentLedgerOffsets{Data: appData}
+				info.eventCount = lm.TotalEvents()
+			}
+			pr.Close()
 		}
 
-		for i := range totals {
-			totals[i] += info.counts[i]
-		}
+		totalTerms += info.termCount
 		segments = append(segments, info)
 	}
 
 	// Print table
-	p.Printf("\n%-8s  %10s  %10s  %10s  %10s  %10s  %10s  %10s\n",
-		"segment", "events", "contracts", "topic0", "topic1", "topic2", "topic3", "terms")
-	p.Printf("%s\n", strings.Repeat("─", 90))
+	p.Printf("\n%-8s  %10s  %10s\n",
+		"segment", "events", "terms")
+	p.Printf("%s\n", strings.Repeat("─", 32))
 
 	var totalEvents uint64
 	for _, seg := range segments {
-		var rowTotal uint64
-		for _, c := range seg.counts {
-			rowTotal += c
-		}
 		totalEvents += uint64(seg.eventCount)
-		p.Printf("%-8s  %10d  %10d  %10d  %10d  %10d  %10d  %10d\n",
-			seg.id, seg.eventCount, seg.counts[0], seg.counts[1], seg.counts[2], seg.counts[3], seg.counts[4], rowTotal)
+		p.Printf("%-8s  %10d  %10d\n",
+			seg.id, seg.eventCount, seg.termCount)
 	}
 
-	var grandTotal uint64
-	for _, c := range totals {
-		grandTotal += c
-	}
-	p.Printf("%s\n", strings.Repeat("─", 90))
-	p.Printf("%-8s  %10d  %10d  %10d  %10d  %10d  %10d  %10d\n",
-		"TOTAL", totalEvents, totals[0], totals[1], totals[2], totals[3], totals[4], grandTotal)
+	p.Printf("%s\n", strings.Repeat("─", 32))
+	p.Printf("%-8s  %10d  %10d\n",
+		"TOTAL", totalEvents, totalTerms)
 
-	// Verbose: per-term bitmap stats
+	// Verbose: per-segment event pack + bitmap stats
 	if verbose {
-		p.Printf("\n=== Per-Index Bitmap Stats ===\n")
+		p.Printf("\n=== Per-Segment Stats ===\n")
 		for _, seg := range segments {
 			dirPath := filepath.Join(basePath, seg.id)
-			for i, name := range indexNames {
-				if seg.counts[i] == 0 {
-					continue
-				}
-				printBitmapStats(p, dirPath, name, seg.id, seg.counts[i])
+			printEventPackStats(p, dirPath, seg.id)
+			if seg.termCount > 0 {
+				printBitmapStats(p, dirPath, "index", seg.id, seg.termCount)
 			}
 		}
 	}
+}
+
+func recordFormatString(f packfile.RecordFormat) string {
+	switch f {
+	case packfile.Compressed:
+		return "compressed"
+	case packfile.Uncompressed:
+		return "uncompressed"
+	case packfile.Raw:
+		return "raw"
+	default:
+		return fmt.Sprintf("unknown(%d)", f)
+	}
+}
+
+func printEventPackStats(p *message.Printer, dirPath, segID string) {
+	eventsPath := filepath.Join(dirPath, store.EventsFileName)
+	fi, err := os.Stat(eventsPath)
+	if err != nil {
+		return // no events.pack in this segment
+	}
+	fileSize := fi.Size()
+
+	pr := packfile.Open(eventsPath)
+	defer pr.Close()
+
+	trailer, err := pr.Trailer()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to read trailer for %s: %v\n", eventsPath, err)
+		return
+	}
+
+	avgBytes := float64(0)
+	if trailer.TotalItems > 0 {
+		avgBytes = float64(fileSize) / float64(trailer.TotalItems)
+	}
+
+	p.Printf("\n  [%s/events.pack] %d events, %d records × %d\n",
+		segID, trailer.TotalItems, trailer.RecordCount, trailer.RecordSize)
+	p.Printf("    File size: %s   Avg: %s/event   Format: %s\n",
+		formatBytes(fileSize), formatBytes(int64(avgBytes)), recordFormatString(trailer.Format))
 }
 
 func printBitmapStats(p *message.Printer, dirPath, name, segID string, numKeys uint64) {
@@ -217,8 +246,14 @@ func printBitmapStats(p *message.Printer, dirPath, name, segID string, numKeys u
 			continue
 		}
 
-		bitmapBytes := packMmap.Data()[bitmapStart:bitmapEnd]
+		recordBytes := packMmap.Data()[bitmapStart:bitmapEnd]
 		byteLen := bitmapEnd - bitmapStart
+
+		// Skip 5-byte prefix (4-byte fingerprint + 1-byte fieldIndex)
+		if len(recordBytes) < 5 {
+			continue
+		}
+		bitmapBytes := recordBytes[5:]
 
 		bm := roaring.New()
 		if err := bm.UnmarshalBinary(bitmapBytes); err != nil {
