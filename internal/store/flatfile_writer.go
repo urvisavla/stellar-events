@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/tamirms/streamhash"
 	"github.com/zeebo/xxh3"
@@ -40,16 +41,18 @@ func FinalizeSegment(indexStore *IndexStore, segmentPath string, segmentID uint3
 		return fmt.Errorf("no cached terms for segment %d", segmentID)
 	}
 
-	// Write MPHF bitmap indexes (.hash/.pack) for this segment
+	t0 := time.Now()
 	if err := WriteSegmentDir(segmentPath, segmentID, cached.Contracts, cached.Topics); err != nil {
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "    [segment %d] WriteSegmentDir: %v\n", segmentID, time.Since(t0))
 
-	// Finalize segment data chunk with ledger offsets as appData
 	if sdw != nil && sdw.IsActive() && sdw.ChunkID() == segmentID {
+		t1 := time.Now()
 		if err := sdw.FinalizeChunk(cached.LedgerOffsetsData); err != nil {
 			return fmt.Errorf("failed to finalize segment data chunk %d: %w", segmentID, err)
 		}
+		fmt.Fprintf(os.Stderr, "    [segment %d] FinalizeChunk: %v\n", segmentID, time.Since(t1))
 	}
 
 	return nil
@@ -161,11 +164,16 @@ func (w *SegmentDataWriter) IsActive() bool {
 //
 // Directory structure:
 //   <base_path>/NNNNNN/
-//     index.hash         - single streamhash MPHF index (17-byte keys → slots)
+//     index.hash         - single streamhash MPHF index (32-byte keys → slots)
 //     index.pack         - all bitmaps ordered by MPHF slot + u64 LE offset trailer
 //     events.pack        - event data (ledger offsets embedded as packfile appData)
 //
-// Key format: [fieldIndex:1][termHash:16] = 17 bytes
+// Key format: [PreHash(compositeKey):16][termHash:16] = 32 bytes
+//   compositeKey = [termHash:16][fieldIndex:1] (17 bytes)
+//   PreHash produces uniform 16-byte keys via xxhash128, ensuring both
+//   good block distribution and unique (k0, k1) pairs for different fieldIndex values.
+//   The second half stores the original termHash for full 32-byte key size.
+//
 //   fieldIndex 0x00 = contract
 //   fieldIndex 0x01 = topic position 0
 //   fieldIndex 0x02 = topic position 1
@@ -177,7 +185,7 @@ func (w *SegmentDataWriter) IsActive() bool {
 //   [offset_0: u64 LE][offset_1: u64 LE]...[offset_N: u64 LE]   ← (N+1) entries
 //
 // Each record: [fingerprint:4][fieldIndex:1][bitmap bytes]
-// Fingerprint: first 4 bytes of xxh3.Hash(queryKey) where queryKey is [fieldIndex][termHash].
+// Fingerprint: first 4 bytes of xxh3.Hash(streamhashKey).
 //
 // Lookup:
 //   1. hashIdx.Query(queryKey) → slot (fingerprint mismatch = not found)
@@ -187,14 +195,33 @@ func (w *SegmentDataWriter) IsActive() bool {
 //   5. roaring.UnmarshalBinary(bytes)
 
 
-// indexPackEntry holds a 17-byte key and its serialized bitmap data for the unified index.
+// indexPackEntry holds a 32-byte key and its serialized bitmap data for the unified index.
 type indexPackEntry struct {
-	Key        []byte // [fieldIndex:1][termHash:16] = 17 bytes
+	Key        []byte // [xxh3(composite):16][termHash:16] = 32 bytes
+	FieldIndex byte   // fieldIndex (0x00=contract, 0x01-0x04=topic positions)
 	BitmapData []byte
 }
 
+// makeStreamhashKey builds a 32-byte streamhash key from a termHash and fieldIndex.
+// Format: [xxh3(composite):16][termHash:16] where composite = [termHash:16][fieldIndex:1].
+// xxh3.Hash128 ensures unique (k0, k1) pairs even when the same termHash appears in multiple fields.
+func makeStreamhashKey(termHash [16]byte, fieldIndex byte) []byte {
+	// Build 17-byte composite key: [termHash:16][fieldIndex:1]
+	var composite [17]byte
+	copy(composite[:16], termHash[:])
+	composite[16] = fieldIndex
+
+	// Hash composite into first 16 bytes, store original termHash in second half
+	h := xxh3.Hash128(composite[:])
+	key := make([]byte, 32)
+	binary.LittleEndian.PutUint64(key[0:8], h.Lo)
+	binary.LittleEndian.PutUint64(key[8:16], h.Hi)
+	copy(key[16:32], termHash[:])
+	return key
+}
+
 // WriteSegmentDir writes a single MPHF bitmap index (index.hash + index.pack) for a segment.
-// All fields (contracts + 4 topic positions) are merged into one index using 17-byte keys.
+// All fields (contracts + 4 topic positions) are merged into one index using 32-byte keys.
 func WriteSegmentDir(basePath string, segmentID uint32, contractTerms []SegmentTermData, topicsByPos [4][]SegmentTermData) error {
 	dirName := fmt.Sprintf("%06d", segmentID)
 	dirPath := filepath.Join(basePath, dirName)
@@ -203,7 +230,7 @@ func WriteSegmentDir(basePath string, segmentID uint32, contractTerms []SegmentT
 		return fmt.Errorf("failed to create segment dir %s: %w", dirPath, err)
 	}
 
-	// Collect all terms into a single slice with 17-byte keys
+	// Collect all terms into a single slice with 32-byte keys
 	totalTerms := len(contractTerms)
 	for pos := 0; pos < 4; pos++ {
 		totalTerms += len(topicsByPos[pos])
@@ -217,25 +244,26 @@ func WriteSegmentDir(basePath string, segmentID uint32, contractTerms []SegmentT
 
 	// Contracts: fieldIndex = 0x00
 	for _, t := range contractTerms {
-		key := make([]byte, 17)
-		key[0] = 0x00
-		copy(key[1:], t.TermHash[:])
-		entries = append(entries, indexPackEntry{Key: key, BitmapData: t.BitmapData})
+		entries = append(entries, indexPackEntry{
+			Key:        makeStreamhashKey(t.TermHash, 0x00),
+			FieldIndex: 0x00,
+			BitmapData: t.BitmapData,
+		})
 	}
 
 	// Topics: fieldIndex = 0x01..0x04
 	for pos := 0; pos < 4; pos++ {
 		for _, t := range topicsByPos[pos] {
-			key := make([]byte, 17)
-			key[0] = byte(pos + 1)
-			copy(key[1:], t.TermHash[:])
-			entries = append(entries, indexPackEntry{Key: key, BitmapData: t.BitmapData})
+			fi := byte(pos + 1)
+			entries = append(entries, indexPackEntry{
+				Key:        makeStreamhashKey(t.TermHash, fi),
+				FieldIndex: fi,
+				BitmapData: t.BitmapData,
+			})
 		}
 	}
 
-	// Pre-sort entries by key bytes so streamhash receives them in block order.
-	// Lexicographic byte order on the 17-byte keys matches streamhash's expected
-	// order because the first 8 bytes are big-endian when read as ReverseBytes64(LE).
+	// Pre-sort entries by key bytes for streamhash block order.
 	sort.Slice(entries, func(i, j int) bool {
 		return bytes.Compare(entries[i].Key, entries[j].Key) < 0
 	})
@@ -244,29 +272,34 @@ func WriteSegmentDir(basePath string, segmentID uint32, contractTerms []SegmentT
 }
 
 // writeIndexPack builds index.hash (streamhash MPHF) and index.pack (bitmaps + offset trailer)
-// from a unified set of 33-byte keyed entries.
+// from a unified set of 32-byte keyed entries.
 func writeIndexPack(dirPath string, entries []indexPackEntry) error {
 	n := uint64(len(entries))
 	if n == 0 {
 		return nil
 	}
 
+	fmt.Fprintf(os.Stderr, "      [writeIndexPack] %d entries\n", n)
+
 	hashPath := filepath.Join(dirPath, "index.hash")
 	packPath := filepath.Join(dirPath, "index.pack")
 	hashTmpPath := hashPath + ".tmp"
 	packTmpPath := packPath + ".tmp"
 
-	// Build .hash using streamhash (entries are pre-sorted by key bytes)
+	// Build .hash using streamhash
+	tNew := time.Now()
 	builder, err := streamhash.NewBuilder(
 		context.Background(),
 		hashTmpPath,
 		n,
-		streamhash.WithFingerprint(2),
+		streamhash.WithUnsortedInput(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create streamhash builder: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "      [writeIndexPack] NewBuilder: %v\n", time.Since(tNew))
 
+	tAdd := time.Now()
 	for _, e := range entries {
 		if err := builder.AddKey(e.Key, 0); err != nil {
 			builder.Close()
@@ -274,19 +307,24 @@ func writeIndexPack(dirPath string, entries []indexPackEntry) error {
 			return fmt.Errorf("failed to add key to streamhash: %w", err)
 		}
 	}
+	fmt.Fprintf(os.Stderr, "      [writeIndexPack] AddKey ×%d: %v\n", n, time.Since(tAdd))
 
+	tFinish := time.Now()
 	if err := builder.Finish(); err != nil {
 		builder.Close()
 		os.Remove(hashTmpPath)
 		return fmt.Errorf("failed to finish streamhash: %w", err)
 	}
 	builder.Close()
+	fmt.Fprintf(os.Stderr, "      [writeIndexPack] Finish: %v\n", time.Since(tFinish))
 
 	// Fsync .hash tmp
+	tFsync := time.Now()
 	if err := fsyncFile(hashTmpPath); err != nil {
 		os.Remove(hashTmpPath)
 		return fmt.Errorf("failed to fsync index.hash: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "      [writeIndexPack] fsync .hash: %v\n", time.Since(tFsync))
 
 	// Open .hash to get slot assignments
 	idx, err := streamhash.Open(hashTmpPath)
@@ -296,7 +334,8 @@ func writeIndexPack(dirPath string, entries []indexPackEntry) error {
 	}
 	defer idx.Close()
 
-	// Map each entry to its MPHF slot, computing fingerprint from the 17-byte key
+	// Map each entry to its MPHF slot, computing fingerprint from the 32-byte key
+	tQuery := time.Now()
 	type slotEntry struct {
 		slot        uint64
 		fingerprint [4]byte
@@ -314,8 +353,9 @@ func writeIndexPack(dirPath string, entries []indexPackEntry) error {
 		fp := xxh3.Hash(e.Key)
 		var fpBytes [4]byte
 		binary.LittleEndian.PutUint32(fpBytes[:], uint32(fp))
-		slotData[i] = slotEntry{slot: slot, fingerprint: fpBytes, fieldIndex: e.Key[0], data: e.BitmapData}
+		slotData[i] = slotEntry{slot: slot, fingerprint: fpBytes, fieldIndex: e.FieldIndex, data: e.BitmapData}
 	}
+	fmt.Fprintf(os.Stderr, "      [writeIndexPack] slot queries: %v\n", time.Since(tQuery))
 
 	// Sort by slot to write bitmaps in MPHF slot order
 	sort.Slice(slotData, func(i, j int) bool {
@@ -323,6 +363,7 @@ func writeIndexPack(dirPath string, entries []indexPackEntry) error {
 	})
 
 	// Build .pack: [fp:4][field:1][bitmap]... per record, then (N+1) u64 LE offset trailer
+	tPack := time.Now()
 	packFile, err := os.Create(packTmpPath)
 	if err != nil {
 		os.Remove(hashTmpPath)
@@ -370,8 +411,10 @@ func writeIndexPack(dirPath string, entries []indexPackEntry) error {
 		os.Remove(packTmpPath)
 		return fmt.Errorf("failed to write trailer to index.pack: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "      [writeIndexPack] pack write: %v\n", time.Since(tPack))
 
 	// Fsync and close pack file
+	tSync := time.Now()
 	if err := packFile.Sync(); err != nil {
 		packFile.Close()
 		os.Remove(hashTmpPath)
@@ -379,6 +422,7 @@ func writeIndexPack(dirPath string, entries []indexPackEntry) error {
 		return fmt.Errorf("failed to fsync index.pack: %w", err)
 	}
 	packFile.Close()
+	fmt.Fprintf(os.Stderr, "      [writeIndexPack] fsync+close .pack: %v\n", time.Since(tSync))
 
 	// Atomic rename both files
 	if err := os.Rename(hashTmpPath, hashPath); err != nil {

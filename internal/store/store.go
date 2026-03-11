@@ -568,31 +568,35 @@ func (es *Store) StoreEvents(events []*event.IngestEvent, opts *StoreOptions) (i
 // and flat file paths) and, when segment files are configured, writes flat file
 // indexes for the given segment. Logs heap memory freed by the flush.
 func (es *Store) finalizeCompletedSegment(segmentID uint32) error {
-	// Measure heap before flush
+	t0 := time.Now()
+
 	runtime.GC()
 	var memBefore runtime.MemStats
 	runtime.ReadMemStats(&memBefore)
+	fmt.Fprintf(os.Stderr, "  [finalize %d] GC+memstats: %v\n", segmentID, time.Since(t0))
 
+	t1 := time.Now()
 	if err := es.indexStore.Flush(); err != nil {
 		return fmt.Errorf("flush bitmap indexes: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "  [finalize %d] indexStore.Flush: %v\n", segmentID, time.Since(t1))
 
 	if es.segmentPath != "" {
+		t2 := time.Now()
 		if err := FinalizeSegment(es.indexStore, es.segmentPath, segmentID, es.segmentDataWriter); err != nil {
 			return err
 		}
+		fmt.Fprintf(os.Stderr, "  [finalize %d] FinalizeSegment: %v\n", segmentID, time.Since(t2))
 	}
 
-	// Measure heap after flush
 	runtime.GC()
 	var memAfter runtime.MemStats
 	runtime.ReadMemStats(&memAfter)
-
 	beforeMB := memBefore.HeapAlloc / (1024 * 1024)
 	afterMB := memAfter.HeapAlloc / (1024 * 1024)
 	freedMB := int64(beforeMB) - int64(afterMB)
-	fmt.Fprintf(os.Stderr, "segment %d finalized: heap freed %d MB (before: %d MB, after: %d MB)\n",
-		segmentID, freedMB, beforeMB, afterMB)
+	fmt.Fprintf(os.Stderr, "  [finalize %d] total: %v, heap freed %d MB (%d→%d)\n",
+		segmentID, time.Since(t0), freedMB, beforeMB, afterMB)
 
 	return nil
 }

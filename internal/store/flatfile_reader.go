@@ -189,7 +189,7 @@ func (r *SegmentReader) loadLedgerOffsetsFromFile(segmentID uint32) (*SegmentLed
 
 // loadBitmapFromFile loads a bitmap from the unified segment MPHF index files via reader cache.
 // fieldIndex: 0=contracts, 1-4=topic positions 0-3.
-// Uses 17-byte query keys: [fieldIndex:1][termHash:16].
+// Uses 32-byte query keys: [PreHash(compositeKey):16][termHash:16].
 func (r *SegmentReader) loadBitmapFromFile(segmentID uint32, fieldIndex int, termKey [16]byte) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
 	dirName := fmt.Sprintf("%06d", segmentID)
 	dirPath := filepath.Join(r.basePath, dirName)
@@ -197,10 +197,8 @@ func (r *SegmentReader) loadBitmapFromFile(segmentID uint32, fieldIndex int, ter
 	hashPath := filepath.Join(dirPath, "index.hash")
 	packPath := filepath.Join(dirPath, "index.pack")
 
-	// Build 17-byte query key: [fieldIndex][termHash]
-	queryKey := make([]byte, 17)
-	queryKey[0] = byte(fieldIndex)
-	copy(queryKey[1:], termKey[:])
+	// Build 32-byte query key: [PreHash(compositeKey):16][termHash:16]
+	queryKey := makeStreamhashKey(termKey, byte(fieldIndex))
 
 	// Get cached MPHF index
 	readStart := time.Now()
@@ -209,10 +207,9 @@ func (r *SegmentReader) loadBitmapFromFile(segmentID uint32, fieldIndex int, ter
 		return nil, 0, 0, 0, err
 	}
 
-	// O(1) MPHF lookup with fingerprint check
+	// O(1) MPHF lookup (no streamhash fingerprint — false positives caught by pack-level xxh3 check)
 	slot, err := hashIdx.Query(queryKey)
 	if err != nil {
-		// Fingerprint mismatch or not found — term not in index
 		return nil, 0, time.Since(readStart), 0, nil
 	}
 
