@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -232,6 +233,13 @@ func WriteSegmentDir(basePath string, segmentID uint32, contractTerms []SegmentT
 		}
 	}
 
+	// Pre-sort entries by key bytes so streamhash receives them in block order.
+	// Lexicographic byte order on the 17-byte keys matches streamhash's expected
+	// order because the first 8 bytes are big-endian when read as ReverseBytes64(LE).
+	sort.Slice(entries, func(i, j int) bool {
+		return bytes.Compare(entries[i].Key, entries[j].Key) < 0
+	})
+
 	return writeIndexPack(dirPath, entries)
 }
 
@@ -248,13 +256,12 @@ func writeIndexPack(dirPath string, entries []indexPackEntry) error {
 	hashTmpPath := hashPath + ".tmp"
 	packTmpPath := packPath + ".tmp"
 
-	// Build .hash using streamhash with unsorted input
+	// Build .hash using streamhash (entries are pre-sorted by key bytes)
 	builder, err := streamhash.NewBuilder(
 		context.Background(),
 		hashTmpPath,
 		n,
 		streamhash.WithFingerprint(2),
-		streamhash.WithUnsortedInput(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create streamhash builder: %w", err)
