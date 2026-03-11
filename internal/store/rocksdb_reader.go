@@ -14,21 +14,21 @@ import (
 	"github.com/urvisavla/stellar-events/internal/query"
 )
 
-// encodeIndexKeyWithSegment creates a 36-byte index key from term key and segment ID.
-func encodeIndexKeyWithSegment(termKey [32]byte, segmentID uint32) []byte {
+// encodeIndexKeyWithSegment creates a 20-byte index key from term key and segment ID.
+func encodeIndexKeyWithSegment(termKey [16]byte, segmentID uint32) []byte {
 	key := make([]byte, IndexKeySize)
-	copy(key[0:32], termKey[:])
-	binary.BigEndian.PutUint32(key[32:36], segmentID)
+	copy(key[0:16], termKey[:])
+	binary.BigEndian.PutUint32(key[16:20], segmentID)
 	return key
 }
 
-// encodeTopicIndexKey creates a 37-byte RocksDB key for topic CF entries.
-// Format: [pos:1][termHash:32][segmentID:4]
-func encodeTopicIndexKey(pos int, termKey [32]byte, segmentID uint32) []byte {
-	key := make([]byte, 37)
+// encodeTopicIndexKey creates a 21-byte RocksDB key for topic CF entries.
+// Format: [pos:1][termHash:16][segmentID:4]
+func encodeTopicIndexKey(pos int, termKey [16]byte, segmentID uint32) []byte {
+	key := make([]byte, 21)
 	key[0] = byte(pos)
-	copy(key[1:33], termKey[:])
-	binary.BigEndian.PutUint32(key[33:37], segmentID)
+	copy(key[1:17], termKey[:])
+	binary.BigEndian.PutUint32(key[17:21], segmentID)
 	return key
 }
 
@@ -101,7 +101,7 @@ func (s *RocksDBIndexStore) LoadSegmentLedgerOffsets(segmentID uint32) (*Segment
 
 // LoadBitmap32SegmentWithTiming loads a segment using FromBuffer for near-zero-cost decode.
 // fieldIndex: 0=contracts, 1-4=topic positions 0-3.
-func (s *RocksDBIndexStore) LoadBitmap32SegmentWithTiming(fieldIndex int, termKey [32]byte, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
+func (s *RocksDBIndexStore) LoadBitmap32SegmentWithTiming(fieldIndex int, termKey [16]byte, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
 	isContract := fieldIndex == 0
 	var dbKey []byte
 	if isContract {
@@ -179,9 +179,9 @@ func (s *RocksDBIndexStore) Flush(
 			dbKey = seg.Key
 		} else {
 			pos := seg.FieldIndex - 1
-			var termKey [32]byte
-			copy(termKey[:], seg.Key[0:32])
-			segmentID := binary.BigEndian.Uint32(seg.Key[32:36])
+			var termKey [16]byte
+			copy(termKey[:], seg.Key[0:16])
+			segmentID := binary.BigEndian.Uint32(seg.Key[16:20])
 			dbKey = encodeTopicIndexKey(pos, termKey, segmentID)
 		}
 
@@ -275,7 +275,7 @@ func NewRocksDBReader(bitmap *eventBitmap32Index, fetcher EventFetcher, lmLoader
 
 // LoadTermBitmap loads a bitmap for a specific term+segment, trimmed to ledger range.
 // fieldIndex: 0=contracts, 1-4=topic positions 0-3.
-func (l *RocksDBReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey [32]byte,
+func (l *RocksDBReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey [16]byte,
 	startLedger, endLedger uint32) (*roaring.Bitmap, BitmapLoadStats, error) {
 
 	// Load bitmap for this single segment (checks hot cache first, then RocksDB).

@@ -12,8 +12,10 @@ import (
 
 	"github.com/RoaringBitmap/roaring"
 	"github.com/tamirms/streamhash"
+	"github.com/zeebo/xxh3"
 
 	"github.com/tamir/events-analysis/eventstore"
+	"github.com/tamir/events-analysis/packfile"
 
 	"github.com/urvisavla/stellar-events/internal/event"
 	"github.com/urvisavla/stellar-events/internal/query"
@@ -24,19 +26,21 @@ import (
 type SegmentReader struct {
 	basePath string
 
-	mu         sync.Mutex
-	mmapCache  map[string]*MmapFile          // path -> mmap'd file (.meta, .pack, ledgermap)
-	hashCache  map[string]*streamhash.Index  // path -> streamhash index (.hash files)
-	eventCache map[string]*eventstore.Reader // path -> eventstore reader (event data)
+	mu           sync.Mutex
+	mmapCache    map[string]*MmapFile          // path -> mmap'd file (.meta, .pack, ledgermap)
+	hashCache    map[string]*streamhash.Index  // path -> streamhash index (.hash files)
+	eventCache   map[string]*eventstore.Reader // path -> eventstore reader (event data)
+	appDataCache map[string][]byte             // path -> cached appData from events.pack
 }
 
 // NewSegmentReader creates a new reader for segment flat file indexes.
 func NewSegmentReader(basePath string) *SegmentReader {
 	return &SegmentReader{
-		basePath:   basePath,
-		mmapCache:  make(map[string]*MmapFile),
-		hashCache:  make(map[string]*streamhash.Index),
-		eventCache: make(map[string]*eventstore.Reader),
+		basePath:     basePath,
+		mmapCache:    make(map[string]*MmapFile),
+		hashCache:    make(map[string]*streamhash.Index),
+		eventCache:   make(map[string]*eventstore.Reader),
+		appDataCache: make(map[string][]byte),
 	}
 }
 
@@ -63,7 +67,7 @@ func (r *SegmentReader) Close() error {
 // trimmed to the given ledger range. Returns nil bitmap if the term doesn't exist.
 // fieldIndex: 0=contracts, 1-4=topic positions 0-3.
 // Implements BitmapLoader.
-func (r *SegmentReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey [32]byte,
+func (r *SegmentReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey [16]byte,
 	startLedger, endLedger uint32) (*roaring.Bitmap, BitmapLoadStats, error) {
 
 	bm, bytesRead, readTime, decodeTime, err := r.loadBitmapFromFile(segmentID, fieldIndex, termKey)
@@ -144,39 +148,59 @@ func (r *SegmentReader) getEventstoreReader(dirPath string) (*eventstore.Reader,
 	return er, nil
 }
 
-// loadLedgerOffsetsFromFile reads a ledger offsets from segment flat files via mmap cache.
-func (r *SegmentReader) loadLedgerOffsetsFromFile(segmentID uint32) (*SegmentLedgerOffsets, error) {
-	dirName := fmt.Sprintf("%06d", segmentID)
-	path := filepath.Join(r.basePath, dirName, LedgerOffsetsFileName)
-
-	mm, err := r.getMmap(path)
+// getAppData returns cached appData from an events.pack file, reading it on first access
+// via a temporary packfile.Reader.
+func (r *SegmentReader) getAppData(eventsPath string) ([]byte, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if data, ok := r.appDataCache[eventsPath]; ok {
+		return data, nil
+	}
+	pr := packfile.Open(eventsPath)
+	defer pr.Close()
+	data, err := pr.AppData()
 	if err != nil {
-		return nil, fmt.Errorf("failed to mmap ledger offsets: %w", err)
+		return nil, err
 	}
-
-	if mm.Len() != SegmentLedgerOffsetsSize {
-		return nil, fmt.Errorf("invalid ledger offsets size: got %d, expected %d", mm.Len(), SegmentLedgerOffsetsSize)
-	}
-
-	// Data points directly into the mmap region (zero-copy).
-	return &SegmentLedgerOffsets{SegmentID: segmentID, Data: mm.data}, nil
+	// Cache a copy so we don't depend on the reader after close
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	r.appDataCache[eventsPath] = dataCopy
+	return dataCopy, nil
 }
 
-// loadBitmapFromFile loads a bitmap from segment MPHF index files via reader cache.
-// fieldIndex: 0=contracts (.hash/.pack), 1-4=topic positions 0-3.
-func (r *SegmentReader) loadBitmapFromFile(segmentID uint32, fieldIndex int, termKey [32]byte) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
+// loadLedgerOffsetsFromFile reads ledger offsets from events.pack appData.
+func (r *SegmentReader) loadLedgerOffsetsFromFile(segmentID uint32) (*SegmentLedgerOffsets, error) {
+	dirName := fmt.Sprintf("%06d", segmentID)
+	dirPath := filepath.Join(r.basePath, dirName)
+	eventsPath := filepath.Join(dirPath, EventsFileName)
+
+	appData, err := r.getAppData(eventsPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read appData for ledger offsets: %w", err)
+	}
+
+	if len(appData) != SegmentLedgerOffsetsSize {
+		return nil, fmt.Errorf("invalid ledger offsets size in appData: got %d, expected %d", len(appData), SegmentLedgerOffsetsSize)
+	}
+
+	return &SegmentLedgerOffsets{SegmentID: segmentID, Data: appData}, nil
+}
+
+// loadBitmapFromFile loads a bitmap from the unified segment MPHF index files via reader cache.
+// fieldIndex: 0=contracts, 1-4=topic positions 0-3.
+// Uses 17-byte query keys: [fieldIndex:1][termHash:16].
+func (r *SegmentReader) loadBitmapFromFile(segmentID uint32, fieldIndex int, termKey [16]byte) (*roaring.Bitmap, int64, time.Duration, time.Duration, error) {
 	dirName := fmt.Sprintf("%06d", segmentID)
 	dirPath := filepath.Join(r.basePath, dirName)
 
-	var name string
-	if fieldIndex == 0 {
-		name = "contracts"
-	} else {
-		name = fmt.Sprintf("topic%d", fieldIndex-1)
-	}
+	hashPath := filepath.Join(dirPath, "index.hash")
+	packPath := filepath.Join(dirPath, "index.pack")
 
-	hashPath := filepath.Join(dirPath, name+".hash")
-	packPath := filepath.Join(dirPath, name+".pack")
+	// Build 17-byte query key: [fieldIndex][termHash]
+	queryKey := make([]byte, 17)
+	queryKey[0] = byte(fieldIndex)
+	copy(queryKey[1:], termKey[:])
 
 	// Get cached MPHF index
 	readStart := time.Now()
@@ -186,7 +210,7 @@ func (r *SegmentReader) loadBitmapFromFile(segmentID uint32, fieldIndex int, ter
 	}
 
 	// O(1) MPHF lookup with fingerprint check
-	slot, err := hashIdx.Query(termKey[:])
+	slot, err := hashIdx.Query(queryKey)
 	if err != nil {
 		// Fingerprint mismatch or not found — term not in index
 		return nil, 0, time.Since(readStart), 0, nil
@@ -222,8 +246,29 @@ func (r *SegmentReader) loadBitmapFromFile(segmentID uint32, fieldIndex int, ter
 
 	readTime := time.Since(readStart)
 
-	bitmapBytes := packMmap.data[bitmapStart:bitmapEnd]
+	recordBytes := packMmap.data[bitmapStart:bitmapEnd]
 	bytesRead := int64(bitmapEnd - bitmapStart)
+
+	if len(recordBytes) < 5 {
+		return nil, bytesRead, readTime, 0, nil // record too small
+	}
+
+	// Verify 4-byte fingerprint
+	expectedFP := xxh3.Hash(queryKey)
+	var expectedFPBytes [4]byte
+	binary.LittleEndian.PutUint32(expectedFPBytes[:], uint32(expectedFP))
+	if recordBytes[0] != expectedFPBytes[0] || recordBytes[1] != expectedFPBytes[1] ||
+		recordBytes[2] != expectedFPBytes[2] || recordBytes[3] != expectedFPBytes[3] {
+		return nil, bytesRead, readTime, 0, nil // fingerprint mismatch — term not found
+	}
+
+	// Verify 1-byte field index
+	if recordBytes[4] != byte(fieldIndex) {
+		return nil, bytesRead, readTime, 0, nil // wrong field
+	}
+
+	// Actual bitmap bytes start after 5-byte prefix
+	bitmapBytes := recordBytes[5:]
 
 	// Decode bitmap
 	decodeStart := time.Now()

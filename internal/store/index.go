@@ -1,43 +1,41 @@
 package store
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/RoaringBitmap/roaring"
+	"github.com/zeebo/xxh3"
 )
 
 // =============================================================================
-// Index Key Format (36 bytes)
+// Index Key Format (20 bytes)
 // =============================================================================
 //
-//   [term_key:32][segment_id:4]
-//   - term_key: full SHA-256 hash (32 bytes) of the indexed value
+//   [term_key:16][segment_id:4]
+//   - term_key: xxhash128 (16 bytes) of the indexed value
 //   - segment_id: ledger_seq / SegmentSize (groups ~14 hours of ledgers)
 //
 // Used by bitmap and segment-index indexes.
 // Column families separate contract vs topic data.
 
 const (
-	// IndexKeySize is the size of an index key in bytes (32 hash + 4 segment ID).
-	IndexKeySize = 36
+	// IndexKeySize is the size of an index key in bytes (16 hash + 4 segment ID).
+	IndexKeySize = 20
 )
 
-// ContractTermKey computes the full SHA-256 term key for a contract ID.
-func ContractTermKey(contractID []byte) [32]byte {
-	return sha256.Sum256(contractID)
+// ContractTermKey computes the xxhash128 term key for a contract ID.
+func ContractTermKey(contractID []byte) [16]byte {
+	return xxh3.Hash128(contractID).Bytes()
 }
 
-// TopicTermKey computes the full SHA-256 term key for a topic XDR value.
+// TopicTermKey computes the xxhash128 term key for a topic XDR value.
 // Position-implicit: the position is NOT embedded in the hash.
 // Instead, position is tracked by separate per-field maps/files.
-func TopicTermKey(topicXDR []byte) [32]byte {
-	return sha256.Sum256(topicXDR)
+func TopicTermKey(topicXDR []byte) [16]byte {
+	return xxh3.Hash128(topicXDR).Bytes()
 }
 
 // bitmapChunk represents a serializable bitmap segment.
@@ -51,15 +49,15 @@ type bitmapChunk struct {
 type bitmap32Loader interface {
 	// LoadBitmap32SegmentWithTiming loads a segment and returns bytes read, read time, and decode time.
 	// fieldIndex: 0=contracts, 1-4=topic positions 0-3.
-	LoadBitmap32SegmentWithTiming(fieldIndex int, termKey [32]byte, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, error)
+	LoadBitmap32SegmentWithTiming(fieldIndex int, termKey [16]byte, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, error)
 }
 
-// makeIndexKey creates a 36-byte index key from a term key and segment ID.
-// Format: [term_key:32][segment_id:4]
-func makeIndexKey(termKey [32]byte, segmentID uint32) [IndexKeySize]byte {
+// makeIndexKey creates a 20-byte index key from a term key and segment ID.
+// Format: [term_key:16][segment_id:4]
+func makeIndexKey(termKey [16]byte, segmentID uint32) [IndexKeySize]byte {
 	var key [IndexKeySize]byte
-	copy(key[0:32], termKey[:])
-	binary.BigEndian.PutUint32(key[32:36], segmentID)
+	copy(key[0:16], termKey[:])
+	binary.BigEndian.PutUint32(key[16:20], segmentID)
 	return key
 }
 
@@ -178,7 +176,7 @@ func (bi *eventBitmap32Index) AddTopicEvent(pos int, topicValue []byte, segmentI
 // getSegmentWithStats retrieves a segment and tracks bytes read.
 // fieldIndex: 0=contracts, 1-4=topic positions 0-3.
 // Returns fromCache=true if the bitmap came from the hot cache (shared, must clone before mutating).
-func (bi *eventBitmap32Index) getSegmentWithStats(fieldIndex int, termKey [32]byte, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, bool, error) {
+func (bi *eventBitmap32Index) getSegmentWithStats(fieldIndex int, termKey [16]byte, segmentID uint32) (*roaring.Bitmap, int64, time.Duration, time.Duration, bool, error) {
 	key := makeIndexKey(termKey, segmentID)
 
 	// Check hot cache first - no disk read
@@ -302,8 +300,8 @@ type SegmentMemStats struct {
 }
 
 // perEntryOverhead is the estimated overhead per map entry:
-// 36 (key) + 8 (pointer) + ~50 (map bucket) + ~100 (bitmap object) = 194
-const perEntryOverhead = 194
+// 20 (key) + 8 (pointer) + ~50 (map bucket) + ~100 (bitmap object) = 178
+const perEntryOverhead = 178
 
 // counterSize is the memory for a segmentEventCounter:
 // [SegmentSize]uint32 (4*10000=40000) + nextDenseID uint32 (4) = 40004
@@ -324,7 +322,7 @@ func (bi *eventBitmap32Index) GetPerSegmentMemStats() []SegmentMemStats {
 	}
 	for _, m := range allMaps {
 		for key, bitmap := range m {
-			segID := binary.BigEndian.Uint32(key[32:36])
+			segID := binary.BigEndian.Uint32(key[16:20])
 			a, ok := accum[segID]
 			if !ok {
 				a = &segAccum{}
@@ -379,14 +377,15 @@ type IndexFlusher interface {
 
 // SegmentTermData holds a term hash and its serialized bitmap data.
 type SegmentTermData struct {
-	TermHash   [32]byte
+	TermHash   [16]byte
 	BitmapData []byte
 }
 
 // FlushedSegmentData holds bitmap terms for a single segment, cached after Flush().
 type FlushedSegmentData struct {
-	Contracts []SegmentTermData
-	Topics    [4][]SegmentTermData
+	Contracts        []SegmentTermData
+	Topics           [4][]SegmentTermData
+	LedgerOffsetsData []byte // cached ledger offsets for embedding in events.pack appData
 }
 
 // IndexStore coordinates the in-memory bitmap index and a pluggable persistence backend.
@@ -446,14 +445,14 @@ func (s *IndexStore) Flush() error {
 	// are enabled, so each term appears at most once — no merge needed.
 	s.flushedTerms = make(map[uint32]*FlushedSegmentData)
 	for _, seg := range segments {
-		segmentID := binary.BigEndian.Uint32(seg.Key[32:36])
+		segmentID := binary.BigEndian.Uint32(seg.Key[16:20])
 		fd, ok := s.flushedTerms[segmentID]
 		if !ok {
 			fd = &FlushedSegmentData{}
 			s.flushedTerms[segmentID] = fd
 		}
-		var termHash [32]byte
-		copy(termHash[:], seg.Key[:32])
+		var termHash [16]byte
+		copy(termHash[:], seg.Key[:16])
 		td := SegmentTermData{TermHash: termHash, BitmapData: seg.Data}
 		if seg.FieldIndex == 0 {
 			fd.Contracts = append(fd.Contracts, td)
@@ -463,17 +462,14 @@ func (s *IndexStore) Flush() error {
 		}
 	}
 
-	// Write ledger offsetss to segment flat files if configured
-	if s.segmentPath != "" {
-		for segmentID, data := range ledgerOffsetsData {
-			dirPath := filepath.Join(s.segmentPath, fmt.Sprintf("%06d", segmentID))
-			if err := os.MkdirAll(dirPath, 0755); err != nil {
-				return fmt.Errorf("failed to create segment dir %s: %w", dirPath, err)
-			}
-			if err := writeFileAtomic(filepath.Join(dirPath, LedgerOffsetsFileName), data); err != nil {
-				return fmt.Errorf("failed to write ledger offsets file for segment %d: %w", segmentID, err)
-			}
+	// Cache ledger offsets data in FlushedSegmentData for embedding in events.pack appData.
+	for segmentID, data := range ledgerOffsetsData {
+		fd, ok := s.flushedTerms[segmentID]
+		if !ok {
+			fd = &FlushedSegmentData{}
+			s.flushedTerms[segmentID] = fd
 		}
+		fd.LedgerOffsetsData = data
 	}
 
 	return nil

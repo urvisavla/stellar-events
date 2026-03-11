@@ -9,6 +9,7 @@ import (
 	"sort"
 
 	"github.com/tamirms/streamhash"
+	"github.com/zeebo/xxh3"
 
 	"github.com/tamir/events-analysis/eventstore"
 	"github.com/tamir/events-analysis/packfile"
@@ -30,8 +31,8 @@ func (f *SegmentIndexFlusher) Close() error { return nil }
 
 // FinalizeSegment writes flat file indexes for a completed segment using cached data from Flush().
 // Returns nil if no cached data exists (caller should fall back to an alternative path).
-// The ledger offsets (segment.offsets) is already written by IndexStore.Flush() — this only writes
-// the MPHF bitmap indexes (.hash/.pack) and finalizes the event data chunk.
+// Writes MPHF bitmap indexes (.hash/.pack) and finalizes the event data chunk with
+// ledger offsets embedded as packfile appData.
 func FinalizeSegment(indexStore *IndexStore, segmentPath string, segmentID uint32, sdw *SegmentDataWriter) error {
 	cached := indexStore.PopSegmentTerms(segmentID)
 	if cached == nil {
@@ -43,9 +44,9 @@ func FinalizeSegment(indexStore *IndexStore, segmentPath string, segmentID uint3
 		return err
 	}
 
-	// Finalize segment data chunk if it matches this segment
+	// Finalize segment data chunk with ledger offsets as appData
 	if sdw != nil && sdw.IsActive() && sdw.ChunkID() == segmentID {
-		if err := sdw.FinalizeChunk(); err != nil {
+		if err := sdw.FinalizeChunk(cached.LedgerOffsetsData); err != nil {
 			return fmt.Errorf("failed to finalize segment data chunk %d: %w", segmentID, err)
 		}
 	}
@@ -59,13 +60,14 @@ const (
 )
 
 // SegmentDataWriter writes event data to flat files during ingestion.
+// Uses packfile.Writer directly to support appData (ledger offsets) in Finish.
 type SegmentDataWriter struct {
 	basePath       string
 	chunkID        uint32
-	ew             *eventstore.Writer // eventstore writer for current chunk
-	active         bool               // true if a chunk is currently open
-	compressEvents bool               // enable zstd compression
-	blockSize      int                // events per compression block
+	pw             *packfile.Writer // packfile writer for current chunk
+	active         bool             // true if a chunk is currently open
+	compressEvents bool             // enable zstd compression
+	blockSize      int              // events per compression block
 }
 
 // NewSegmentDataWriter creates a new segment data writer.
@@ -83,7 +85,7 @@ func NewSegmentDataWriter(basePath string, compressEvents bool, groupSize int) *
 }
 
 // StartChunk begins a new chunk (segment). Creates the directory if needed
-// and opens an eventstore writer.
+// and opens a packfile writer.
 func (w *SegmentDataWriter) StartChunk(chunkID uint32) error {
 	dirName := fmt.Sprintf("%06d", chunkID)
 	dirPath := filepath.Join(w.basePath, dirName)
@@ -97,44 +99,45 @@ func (w *SegmentDataWriter) StartChunk(chunkID uint32) error {
 		format = packfile.Uncompressed
 	}
 
-	ew, err := eventstore.Create(filepath.Join(dirPath, EventsFileName), eventstore.WriterOptions{
-		RecordSize: w.blockSize,
-		Format:     format,
+	pw, err := packfile.Create(filepath.Join(dirPath, EventsFileName), packfile.WriterOptions{
+		RecordSize:   w.blockSize,
+		Format:       format,
+		BytesPerSync: 1 << 20,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create eventstore: %w", err)
+		return fmt.Errorf("failed to create packfile: %w", err)
 	}
 
 	w.chunkID = chunkID
-	w.ew = ew
+	w.pw = pw
 	w.active = true
 
 	fmt.Fprintf(os.Stderr, "  [event-file-store] started chunk %06d\n", chunkID)
 	return nil
 }
 
-// AppendEvent writes an event to the eventstore. Events must be appended
+// AppendEvent writes an event to the packfile. Events must be appended
 // in dense ID order. The denseID parameter is accepted for API compatibility
 // but the position is determined by append order.
 func (w *SegmentDataWriter) AppendEvent(denseID uint32, data []byte) error {
 	if !w.active {
 		return fmt.Errorf("no active chunk")
 	}
-	return w.ew.Append(data)
+	return w.pw.Append(data)
 }
 
-// FinalizeChunk finalizes the eventstore (flushes, writes index, atomic rename).
-func (w *SegmentDataWriter) FinalizeChunk() error {
+// FinalizeChunk finalizes the packfile with optional appData (ledger offsets).
+func (w *SegmentDataWriter) FinalizeChunk(appData []byte) error {
 	if !w.active {
 		return nil
 	}
 	w.active = false
 
-	if w.ew != nil {
-		if err := w.ew.Finish(); err != nil {
-			return fmt.Errorf("failed to finalize eventstore: %w", err)
+	if w.pw != nil {
+		if err := w.pw.Finish(appData); err != nil {
+			return fmt.Errorf("failed to finalize packfile: %w", err)
 		}
-		w.ew = nil
+		w.pw = nil
 	}
 
 	fmt.Fprintf(os.Stderr, "  [event-file-store] finalized chunk %06d\n", w.chunkID)
@@ -157,35 +160,40 @@ func (w *SegmentDataWriter) IsActive() bool {
 //
 // Directory structure:
 //   <base_path>/NNNNNN/
-//     contracts.hash     - streamhash MPHF index (32-byte term keys → slots)
-//     contracts.pack     - bitmaps ordered by MPHF slot + u64 LE offset trailer
-//     topic0.hash        - per-position MPHF index
-//     topic0.pack
-//     topic1.hash
-//     topic1.pack
-//     topic2.hash
-//     topic2.pack
-//     topic3.hash
-//     topic3.pack
-//     segment.offsets       - 40,000 bytes cumulative count array
+//     index.hash         - single streamhash MPHF index (17-byte keys → slots)
+//     index.pack         - all bitmaps ordered by MPHF slot + u64 LE offset trailer
+//     events.pack        - event data (ledger offsets embedded as packfile appData)
+//
+// Key format: [fieldIndex:1][termHash:16] = 17 bytes
+//   fieldIndex 0x00 = contract
+//   fieldIndex 0x01 = topic position 0
+//   fieldIndex 0x02 = topic position 1
+//   fieldIndex 0x03 = topic position 2
+//   fieldIndex 0x04 = topic position 3
 //
 // .pack layout:
-//   [bitmap_0 bytes][bitmap_1 bytes]...[bitmap_{N-1} bytes]
+//   [fp:4][field:1][bitmap_0 bytes][fp:4][field:1][bitmap_1 bytes]...
 //   [offset_0: u64 LE][offset_1: u64 LE]...[offset_N: u64 LE]   ← (N+1) entries
 //
+// Each record: [fingerprint:4][fieldIndex:1][bitmap bytes]
+// Fingerprint: first 4 bytes of xxh3.Hash(queryKey) where queryKey is [fieldIndex][termHash].
+//
 // Lookup:
-//   1. hashIdx.Query(termKey) → slot (fingerprint mismatch = not found)
+//   1. hashIdx.Query(queryKey) → slot (fingerprint mismatch = not found)
 //   2. Read offsets[slot] and offsets[slot+1] from trailer
-//   3. pread(pack, offset, length) → bitmap bytes
-//   4. roaring.UnmarshalBinary(bytes)
+//   3. Verify 4-byte fingerprint and 1-byte fieldIndex at record start
+//   4. pread(pack, offset+5, length-5) → bitmap bytes
+//   5. roaring.UnmarshalBinary(bytes)
 
-const (
-	// LedgerOffsetsFileName is the name of the ledger offsets file.
-	LedgerOffsetsFileName = "segment.offsets"
-)
 
-// WriteSegmentDir writes MPHF bitmap indexes (.hash/.pack) for a segment.
-// The ledger offsets (segment.offsets) is written separately by IndexStore.Flush().
+// indexPackEntry holds a 17-byte key and its serialized bitmap data for the unified index.
+type indexPackEntry struct {
+	Key        []byte // [fieldIndex:1][termHash:16] = 17 bytes
+	BitmapData []byte
+}
+
+// WriteSegmentDir writes a single MPHF bitmap index (index.hash + index.pack) for a segment.
+// All fields (contracts + 4 topic positions) are merged into one index using 17-byte keys.
 func WriteSegmentDir(basePath string, segmentID uint32, contractTerms []SegmentTermData, topicsByPos [4][]SegmentTermData) error {
 	dirName := fmt.Sprintf("%06d", segmentID)
 	dirPath := filepath.Join(basePath, dirName)
@@ -194,40 +202,53 @@ func WriteSegmentDir(basePath string, segmentID uint32, contractTerms []SegmentT
 		return fmt.Errorf("failed to create segment dir %s: %w", dirPath, err)
 	}
 
-	// Write contracts.hash + contracts.pack
-	if len(contractTerms) > 0 {
-		if err := writeMPHFPack(dirPath, "contracts", contractTerms); err != nil {
-			return fmt.Errorf("failed to write contracts: %w", err)
-		}
-	}
-
-	// Write topic0-3.hash + topic0-3.pack
-	topicNames := [4]string{"topic0", "topic1", "topic2", "topic3"}
+	// Collect all terms into a single slice with 17-byte keys
+	totalTerms := len(contractTerms)
 	for pos := 0; pos < 4; pos++ {
-		if len(topicsByPos[pos]) > 0 {
-			if err := writeMPHFPack(dirPath, topicNames[pos], topicsByPos[pos]); err != nil {
-				return fmt.Errorf("failed to write %s: %w", topicNames[pos], err)
-			}
+		totalTerms += len(topicsByPos[pos])
+	}
+
+	if totalTerms == 0 {
+		return nil
+	}
+
+	entries := make([]indexPackEntry, 0, totalTerms)
+
+	// Contracts: fieldIndex = 0x00
+	for _, t := range contractTerms {
+		key := make([]byte, 17)
+		key[0] = 0x00
+		copy(key[1:], t.TermHash[:])
+		entries = append(entries, indexPackEntry{Key: key, BitmapData: t.BitmapData})
+	}
+
+	// Topics: fieldIndex = 0x01..0x04
+	for pos := 0; pos < 4; pos++ {
+		for _, t := range topicsByPos[pos] {
+			key := make([]byte, 17)
+			key[0] = byte(pos + 1)
+			copy(key[1:], t.TermHash[:])
+			entries = append(entries, indexPackEntry{Key: key, BitmapData: t.BitmapData})
 		}
 	}
 
-	return nil
+	return writeIndexPack(dirPath, entries)
 }
 
-// writeMPHFPack builds a .hash (streamhash MPHF) and .pack (bitmaps + offset trailer)
-// file pair for the given terms.
-func writeMPHFPack(dirPath, name string, terms []SegmentTermData) error {
-	n := uint64(len(terms))
+// writeIndexPack builds index.hash (streamhash MPHF) and index.pack (bitmaps + offset trailer)
+// from a unified set of 33-byte keyed entries.
+func writeIndexPack(dirPath string, entries []indexPackEntry) error {
+	n := uint64(len(entries))
 	if n == 0 {
 		return nil
 	}
 
-	hashPath := filepath.Join(dirPath, name+".hash")
-	packPath := filepath.Join(dirPath, name+".pack")
+	hashPath := filepath.Join(dirPath, "index.hash")
+	packPath := filepath.Join(dirPath, "index.pack")
 	hashTmpPath := hashPath + ".tmp"
 	packTmpPath := packPath + ".tmp"
 
-	// Build .hash using streamhash with unsorted input (safe for any key order)
+	// Build .hash using streamhash with unsorted input
 	builder, err := streamhash.NewBuilder(
 		context.Background(),
 		hashTmpPath,
@@ -236,51 +257,57 @@ func writeMPHFPack(dirPath, name string, terms []SegmentTermData) error {
 		streamhash.WithUnsortedInput(),
 	)
 	if err != nil {
-		return fmt.Errorf("failed to create streamhash builder for %s: %w", name, err)
+		return fmt.Errorf("failed to create streamhash builder: %w", err)
 	}
 
-	for _, t := range terms {
-		if err := builder.AddKey(t.TermHash[:], 0); err != nil {
+	for _, e := range entries {
+		if err := builder.AddKey(e.Key, 0); err != nil {
 			builder.Close()
 			os.Remove(hashTmpPath)
-			return fmt.Errorf("failed to add key to streamhash for %s: %w", name, err)
+			return fmt.Errorf("failed to add key to streamhash: %w", err)
 		}
 	}
 
 	if err := builder.Finish(); err != nil {
 		builder.Close()
 		os.Remove(hashTmpPath)
-		return fmt.Errorf("failed to finish streamhash for %s: %w", name, err)
+		return fmt.Errorf("failed to finish streamhash: %w", err)
 	}
 	builder.Close()
 
-	// Fsync and rename .hash
+	// Fsync .hash tmp
 	if err := fsyncFile(hashTmpPath); err != nil {
 		os.Remove(hashTmpPath)
-		return fmt.Errorf("failed to fsync %s.hash: %w", name, err)
+		return fmt.Errorf("failed to fsync index.hash: %w", err)
 	}
 
 	// Open .hash to get slot assignments
 	idx, err := streamhash.Open(hashTmpPath)
 	if err != nil {
 		os.Remove(hashTmpPath)
-		return fmt.Errorf("failed to open streamhash for %s: %w", name, err)
+		return fmt.Errorf("failed to open streamhash: %w", err)
 	}
 	defer idx.Close()
 
-	// Map each term to its MPHF slot
+	// Map each entry to its MPHF slot, computing fingerprint from the 17-byte key
 	type slotEntry struct {
-		slot uint64
-		data []byte
+		slot        uint64
+		fingerprint [4]byte
+		fieldIndex  byte
+		data        []byte
 	}
 	slotData := make([]slotEntry, n)
-	for i, t := range terms {
-		slot, err := idx.Query(t.TermHash[:])
+	for i, e := range entries {
+		slot, err := idx.Query(e.Key)
 		if err != nil {
 			os.Remove(hashTmpPath)
-			return fmt.Errorf("failed to query streamhash slot for %s term %d: %w", name, i, err)
+			return fmt.Errorf("failed to query streamhash slot for entry %d: %w", i, err)
 		}
-		slotData[i] = slotEntry{slot: slot, data: t.BitmapData}
+		// Fingerprint: first 4 bytes of xxh3.Hash(queryKey)
+		fp := xxh3.Hash(e.Key)
+		var fpBytes [4]byte
+		binary.LittleEndian.PutUint32(fpBytes[:], uint32(fp))
+		slotData[i] = slotEntry{slot: slot, fingerprint: fpBytes, fieldIndex: e.Key[0], data: e.BitmapData}
 	}
 
 	// Sort by slot to write bitmaps in MPHF slot order
@@ -288,11 +315,11 @@ func writeMPHFPack(dirPath, name string, terms []SegmentTermData) error {
 		return slotData[i].slot < slotData[j].slot
 	})
 
-	// Build .pack: concatenate bitmaps in slot order, then append (N+1) u64 LE offset trailer
+	// Build .pack: [fp:4][field:1][bitmap]... per record, then (N+1) u64 LE offset trailer
 	packFile, err := os.Create(packTmpPath)
 	if err != nil {
 		os.Remove(hashTmpPath)
-		return fmt.Errorf("failed to create %s.pack: %w", name, err)
+		return fmt.Errorf("failed to create index.pack: %w", err)
 	}
 
 	offsets := make([]uint64, n+1)
@@ -300,15 +327,30 @@ func writeMPHFPack(dirPath, name string, terms []SegmentTermData) error {
 
 	for i, entry := range slotData {
 		offsets[i] = currentOffset
+		// Write 4-byte fingerprint
+		if _, err := packFile.Write(entry.fingerprint[:]); err != nil {
+			packFile.Close()
+			os.Remove(hashTmpPath)
+			os.Remove(packTmpPath)
+			return fmt.Errorf("failed to write fingerprint to index.pack: %w", err)
+		}
+		// Write 1-byte field index
+		if _, err := packFile.Write([]byte{entry.fieldIndex}); err != nil {
+			packFile.Close()
+			os.Remove(hashTmpPath)
+			os.Remove(packTmpPath)
+			return fmt.Errorf("failed to write field index to index.pack: %w", err)
+		}
+		// Write bitmap data
 		if _, err := packFile.Write(entry.data); err != nil {
 			packFile.Close()
 			os.Remove(hashTmpPath)
 			os.Remove(packTmpPath)
-			return fmt.Errorf("failed to write bitmap to %s.pack: %w", name, err)
+			return fmt.Errorf("failed to write bitmap to index.pack: %w", err)
 		}
-		currentOffset += uint64(len(entry.data))
+		currentOffset += 5 + uint64(len(entry.data))
 	}
-	offsets[n] = currentOffset // sentinel: end of last bitmap
+	offsets[n] = currentOffset // sentinel: end of last record
 
 	// Write offset trailer
 	trailer := make([]byte, (n+1)*8)
@@ -319,7 +361,7 @@ func writeMPHFPack(dirPath, name string, terms []SegmentTermData) error {
 		packFile.Close()
 		os.Remove(hashTmpPath)
 		os.Remove(packTmpPath)
-		return fmt.Errorf("failed to write trailer to %s.pack: %w", name, err)
+		return fmt.Errorf("failed to write trailer to index.pack: %w", err)
 	}
 
 	// Fsync and close pack file
@@ -327,7 +369,7 @@ func writeMPHFPack(dirPath, name string, terms []SegmentTermData) error {
 		packFile.Close()
 		os.Remove(hashTmpPath)
 		os.Remove(packTmpPath)
-		return fmt.Errorf("failed to fsync %s.pack: %w", name, err)
+		return fmt.Errorf("failed to fsync index.pack: %w", err)
 	}
 	packFile.Close()
 
@@ -335,11 +377,11 @@ func writeMPHFPack(dirPath, name string, terms []SegmentTermData) error {
 	if err := os.Rename(hashTmpPath, hashPath); err != nil {
 		os.Remove(hashTmpPath)
 		os.Remove(packTmpPath)
-		return fmt.Errorf("failed to rename %s.hash: %w", name, err)
+		return fmt.Errorf("failed to rename index.hash: %w", err)
 	}
 	if err := os.Rename(packTmpPath, packPath); err != nil {
 		os.Remove(packTmpPath)
-		return fmt.Errorf("failed to rename %s.pack: %w", name, err)
+		return fmt.Errorf("failed to rename index.pack: %w", err)
 	}
 
 	return nil

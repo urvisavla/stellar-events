@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RoaringBitmap/roaring"
+	"github.com/stellar/go-stellar-sdk/strkey"
 
 	"github.com/urvisavla/stellar-events/internal/event"
 	"github.com/urvisavla/stellar-events/internal/query"
@@ -71,7 +73,7 @@ type BitmapLoader interface {
 	// LoadTermBitmap loads a bitmap for a specific term in a specific segment,
 	// trimmed to the given ledger range. Returns nil bitmap if the term doesn't exist.
 	// fieldIndex: 0=contracts, 1-4=topic positions 0-3.
-	LoadTermBitmap(segmentID uint32, fieldIndex int, termKey [32]byte,
+	LoadTermBitmap(segmentID uint32, fieldIndex int, termKey [16]byte,
 		startLedger, endLedger uint32) (*roaring.Bitmap, BitmapLoadStats, error)
 }
 
@@ -642,6 +644,13 @@ func (es *Store) QueryEvents(contractIDs [][]byte, topicGroups [4][][]byte, star
 		return nil, nil, err
 	}
 
+	// Post-filter: verify fetched events actually match query terms.
+	// MPHF fingerprint checks reduce but don't eliminate false positives.
+	filterStart := time.Now()
+	events = postFilterEvents(events, contractIDs, topicGroups)
+	result.FilterTime = time.Since(filterStart)
+	result.EventsReturned = len(events)
+
 	result.TotalTime = time.Since(totalStart)
 	return result, events, nil
 }
@@ -659,6 +668,69 @@ func (es *Store) Close() {
 	if es.rocksDB != nil {
 		es.rocksDB.Close()
 	}
+}
+
+// postFilterEvents verifies that fetched events actually match all query terms.
+// This eliminates false positives from the MPHF-based index lookup.
+func postFilterEvents(events []*query.Event, contractIDs [][]byte, topicGroups [4][][]byte) []*query.Event {
+	if len(events) == 0 {
+		return events
+	}
+
+	// Pre-compute contract filter set (strkey-encoded strings)
+	var contractSet map[string]struct{}
+	if len(contractIDs) > 0 {
+		contractSet = make(map[string]struct{}, len(contractIDs))
+		for _, cid := range contractIDs {
+			if encoded, err := strkey.Encode(strkey.VersionByteContract, cid); err == nil {
+				contractSet[encoded] = struct{}{}
+			}
+		}
+	}
+
+	// Pre-compute topic filter sets (base64-encoded strings) per position
+	var topicSets [4]map[string]struct{}
+	for pos, tg := range topicGroups {
+		if len(tg) == 0 {
+			continue
+		}
+		topicSets[pos] = make(map[string]struct{}, len(tg))
+		for _, topicXDR := range tg {
+			topicSets[pos][base64.StdEncoding.EncodeToString(topicXDR)] = struct{}{}
+		}
+	}
+
+	filtered := make([]*query.Event, 0, len(events))
+	for _, ev := range events {
+		// Check contract filter
+		if contractSet != nil {
+			if _, ok := contractSet[ev.ContractID]; !ok {
+				continue
+			}
+		}
+
+		// Check topic filters at each position
+		match := true
+		for pos := 0; pos < 4; pos++ {
+			if topicSets[pos] == nil {
+				continue
+			}
+			if pos >= len(ev.Topics) {
+				match = false
+				break
+			}
+			if _, ok := topicSets[pos][ev.Topics[pos]]; !ok {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+
+		filtered = append(filtered, ev)
+	}
+	return filtered
 }
 
 // collectBitmaps loads bitmaps for a query and intersects them per segment.
