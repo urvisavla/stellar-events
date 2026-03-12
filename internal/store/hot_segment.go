@@ -47,7 +47,8 @@ type HotSegmentMeta struct {
 
 // HotSegmentWriter writes incoming ledger data into hot append-only files
 // within a single segment directory. It tracks the next event ID and writes
-// to four files per ledger batch.
+// to four files per ledger batch. All writes go through bufio.Writer to
+// reduce syscalls from ~7/event to ~1 per 256KB buffer fill.
 type HotSegmentWriter struct {
 	basePath  string // parent directory (e.g. <segmentPath>)
 	segmentID uint32
@@ -56,12 +57,19 @@ type HotSegmentWriter struct {
 	nextEventID      uint32 // next dense local ID to assign
 	cumulativeEvents uint32 // running cumulative event count for ledger_offsets.dat
 	ledgersWritten   uint32 // number of ledger offset entries written
+	eventsDatPos     int64  // tracked in memory to avoid Seek syscall
 
-	// Open file handles
+	// Raw file handles (for fsync)
 	eventsDat   *os.File
 	eventsIdx   *os.File
 	indexDeltas *os.File
 	ledgerOffs  *os.File
+
+	// Buffered writers — reduce per-event syscalls to buffered memcpys
+	eventsDatBuf   *bufio.Writer
+	eventsIdxBuf   *bufio.Writer
+	indexDeltasBuf *bufio.Writer
+	ledgerOffsBuf  *bufio.Writer
 }
 
 // NewHotSegmentWriter opens (or creates) a hot segment directory and its four files.
@@ -103,13 +111,17 @@ func NewHotSegmentWriter(basePath string, segmentID uint32) (*HotSegmentWriter, 
 	}
 
 	return &HotSegmentWriter{
-		basePath:    basePath,
-		segmentID:   segmentID,
-		hotDir:      hotDir,
-		eventsDat:   eventsDat,
-		eventsIdx:   eventsIdx,
-		indexDeltas: indexDeltas,
-		ledgerOffs:  ledgerOffs,
+		basePath:       basePath,
+		segmentID:      segmentID,
+		hotDir:         hotDir,
+		eventsDat:      eventsDat,
+		eventsIdx:      eventsIdx,
+		indexDeltas:    indexDeltas,
+		ledgerOffs:     ledgerOffs,
+		eventsDatBuf:   bufio.NewWriterSize(eventsDat, hotBufSize),
+		eventsIdxBuf:   bufio.NewWriterSize(eventsIdx, hotBufSize),
+		indexDeltasBuf: bufio.NewWriterSize(indexDeltas, hotBufSize),
+		ledgerOffsBuf:  bufio.NewWriterSize(ledgerOffs, hotBufSize),
 	}, nil
 }
 
@@ -122,22 +134,16 @@ func NewHotSegmentWriter(basePath string, segmentID uint32) (*HotSegmentWriter, 
 func (w *HotSegmentWriter) WriteLedger(events []*event.IngestEvent, indexStore *IndexStore) error {
 	if len(events) == 0 {
 		// Still write the cumulative count for empty ledgers
-		w.cumulativeEvents += 0
 		w.ledgersWritten++
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], w.cumulativeEvents)
-		if _, err := w.ledgerOffs.Write(buf[:]); err != nil {
+		if _, err := w.ledgerOffsBuf.Write(buf[:]); err != nil {
 			return fmt.Errorf("write ledger_offsets.dat: %w", err)
 		}
 		return nil
 	}
 
-	// Get current write position in events.dat for offset tracking
-	datPos, err := w.eventsDat.Seek(0, 2) // seek to end
-	if err != nil {
-		return fmt.Errorf("seek events.dat: %w", err)
-	}
-
+	datPos := w.eventsDatPos
 	startID := w.nextEventID
 
 	for i, ev := range events {
@@ -149,11 +155,11 @@ func (w *HotSegmentWriter) WriteLedger(events []*event.IngestEvent, indexStore *
 		// Record byte offset in events.idx (uint64 LE)
 		var offBuf [8]byte
 		binary.LittleEndian.PutUint64(offBuf[:], uint64(datPos))
-		if _, err := w.eventsIdx.Write(offBuf[:]); err != nil {
+		if _, err := w.eventsIdxBuf.Write(offBuf[:]); err != nil {
 			return fmt.Errorf("write events.idx: %w", err)
 		}
 
-		if _, err := w.eventsDat.Write(encoded); err != nil {
+		if _, err := w.eventsDatBuf.Write(encoded); err != nil {
 			return fmt.Errorf("write events.dat: %w", err)
 		}
 		datPos += int64(len(encoded))
@@ -184,6 +190,7 @@ func (w *HotSegmentWriter) WriteLedger(events []*event.IngestEvent, indexStore *
 		}
 	}
 
+	w.eventsDatPos = datPos
 	w.nextEventID = startID + uint32(len(events))
 
 	// Step 5: Append cumulative event count to ledger_offsets.dat
@@ -191,7 +198,7 @@ func (w *HotSegmentWriter) WriteLedger(events []*event.IngestEvent, indexStore *
 	w.ledgersWritten++
 	var cumBuf [4]byte
 	binary.LittleEndian.PutUint32(cumBuf[:], w.cumulativeEvents)
-	if _, err := w.ledgerOffs.Write(cumBuf[:]); err != nil {
+	if _, err := w.ledgerOffsBuf.Write(cumBuf[:]); err != nil {
 		return fmt.Errorf("write ledger_offsets.dat: %w", err)
 	}
 
@@ -204,14 +211,21 @@ func (w *HotSegmentWriter) writeIndexDelta(fieldIndex byte, termHash [16]byte, e
 	buf[0] = fieldIndex
 	copy(buf[1:17], termHash[:])
 	binary.LittleEndian.PutUint32(buf[17:21], eventID)
-	if _, err := w.indexDeltas.Write(buf[:]); err != nil {
+	if _, err := w.indexDeltasBuf.Write(buf[:]); err != nil {
 		return fmt.Errorf("write index_deltas.dat: %w", err)
 	}
 	return nil
 }
 
-// Fsync fsyncs all four hot files.
+// Fsync flushes all bufio writers then fsyncs all four hot files.
 func (w *HotSegmentWriter) Fsync() error {
+	// Flush buffered data to OS
+	for _, bw := range []*bufio.Writer{w.eventsDatBuf, w.eventsIdxBuf, w.indexDeltasBuf, w.ledgerOffsBuf} {
+		if err := bw.Flush(); err != nil {
+			return fmt.Errorf("flush buffer: %w", err)
+		}
+	}
+	// Fsync to disk
 	for _, f := range []*os.File{w.eventsDat, w.eventsIdx, w.indexDeltas, w.ledgerOffs} {
 		if err := f.Sync(); err != nil {
 			return fmt.Errorf("fsync %s: %w", f.Name(), err)

@@ -59,9 +59,11 @@ func cmdInspect(cfg *config.Config, segmentFilter int, verbose bool) {
 		os.Exit(1)
 	}
 
-	entries, err := os.ReadDir(basePath)
+	// Cold segments live under <segmentPath>/cold/
+	coldPath := filepath.Join(basePath, "cold")
+	entries, err := os.ReadDir(coldPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading segment directory %s: %v\n", basePath, err)
+		fmt.Fprintf(os.Stderr, "Error reading segment directory %s: %v\n", coldPath, err)
 		os.Exit(1)
 	}
 
@@ -100,7 +102,7 @@ func cmdInspect(cfg *config.Config, segmentFilter int, verbose bool) {
 		if segmentFilter >= 0 {
 			fmt.Fprintf(os.Stderr, "No segment directory found for segment %d\n", segmentFilter)
 		} else {
-			fmt.Fprintf(os.Stderr, "No segment directories found in %s\n", basePath)
+			fmt.Fprintf(os.Stderr, "No segment directories found in %s\n", coldPath)
 		}
 		os.Exit(1)
 	}
@@ -109,7 +111,7 @@ func cmdInspect(cfg *config.Config, segmentFilter int, verbose bool) {
 	var totalTerms uint64
 
 	for _, dir := range segDirs {
-		dirPath := filepath.Join(basePath, dir)
+		dirPath := filepath.Join(coldPath, dir)
 		var info segmentInfo
 		info.id = dir
 
@@ -159,7 +161,7 @@ func cmdInspect(cfg *config.Config, segmentFilter int, verbose bool) {
 	if verbose {
 		p.Printf("\n=== Per-Segment Stats ===\n")
 		for _, seg := range segments {
-			dirPath := filepath.Join(basePath, seg.id)
+			dirPath := filepath.Join(coldPath, seg.id)
 			printEventPackStats(p, dirPath, seg.id)
 			if seg.termCount > 0 {
 				printBitmapStats(p, dirPath, "index", seg.id, seg.termCount)

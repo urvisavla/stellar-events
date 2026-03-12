@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
@@ -444,9 +445,9 @@ func New(opts Config) (*Store, error) {
 		es.segmentDataWriter = NewSegmentDataWriter(opts.SegmentPath, opts.CompressData, opts.BlockSize)
 	}
 
-	// Initialize query backend
+	// Initialize query backend — cold segments live under <segmentPath>/cold/
 	if opts.SegmentPath != "" {
-		es.queryBackend = NewSegmentReader(opts.SegmentPath)
+		es.queryBackend = NewSegmentReader(filepath.Join(opts.SegmentPath, "cold"))
 	} else if es.rocksDB != nil {
 		es.queryBackend = NewRocksDBReader(
 			es.indexStore.bitmap,
