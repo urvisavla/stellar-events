@@ -154,8 +154,6 @@ type QueryResult struct {
 	IndexDecodeTime    time.Duration // Time decoding bitmap segments (CPU - near zero with FromBuffer)
 	IndexIntersectTime time.Duration // Time spent on bitmap OR/AND operations
 	EventFetchTime     time.Duration // Time fetching events
-	DecompressTime     time.Duration // Time spent decompressing event blobs (zstd/dict)
-	EventDiskReadTime  time.Duration // Time spent on disk I/O for event data
 	GroupsDecompressed int           // Number of group blocks decompressed
 	DecodeTime         time.Duration // Time decoding events
 	FilterTime         time.Duration // Time filtering events

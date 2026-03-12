@@ -439,6 +439,9 @@ func (r *SegmentReader) FetchByRange(startLedger, endLedger uint32, limit int) (
 		result.EventFetchTime += time.Since(readStart)
 	}
 
+	// Subtract decode time so EventFetchTime reflects pure I/O + decompression
+	result.EventFetchTime -= result.DecodeTime
+
 	if fetchCap > 0 && len(events) > fetchCap {
 		events = events[:fetchCap]
 	}
@@ -545,6 +548,9 @@ func (r *SegmentReader) FetchByIDs(perSegment map[uint32]*roaring.Bitmap, limit 
 		}
 		result.EventFetchTime += time.Since(readStart)
 	}
+
+	// Subtract decode time so EventFetchTime reflects pure I/O + decompression
+	result.EventFetchTime -= result.DecodeTime
 
 	if limit > 0 && len(events) > limit {
 		events = events[:limit]

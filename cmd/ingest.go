@@ -137,6 +137,7 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 
 	var totalLedgers, totalEvents int64
 	var diskReadTimeNs, decompressTimeNs, unmarshalTimeNs, writeTimeNs int64
+	var fsyncTimeNs int64
 	var rawBytesTotal int64
 
 	// Use the pipeline's worker pool for parallel reading, with a custom collector
@@ -224,24 +225,25 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 				if hotWriter != nil {
 					// Flush any pending events from the completed segment before conversion
 					if len(eventBatch) > 0 {
-						writeStart := time.Now()
 						ledgerEvents := groupEventsByLedger(eventBatch)
 						for _, le := range ledgerEvents {
+							writeStart := time.Now()
 							if err := hotWriter.WriteLedger(le, indexStore); err != nil {
 								pipelineErr = fmtErr("write ledger to hot segment: %v", err)
 								break
 							}
+							atomic.AddInt64(&writeTimeNs, time.Since(writeStart).Nanoseconds())
+							fsyncStart := time.Now()
+							if err := hotWriter.Fsync(); err != nil {
+								pipelineErr = fmtErr("fsync hot segment: %v", err)
+								break
+							}
+							atomic.AddInt64(&fsyncTimeNs, time.Since(fsyncStart).Nanoseconds())
 						}
 						if pipelineErr != nil {
 							break
 						}
-						atomic.AddInt64(&writeTimeNs, time.Since(writeStart).Nanoseconds())
 						eventBatch = eventBatch[:0]
-					}
-
-					if err := hotWriter.Fsync(); err != nil {
-						pipelineErr = fmtErr("fsync hot segment %d: %v", currentSegID, err)
-						break
 					}
 					freezeStats, err := hotWriter.ConvertToCold(indexStore, sdw)
 					if err != nil {
@@ -281,27 +283,25 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 			atEnd := nextSeq > endLedger
 
 			if (batchFull || atEnd) && len(eventBatch) > 0 {
-				writeStart := time.Now()
-
 				// Group events by ledger and write each ledger to hot segment
 				ledgerEvents := groupEventsByLedger(eventBatch)
 				for _, le := range ledgerEvents {
+					writeStart := time.Now()
 					if err := hotWriter.WriteLedger(le, indexStore); err != nil {
 						pipelineErr = fmtErr("write ledger to hot segment: %v", err)
 						break
 					}
+					atomic.AddInt64(&writeTimeNs, time.Since(writeStart).Nanoseconds())
+					fsyncStart := time.Now()
+					if err := hotWriter.Fsync(); err != nil {
+						pipelineErr = fmtErr("fsync hot segment: %v", err)
+						break
+					}
+					atomic.AddInt64(&fsyncTimeNs, time.Since(fsyncStart).Nanoseconds())
 				}
 				if pipelineErr != nil {
 					break
 				}
-
-				// Fsync after each batch
-				if err := hotWriter.Fsync(); err != nil {
-					pipelineErr = fmtErr("fsync hot segment: %v", err)
-					break
-				}
-
-				atomic.AddInt64(&writeTimeNs, time.Since(writeStart).Nanoseconds())
 
 				eventBatch = eventBatch[:0]
 				batchStartSeq = nextSeq
@@ -373,6 +373,7 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	decompressTime := time.Duration(atomic.LoadInt64(&decompressTimeNs))
 	unmarshalTime := time.Duration(atomic.LoadInt64(&unmarshalTimeNs))
 	writeTime := time.Duration(atomic.LoadInt64(&writeTimeNs))
+	fsyncTime := time.Duration(atomic.LoadInt64(&fsyncTimeNs))
 
 	var summary strings.Builder
 	rawDataMB := float64(rawBytes) / (1024 * 1024)
@@ -390,7 +391,7 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		summary.WriteString(fmt.Sprintf("  Avg events/sec:          %.0f\n", eventsPerSec))
 	}
 
-	totalWorkerTime := diskReadTime + decompressTime + unmarshalTime + writeTime
+	totalWorkerTime := diskReadTime + decompressTime + unmarshalTime + writeTime + fsyncTime
 	summary.WriteString("\n")
 	summary.WriteString("Ingestion Time Breakdown:\n")
 	summary.WriteString(fmt.Sprintf("  Wall clock time:         %s\n", formatElapsed(ingestionElapsed)))
@@ -398,7 +399,8 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		summary.WriteString(fmt.Sprintf("  Disk read:               %s (%.1f%%)\n", formatElapsed(diskReadTime), float64(diskReadTime)/float64(totalWorkerTime)*100))
 		summary.WriteString(fmt.Sprintf("  Decompress (zstd):       %s (%.1f%%)\n", formatElapsed(decompressTime), float64(decompressTime)/float64(totalWorkerTime)*100))
 		summary.WriteString(fmt.Sprintf("  XDR unmarshal:           %s (%.1f%%)\n", formatElapsed(unmarshalTime), float64(unmarshalTime)/float64(totalWorkerTime)*100))
-		summary.WriteString(fmt.Sprintf("  Write (hot+cold):        %s (%.1f%%)\n", formatElapsed(writeTime), float64(writeTime)/float64(totalWorkerTime)*100))
+		summary.WriteString(fmt.Sprintf("  Write (hot):             %s (%.1f%%)\n", formatElapsed(writeTime), float64(writeTime)/float64(totalWorkerTime)*100))
+		summary.WriteString(fmt.Sprintf("  Fsync (per-ledger):      %s (%.1f%%)\n", formatElapsed(fsyncTime), float64(fsyncTime)/float64(totalWorkerTime)*100))
 	}
 
 	summary.WriteString("\n")

@@ -186,8 +186,6 @@ type unifiedQueryResult struct {
 	EventBytesRead     int64
 	IndexLookupTime    time.Duration
 	EventFetchTime     time.Duration
-	DecompressTime     time.Duration
-	EventDiskReadTime  time.Duration
 	GroupsDecompressed int
 	DecodeTime         time.Duration
 	FilterTime         time.Duration
@@ -207,8 +205,6 @@ func toUnifiedResult(r *store.QueryResult) *unifiedQueryResult {
 		EventBytesRead:     r.EventBytesRead,
 		IndexLookupTime:    r.IndexLookupTime,
 		EventFetchTime:     r.EventFetchTime,
-		DecompressTime:     r.DecompressTime,
-		EventDiskReadTime:  r.EventDiskReadTime,
 		GroupsDecompressed: r.GroupsDecompressed,
 		DecodeTime:         r.DecodeTime,
 		FilterTime:         r.FilterTime,
@@ -237,12 +233,6 @@ func printUnifiedResult(r *unifiedQueryResult) {
 	fmt.Fprintf(os.Stderr, "\n=== Timing Breakdown ===\n")
 	fmt.Fprintf(os.Stderr, "  Index lookup:      %s\n", formatDuration(r.IndexLookupTime))
 	fmt.Fprintf(os.Stderr, "  Event fetch:       %s\n", formatDuration(r.EventFetchTime))
-	if r.EventDiskReadTime > 0 {
-		fmt.Fprintf(os.Stderr, "  Event disk read:   %s\n", formatDuration(r.EventDiskReadTime))
-	}
-	if r.DecompressTime > 0 {
-		fmt.Fprintf(os.Stderr, "  Decompress:        %s\n", formatDuration(r.DecompressTime))
-	}
 	fmt.Fprintf(os.Stderr, "  Event decode:      %s\n", formatDuration(r.DecodeTime))
 	if r.FilterTime > 0 {
 		fmt.Fprintf(os.Stderr, "  Event filter:      %s\n", formatDuration(r.FilterTime))

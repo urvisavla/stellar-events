@@ -90,8 +90,6 @@ type BenchmarkResult struct {
 	P99EventFetchTime  time.Duration // P99 time fetching events from storage (I/O)
 	P99EventDecodeTime time.Duration // P99 time decoding events (CPU)
 	P99EventFilterTime time.Duration // P99 time filtering events (CPU)
-	P99EventDecompressTime time.Duration // P99 time decompressing event blobs
-	P99EventDiskReadTime   time.Duration // P99 time on event disk I/O
 
 	// Index stats
 	SegmentsTouched   int   // Number of segments touched by the query
@@ -221,7 +219,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		}
 		defer logWriter.Close()
 		// Write CSV header
-		fmt.Fprintln(logWriter, "timestamp,query_name,datastore,events_returned,index_matches,segments_touched,index_bytes,event_bytes,groups_decompressed,p99_idx_read_ms,p99_idx_decode_ms,p99_idx_intersect_ms,p99_idx_ms,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,p99_total_ms,error")
+		fmt.Fprintln(logWriter, "timestamp,query_name,datastore,events_returned,index_matches,segments_touched,index_bytes,event_bytes,groups_decompressed,p99_idx_read_ms,p99_idx_decode_ms,p99_idx_intersect_ms,p99_idx_ms,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,p99_total_ms,error")
 		logWriter.Sync()
 	}
 
@@ -247,7 +245,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		defer outputWriter.Close()
 		// Write CSV header for results
 		if outputFileFormat == "csv" {
-			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,datastore,start_ledger,end_ledger,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
+			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,datastore,start_ledger,end_ledger,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
 			outputWriter.Sync()
 		}
 		fmt.Fprintf(os.Stderr, "Output file: %s (format: %s)\n", *outputFile, outputFileFormat)
@@ -335,7 +333,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 			// Log query result
 			if logWriter != nil {
 				errStr := result.Error
-				fmt.Fprintf(logWriter, "%s,%s,%s,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s\n",
+				fmt.Fprintf(logWriter, "%s,%s,%s,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s\n",
 					time.Now().Format(time.RFC3339),
 					result.Query.Name,
 					result.Datastore,
@@ -353,8 +351,6 @@ func runBenchmark(cfg *config.Config, args []string) {
 					float64(result.P99EventFetchTime.Microseconds())/1000.0,
 					float64(result.P99EventDecodeTime.Microseconds())/1000.0,
 					float64(result.P99EventFilterTime.Microseconds())/1000.0,
-					float64(result.P99EventDecompressTime.Microseconds())/1000.0,
-					float64(result.P99EventDiskReadTime.Microseconds())/1000.0,
 					float64(result.P99Time.Microseconds())/1000.0,
 					errStr,
 				)
@@ -846,8 +842,6 @@ func runQueryBenchmark(eventStore *store.Store, data *BenchmarkData, spec QueryS
 		eventFetch     time.Duration
 		eventDecode    time.Duration
 		eventFilter    time.Duration
-		eventDecompress time.Duration
-		eventDiskRead   time.Duration
 	}
 	var timings []iterationTiming
 
@@ -929,7 +923,6 @@ func runQueryBenchmark(eventStore *store.Store, data *BenchmarkData, spec QueryS
 			return iterationTiming{
 				total: elapsed, index: qr.IndexTime, indexRead: qr.IndexReadTime, indexDecode: qr.IndexDecodeTime, indexIntersect: qr.IndexIntersectTime,
 				event: qr.EventTime, eventFetch: qr.EventFetchTime, eventDecode: qr.EventDecodeTime, eventFilter: qr.EventFilterTime,
-				eventDecompress: qr.EventDecompressTime, eventDiskRead: qr.EventDiskReadTime,
 			}
 		}
 
@@ -972,8 +965,6 @@ func runQueryBenchmark(eventStore *store.Store, data *BenchmarkData, spec QueryS
 		result.P99EventFetchTime = timings[p99Idx].eventFetch
 		result.P99EventDecodeTime = timings[p99Idx].eventDecode
 		result.P99EventFilterTime = timings[p99Idx].eventFilter
-		result.P99EventDecompressTime = timings[p99Idx].eventDecompress
-		result.P99EventDiskReadTime = timings[p99Idx].eventDiskRead
 	}
 
 	return result
@@ -1019,8 +1010,6 @@ type QueryResult struct {
 	EventFetchTime       time.Duration // Time spent fetching events from storage (I/O)
 	EventDecodeTime      time.Duration // Time spent decoding events (CPU)
 	EventFilterTime      time.Duration // Time spent filtering events (CPU)
-	EventDecompressTime  time.Duration // Time spent decompressing event blobs (zstd/dict)
-	EventDiskReadTime    time.Duration // Time spent on disk I/O for event data
 	GroupsDecompressed   int           // Number of group blocks decompressed
 
 	Error error
@@ -1047,8 +1036,6 @@ func executeQueryBenchmark(eventStore *store.Store, startLedger, endLedger uint3
 		EventFetchTime:      stats.EventFetchTime,
 		EventDecodeTime:     stats.DecodeTime,
 		EventFilterTime:     stats.FilterTime,
-		EventDecompressTime: stats.DecompressTime,
-		EventDiskReadTime:   stats.EventDiskReadTime,
 		GroupsDecompressed:  stats.GroupsDecompressed,
 	}
 }
@@ -1141,7 +1128,7 @@ func printSummaryStats(results []BenchmarkResult, datastores []string) {
 
 func outputCSV(results []BenchmarkResult) {
 	// Header: query | timing | index | event | test
-	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,datastore,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,evt_decompress_ms,evt_disk_read_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
+	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,datastore,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
 
 	for _, r := range results {
 		contractID := strings.Join(r.Query.ContractIDs, "|")
@@ -1158,7 +1145,7 @@ func outputCSV(results []BenchmarkResult) {
 			}
 		}
 
-		fmt.Printf("%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%s\n",
+		fmt.Printf("%s,%s,%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%s\n",
 			r.Query.Name,
 			contractID,
 			topics[0], topics[1], topics[2], topics[3],
@@ -1178,8 +1165,6 @@ func outputCSV(results []BenchmarkResult) {
 			float64(r.P99EventFetchTime.Microseconds())/1000.0,
 			float64(r.P99EventDecodeTime.Microseconds())/1000.0,
 			float64(r.P99EventFilterTime.Microseconds())/1000.0,
-			float64(r.P99EventDecompressTime.Microseconds())/1000.0,
-			float64(r.P99EventDiskReadTime.Microseconds())/1000.0,
 			r.EventsReturned,
 			r.EventsScanned,
 			formatBytes(r.EventBytes),
@@ -1218,8 +1203,6 @@ func outputJSON(results []BenchmarkResult) {
 		EvtFetchMs        float64 `json:"evt_fetch_ms"`
 		EvtDecodeMs       float64 `json:"evt_decode_ms"`
 		EvtFilterMs       float64 `json:"evt_filter_ms"`
-		EvtDecompressMs    float64 `json:"evt_decompress_ms"`
-		EvtDiskReadMs      float64 `json:"evt_disk_read_ms"`
 		EventsReturned     int     `json:"events_returned"`
 		EventsScanned      int     `json:"events_scanned"`
 		EventBytes         string  `json:"event_bytes"`
@@ -1252,8 +1235,6 @@ func outputJSON(results []BenchmarkResult) {
 			EvtFetchMs:       float64(r.P99EventFetchTime.Microseconds()) / 1000.0,
 			EvtDecodeMs:      float64(r.P99EventDecodeTime.Microseconds()) / 1000.0,
 			EvtFilterMs:      float64(r.P99EventFilterTime.Microseconds()) / 1000.0,
-			EvtDecompressMs:    float64(r.P99EventDecompressTime.Microseconds()) / 1000.0,
-			EvtDiskReadMs:      float64(r.P99EventDiskReadTime.Microseconds()) / 1000.0,
 			EventsReturned:     r.EventsReturned,
 			EventsScanned:      r.EventsScanned,
 			EventBytes:         formatBytes(r.EventBytes),
@@ -1301,8 +1282,6 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			EvtFetchMs      float64 `json:"evt_fetch_ms"`
 			EvtDecodeMs     float64 `json:"evt_decode_ms"`
 			EvtFilterMs     float64 `json:"evt_filter_ms"`
-			EvtDecompressMs    float64 `json:"evt_decompress_ms"`
-			EvtDiskReadMs      float64 `json:"evt_disk_read_ms"`
 			EventsReturned     int     `json:"events_returned"`
 			EventsScanned      int     `json:"events_scanned"`
 			EventBytes         string  `json:"event_bytes"`
@@ -1333,8 +1312,6 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			EvtFetchMs:       float64(r.P99EventFetchTime.Microseconds()) / 1000.0,
 			EvtDecodeMs:      float64(r.P99EventDecodeTime.Microseconds()) / 1000.0,
 			EvtFilterMs:      float64(r.P99EventFilterTime.Microseconds()) / 1000.0,
-			EvtDecompressMs:    float64(r.P99EventDecompressTime.Microseconds()) / 1000.0,
-			EvtDiskReadMs:      float64(r.P99EventDiskReadTime.Microseconds()) / 1000.0,
 			EventsReturned:     r.EventsReturned,
 			EventsScanned:      r.EventsScanned,
 			EventBytes:         formatBytes(r.EventBytes),
@@ -1358,7 +1335,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 				topics[i] = "-"
 			}
 		}
-		fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%s\n",
+		fmt.Fprintf(w, "%s,%s,%s,%s,%s,%s,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%s,%d,%d,%s\n",
 			r.Query.Name,
 			contractID,
 			topics[0], topics[1], topics[2], topics[3],
@@ -1380,8 +1357,6 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			float64(r.P99EventFetchTime.Microseconds())/1000.0,
 			float64(r.P99EventDecodeTime.Microseconds())/1000.0,
 			float64(r.P99EventFilterTime.Microseconds())/1000.0,
-			float64(r.P99EventDecompressTime.Microseconds())/1000.0,
-			float64(r.P99EventDiskReadTime.Microseconds())/1000.0,
 			r.EventsReturned,
 			r.EventsScanned,
 			formatBytes(r.EventBytes),
