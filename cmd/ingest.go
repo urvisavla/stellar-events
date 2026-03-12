@@ -18,6 +18,7 @@ import (
 	"github.com/urvisavla/stellar-events/internal/config"
 	"github.com/urvisavla/stellar-events/internal/event"
 	"github.com/urvisavla/stellar-events/internal/ingest"
+	"github.com/urvisavla/stellar-events/internal/progress"
 	"github.com/urvisavla/stellar-events/internal/store"
 )
 
@@ -187,6 +188,13 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	batchStartSeq := startLedger
 	var ledgersProcessed int
 
+	// Progress tracking
+	var progressWriter *progress.Writer
+	if cfg.Ingestion.ProgressFile != "" {
+		progressWriter = progress.NewWriter(cfg.Ingestion.ProgressFile, startLedger, endLedger)
+		fmt.Fprintf(os.Stderr, "Progress file: %s\n", cfg.Ingestion.ProgressFile)
+	}
+
 	var pipelineErr error
 
 	for result := range results {
@@ -235,9 +243,13 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 						pipelineErr = fmtErr("fsync hot segment %d: %v", currentSegID, err)
 						break
 					}
-					if err := hotWriter.ConvertToCold(indexStore, sdw); err != nil {
+					freezeStats, err := hotWriter.ConvertToCold(indexStore, sdw)
+					if err != nil {
 						pipelineErr = fmtErr("convert segment %d to cold: %v", currentSegID, err)
 						break
+					}
+					if freezeStats != nil && progressWriter != nil {
+						progressWriter.RecordFreeze(*freezeStats)
 					}
 					hotWriter = nil
 				}
@@ -300,6 +312,9 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 			if ledgersProcessed%1000 == 0 {
 				fmt.Fprintf(os.Stderr, "Processed %d ledgers, %d events (ledger %d)...\n",
 					ledgersProcessed, atomic.LoadInt64(&totalEvents), nextSeq-1)
+				if progressWriter != nil {
+					_ = progressWriter.Update(nextSeq-1, ledgersProcessed, int(atomic.LoadInt64(&totalEvents)))
+				}
 			}
 		}
 
@@ -312,6 +327,9 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		if hotWriter != nil {
 			hotWriter.Close()
 		}
+		if progressWriter != nil {
+			_ = progressWriter.Failed(nextSeq-1, ledgersProcessed, int(atomic.LoadInt64(&totalEvents)), pipelineErr)
+		}
 		fmt.Fprintf(os.Stderr, "Pipeline failed: %v\n", pipelineErr)
 		os.Exit(1)
 	}
@@ -321,8 +339,12 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		if err := hotWriter.Fsync(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to fsync last hot segment: %v\n", err)
 		}
-		if err := hotWriter.ConvertToCold(indexStore, sdw); err != nil {
+		freezeStats, err := hotWriter.ConvertToCold(indexStore, sdw)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to convert last segment to cold: %v\n", err)
+		}
+		if freezeStats != nil && progressWriter != nil {
+			progressWriter.RecordFreeze(*freezeStats)
 		}
 		hotWriter = nil
 	}
@@ -330,6 +352,12 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	// Final progress
 	fmt.Fprintf(os.Stderr, "Processed %d ledgers, %d events (ledger %d)...\n",
 		ledgersProcessed, atomic.LoadInt64(&totalEvents), nextSeq-1)
+
+	if progressWriter != nil {
+		if err := progressWriter.Complete(ledgersProcessed, int(atomic.LoadInt64(&totalEvents))); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to write final progress: %v\n", err)
+		}
+	}
 
 	ingestionElapsed := time.Since(startTime)
 

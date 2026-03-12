@@ -17,6 +17,7 @@ type ProgressFile struct {
 	Progress    ProgressInfo    `json:"progress"`
 	Events      EventsInfo      `json:"events"`
 	Performance PerformanceInfo `json:"performance"`
+	Freezes     *FreezeInfo     `json:"freezes,omitempty"`
 	Status      string          `json:"status"`
 	UpdatedAt   time.Time       `json:"updated_at"`
 }
@@ -48,6 +49,26 @@ type PerformanceInfo struct {
 	Remaining     string  `json:"remaining"`
 }
 
+// FreezeInfo holds cumulative and per-segment hot→cold conversion metrics.
+type FreezeInfo struct {
+	SegmentsFrozen int                  `json:"segments_frozen"`
+	TotalMs        float64              `json:"total_ms"`
+	AvgMs          float64              `json:"avg_ms"`
+	Segments       []FreezeSegmentStats `json:"segments"`
+}
+
+// FreezeSegmentStats holds timing for a single hot→cold segment conversion.
+type FreezeSegmentStats struct {
+	SegmentID     uint32  `json:"segment_id"`
+	Events        int     `json:"events"`
+	FlushMs       float64 `json:"flush_ms"`
+	EventsPackMs  float64 `json:"events_pack_ms"`
+	MphfMs        float64 `json:"mphf_ms"`
+	CleanupMs     float64 `json:"cleanup_ms"`
+	TotalMs       float64 `json:"total_ms"`
+	HeapFreedMB   int64   `json:"heap_freed_mb"`
+}
+
 // =============================================================================
 // Writer
 // =============================================================================
@@ -58,6 +79,7 @@ type Writer struct {
 	startTime time.Time
 	start     uint32
 	end       uint32
+	freezes   []FreezeSegmentStats
 }
 
 // NewWriter creates a new progress writer
@@ -125,6 +147,7 @@ func (w *Writer) Update(current uint32, ledgersProcessed, eventsTotal int) error
 			Elapsed:       formatDuration(elapsed),
 			Remaining:     remaining,
 		},
+		Freezes:   w.freezeInfo(),
 		Status:    "running",
 		UpdatedAt: time.Now(),
 	}
@@ -168,6 +191,7 @@ func (w *Writer) Complete(ledgersProcessed, eventsTotal int) error {
 			Elapsed:       formatDuration(elapsed),
 			Remaining:     "0s",
 		},
+		Freezes:   w.freezeInfo(),
 		Status:    "completed",
 		UpdatedAt: time.Now(),
 	}
@@ -217,11 +241,35 @@ func (w *Writer) Failed(current uint32, ledgersProcessed, eventsTotal int, err e
 			Elapsed:       formatDuration(elapsed),
 			Remaining:     "-",
 		},
+		Freezes:   w.freezeInfo(),
 		Status:    fmt.Sprintf("failed: %v", err),
 		UpdatedAt: time.Now(),
 	}
 
 	return w.write(progress)
+}
+
+// RecordFreeze records a hot→cold segment conversion.
+func (w *Writer) RecordFreeze(stats FreezeSegmentStats) {
+	w.freezes = append(w.freezes, stats)
+}
+
+// freezeInfo builds a FreezeInfo summary from recorded freezes.
+// Returns nil if no freezes have been recorded.
+func (w *Writer) freezeInfo() *FreezeInfo {
+	if len(w.freezes) == 0 {
+		return nil
+	}
+	var totalMs float64
+	for _, s := range w.freezes {
+		totalMs += s.TotalMs
+	}
+	return &FreezeInfo{
+		SegmentsFrozen: len(w.freezes),
+		TotalMs:        totalMs,
+		AvgMs:          totalMs / float64(len(w.freezes)),
+		Segments:       w.freezes,
+	}
 }
 
 // write marshals and writes the progress to file
