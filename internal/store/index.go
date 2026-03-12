@@ -475,6 +475,23 @@ func (s *IndexStore) Flush() error {
 	return nil
 }
 
+// SegmentTermCount returns the number of unique index terms cached for a segment
+// (contracts + all topic positions) without consuming the cache.
+func (s *IndexStore) SegmentTermCount(segmentID uint32) int {
+	if s.flushedTerms == nil {
+		return 0
+	}
+	fd := s.flushedTerms[segmentID]
+	if fd == nil {
+		return 0
+	}
+	n := len(fd.Contracts)
+	for _, t := range fd.Topics {
+		n += len(t)
+	}
+	return n
+}
+
 // PopSegmentTerms returns cached bitmap terms for a segment and removes them from the cache.
 // Returns nil if no cached data exists (caller should fall back to RocksDB scan).
 func (s *IndexStore) PopSegmentTerms(segmentID uint32) *FlushedSegmentData {

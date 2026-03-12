@@ -17,8 +17,8 @@ type ProgressFile struct {
 	Progress    ProgressInfo    `json:"progress"`
 	Events      EventsInfo      `json:"events"`
 	Performance PerformanceInfo `json:"performance"`
-	Freezes     *FreezeInfo     `json:"freezes,omitempty"`
-	Status      string          `json:"status"`
+	SegmentMetrics []SegmentStats  `json:"segment_metrics,omitempty"`
+	Status         string          `json:"status"`
 	UpdatedAt   time.Time       `json:"updated_at"`
 }
 
@@ -49,24 +49,29 @@ type PerformanceInfo struct {
 	Remaining     string  `json:"remaining"`
 }
 
-// FreezeInfo holds cumulative and per-segment hot→cold conversion metrics.
-type FreezeInfo struct {
-	SegmentsFrozen int                  `json:"segments_frozen"`
-	TotalMs        float64              `json:"total_ms"`
-	AvgMs          float64              `json:"avg_ms"`
-	Segments       []FreezeSegmentStats `json:"segments"`
-}
+// SegmentStats holds per-segment observability metrics collected during ingestion.
+type SegmentStats struct {
+	SegmentID       uint32  `json:"segment_id"`
+	Ledgers         int     `json:"ledgers"`
+	Events          int     `json:"events"`
+	EventBytes      int64   `json:"event_bytes"`          // bytes written to events.dat / events.pack
+	IndexBytes      int64   `json:"index_bytes"`          // bytes written to index files
+	IndexEntries    int     `json:"index_entries"`         // number of term delta entries
+	IndexTerms      int     `json:"index_terms"`           // unique index terms (contracts + topics)
+	AvgEventBytes   float64 `json:"avg_event_bytes"`       // EventBytes / Events
+	EventsPerSec    float64 `json:"events_per_sec"`        // Events / wall time
+	EventThroughput float64 `json:"event_throughput_mb_s"` // EventBytes / wall time (MB/s)
+	IndexThroughput float64 `json:"index_throughput_mb_s"` // IndexBytes / wall time (MB/s)
+	HeapInUseMB     int64   `json:"heap_in_use_mb"`        // current heap after segment completes
+	IngestWallMs    float64 `json:"ingest_wall_ms"`        // wall clock time for ingestion (excludes freeze)
 
-// FreezeSegmentStats holds timing for a single hot→cold segment conversion.
-type FreezeSegmentStats struct {
-	SegmentID     uint32  `json:"segment_id"`
-	Events        int     `json:"events"`
-	FlushMs       float64 `json:"flush_ms"`
-	EventsPackMs  float64 `json:"events_pack_ms"`
-	MphfMs        float64 `json:"mphf_ms"`
-	CleanupMs     float64 `json:"cleanup_ms"`
-	TotalMs       float64 `json:"total_ms"`
-	HeapFreedMB   int64   `json:"heap_freed_mb"`
+	// Freeze/finalize timing (filled by ConvertToCold or finalizeCompletedSegment)
+	FreezeWallMs float64 `json:"freeze_wall_ms,omitempty"` // wall clock time for freeze/finalize
+	FlushMs      float64 `json:"flush_ms,omitempty"`       // bitmap flush time
+	EventsPackMs float64 `json:"events_pack_ms,omitempty"` // events.pack build time (ingest only)
+	MphfMs       float64 `json:"mphf_ms,omitempty"`        // MPHF index build time
+	CleanupMs    float64 `json:"cleanup_ms,omitempty"`     // hot dir cleanup time (ingest only)
+	HeapFreedMB  int64   `json:"heap_freed_mb,omitempty"`  // heap freed during freeze
 }
 
 // =============================================================================
@@ -75,11 +80,11 @@ type FreezeSegmentStats struct {
 
 // Writer writes progress updates to a file
 type Writer struct {
-	filePath  string
-	startTime time.Time
-	start     uint32
-	end       uint32
-	freezes   []FreezeSegmentStats
+	filePath       string
+	startTime      time.Time
+	start          uint32
+	end            uint32
+	segmentMetrics []SegmentStats
 }
 
 // NewWriter creates a new progress writer
@@ -147,8 +152,8 @@ func (w *Writer) Update(current uint32, ledgersProcessed, eventsTotal int) error
 			Elapsed:       formatDuration(elapsed),
 			Remaining:     remaining,
 		},
-		Freezes:   w.freezeInfo(),
-		Status:    "running",
+		SegmentMetrics: w.segmentMetrics,
+		Status:         "running",
 		UpdatedAt: time.Now(),
 	}
 
@@ -191,8 +196,8 @@ func (w *Writer) Complete(ledgersProcessed, eventsTotal int) error {
 			Elapsed:       formatDuration(elapsed),
 			Remaining:     "0s",
 		},
-		Freezes:   w.freezeInfo(),
-		Status:    "completed",
+		SegmentMetrics: w.segmentMetrics,
+		Status:         "completed",
 		UpdatedAt: time.Now(),
 	}
 
@@ -241,35 +246,22 @@ func (w *Writer) Failed(current uint32, ledgersProcessed, eventsTotal int, err e
 			Elapsed:       formatDuration(elapsed),
 			Remaining:     "-",
 		},
-		Freezes:   w.freezeInfo(),
-		Status:    fmt.Sprintf("failed: %v", err),
+		SegmentMetrics: w.segmentMetrics,
+		Status:         fmt.Sprintf("failed: %v", err),
 		UpdatedAt: time.Now(),
 	}
 
 	return w.write(progress)
 }
 
-// RecordFreeze records a hot→cold segment conversion.
-func (w *Writer) RecordFreeze(stats FreezeSegmentStats) {
-	w.freezes = append(w.freezes, stats)
+// RecordSegmentStats records per-segment ingestion metrics.
+func (w *Writer) RecordSegmentStats(stats SegmentStats) {
+	w.segmentMetrics = append(w.segmentMetrics, stats)
 }
 
-// freezeInfo builds a FreezeInfo summary from recorded freezes.
-// Returns nil if no freezes have been recorded.
-func (w *Writer) freezeInfo() *FreezeInfo {
-	if len(w.freezes) == 0 {
-		return nil
-	}
-	var totalMs float64
-	for _, s := range w.freezes {
-		totalMs += s.TotalMs
-	}
-	return &FreezeInfo{
-		SegmentsFrozen: len(w.freezes),
-		TotalMs:        totalMs,
-		AvgMs:          totalMs / float64(len(w.freezes)),
-		Segments:       w.freezes,
-	}
+// SegmentMetrics returns the collected per-segment metrics.
+func (w *Writer) SegmentMetrics() []SegmentStats {
+	return w.segmentMetrics
 }
 
 // write marshals and writes the progress to file

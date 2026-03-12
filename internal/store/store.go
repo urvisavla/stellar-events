@@ -16,6 +16,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/strkey"
 
 	"github.com/urvisavla/stellar-events/internal/event"
+	"github.com/urvisavla/stellar-events/internal/progress"
 	"github.com/urvisavla/stellar-events/internal/query"
 )
 
@@ -398,6 +399,16 @@ type Store struct {
 	// Tracks the last segment ID seen during StoreEvents for auto-finalization.
 	lastSegmentID  uint32
 	hasLastSegment bool
+
+	// Per-segment accumulators for metrics
+	segStartTime   time.Time
+	segEvents      int
+	segLedgers     int
+	segEventBytes  int64
+	lastLedgerSeq  uint32
+
+	// Collected segment metrics
+	segmentMetrics []progress.SegmentStats
 }
 
 // Config configures a Store.
@@ -493,9 +504,28 @@ func (es *Store) StoreEvents(events []*event.IngestEvent, opts *StoreOptions) (i
 				if err := es.finalizeCompletedSegment(es.lastSegmentID); err != nil {
 					return 0, fmt.Errorf("failed to finalize segment %d: %w", es.lastSegmentID, err)
 				}
+				// Reset per-segment accumulators for the new segment
+				es.segStartTime = time.Now()
+				es.segEvents = 0
+				es.segLedgers = 0
+				es.segEventBytes = 0
+				es.lastLedgerSeq = 0
 			}
 			es.lastSegmentID = segmentID
 			es.hasLastSegment = true
+
+			// Initialize segment start time on first event
+			if es.segStartTime.IsZero() {
+				es.segStartTime = time.Now()
+			}
+
+			// Track per-segment stats
+			es.segEvents++
+			es.segEventBytes += int64(len(ev.RawXDR))
+			if ev.LedgerSequence != es.lastLedgerSeq {
+				es.segLedgers++
+				es.lastLedgerSeq = ev.LedgerSequence
+			}
 
 			denseLocalID := es.indexStore.AssignDenseLocalID(segmentID, ev.LedgerSequence)
 
@@ -572,6 +602,9 @@ func (es *Store) StoreEvents(events []*event.IngestEvent, opts *StoreOptions) (i
 // and flat file paths) and, when segment files are configured, writes flat file
 // indexes for the given segment. Logs heap memory freed by the flush.
 func (es *Store) finalizeCompletedSegment(segmentID uint32) error {
+	// Snapshot segment wall time before finalization work
+	segWallMs := float64(time.Since(es.segStartTime).Milliseconds())
+
 	t0 := time.Now()
 
 	runtime.GC()
@@ -584,6 +617,8 @@ func (es *Store) finalizeCompletedSegment(segmentID uint32) error {
 		return fmt.Errorf("flush bitmap indexes: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "  [finalize %d] indexStore.Flush: %v\n", segmentID, time.Since(t1))
+
+	indexTerms := es.indexStore.SegmentTermCount(segmentID)
 
 	if es.segmentPath != "" {
 		t2 := time.Now()
@@ -602,7 +637,82 @@ func (es *Store) finalizeCompletedSegment(segmentID uint32) error {
 	fmt.Fprintf(os.Stderr, "  [finalize %d] total: %v, heap freed %d MB (%d→%d)\n",
 		segmentID, time.Since(t0), freedMB, beforeMB, afterMB)
 
+	// Compute per-segment metrics after finalization (so we can stat cold output files)
+	var indexBytes int64
+	if es.segmentPath != "" {
+		dirName := fmt.Sprintf("%06d", segmentID)
+		segDir := filepath.Join(es.segmentPath, dirName)
+		for _, name := range []string{"index.hash", "index.pack"} {
+			if fi, err := os.Stat(filepath.Join(segDir, name)); err == nil {
+				indexBytes += fi.Size()
+			}
+		}
+	}
+
+	heapMB := int64(memAfter.HeapInuse / (1024 * 1024))
+	wallSec := segWallMs / 1000.0
+	var eventsPerSec, eventThroughput, indexThroughput, avgEventBytes float64
+	if wallSec > 0 {
+		eventsPerSec = float64(es.segEvents) / wallSec
+		eventThroughput = float64(es.segEventBytes) / wallSec / (1024 * 1024)
+		indexThroughput = float64(indexBytes) / wallSec / (1024 * 1024)
+	}
+	if es.segEvents > 0 {
+		avgEventBytes = float64(es.segEventBytes) / float64(es.segEvents)
+	}
+
+	fmt.Fprintf(os.Stderr, "[segment %06d] %d ledgers, %d events, %s events, %s index (%d terms)\n",
+		segmentID, es.segLedgers, es.segEvents,
+		formatBytesStore(es.segEventBytes), formatBytesStore(indexBytes), indexTerms)
+	fmt.Fprintf(os.Stderr, "[segment %06d] %.0f events/s, event I/O %.1f MB/s, index I/O %.1f MB/s, avg %.0f bytes/event\n",
+		segmentID, eventsPerSec, eventThroughput, indexThroughput, avgEventBytes)
+	freezeMs := float64(time.Since(t0).Microseconds()) / 1000
+	flushMs := float64(time.Since(t1).Microseconds()) / 1000
+
+	fmt.Fprintf(os.Stderr, "[segment %06d] heap: %d MB, wall: %.0fms\n",
+		segmentID, heapMB, segWallMs)
+	fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (flush %.0fms, index %.0fms), heap freed %d MB\n",
+		segmentID, freezeMs, flushMs, freezeMs-flushMs, freedMB)
+
+	es.segmentMetrics = append(es.segmentMetrics, progress.SegmentStats{
+		SegmentID:       segmentID,
+		Ledgers:         es.segLedgers,
+		Events:          es.segEvents,
+		EventBytes:      es.segEventBytes,
+		IndexBytes:      indexBytes,
+		AvgEventBytes:   avgEventBytes,
+		EventsPerSec:    eventsPerSec,
+		EventThroughput: eventThroughput,
+		IndexThroughput: indexThroughput,
+		IndexTerms:      indexTerms,
+		HeapInUseMB:     heapMB,
+		IngestWallMs:          segWallMs,
+		FreezeWallMs:        freezeMs,
+		FlushMs:         flushMs,
+		MphfMs:          freezeMs - flushMs,
+		HeapFreedMB:     freedMB,
+	})
+
 	return nil
+}
+
+// SegmentMetrics returns the collected per-segment metrics.
+func (es *Store) SegmentMetrics() []progress.SegmentStats {
+	return es.segmentMetrics
+}
+
+// formatBytesStore formats byte counts as human-readable strings.
+func formatBytesStore(bytes int64) string {
+	switch {
+	case bytes >= 1024*1024*1024:
+		return fmt.Sprintf("%.1f GB", float64(bytes)/(1024*1024*1024))
+	case bytes >= 1024*1024:
+		return fmt.Sprintf("%.1f MB", float64(bytes)/(1024*1024))
+	case bytes >= 1024:
+		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
 }
 
 // Finalize flushes in-memory bitmap indexes and finalizes the last segment.

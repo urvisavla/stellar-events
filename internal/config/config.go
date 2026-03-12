@@ -96,6 +96,9 @@ type IngestionConfig struct {
 	// Index maintenance during ingestion
 	UniqueIndexes bool `toml:"unique_indexes"` // Maintain unique value counts (default: false)
 
+	// Durability
+	DisableFsync bool `toml:"disable_fsync"` // Skip per-ledger fsync in hot ingest (faster, less durable)
+
 	// Parallelism
 	Workers   int `toml:"workers"`    // Parallel workers (0 = NumCPU)
 	BatchSize int `toml:"batch_size"` // Ledgers per batch (default: 100)

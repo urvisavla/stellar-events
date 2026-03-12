@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"golang.org/x/text/message"
 
 	"github.com/urvisavla/stellar-events/internal/config"
+	"github.com/urvisavla/stellar-events/internal/progress"
 	"github.com/urvisavla/stellar-events/internal/store"
 )
 
@@ -195,6 +197,115 @@ func printCompactionSummary(sb *strings.Builder, cs *store.CompactionSummary) {
 // =============================================================================
 // Stats Display Helpers
 // =============================================================================
+
+// setupStderrTee redirects os.Stderr so that all output is written to both
+// the console and a log file. Returns a cleanup function that must be called
+// before the program exits (typically via defer).
+func setupStderrTee(logPath string) func() {
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to create log file %s: %v\n", logPath, err)
+		return func() {}
+	}
+
+	origStderr := os.Stderr
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		logFile.Close()
+		fmt.Fprintf(os.Stderr, "Warning: failed to create stderr tee: %v\n", err)
+		return func() {}
+	}
+
+	os.Stderr = w
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				origStderr.Write(buf[:n])
+				logFile.Write(buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	return func() {
+		w.Close()
+		<-done
+		r.Close()
+		logFile.Close()
+		os.Stderr = origStderr
+	}
+}
+
+// writeSegmentMetricsSummary appends a per-segment metrics table to the summary.
+func writeSegmentMetricsSummary(sb *strings.Builder, metrics []progress.SegmentStats) {
+	if len(metrics) == 0 {
+		return
+	}
+
+	p := message.NewPrinter(language.English)
+
+	sb.WriteString("\n")
+	sb.WriteString("Per-Segment Metrics:\n")
+	sb.WriteString("  Segment   Ledgers   Events   Event Data     Terms   Index Data     Ingest     Freeze     Heap   GC Freed   Events/s\n")
+	sb.WriteString("  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n")
+
+	var totalEvents int
+	var totalEventBytes, totalIndexBytes int64
+	var totalIngestMs, totalFreezeMs float64
+	var totalFreedMB int64
+	var totalTerms int
+	for _, m := range metrics {
+		freezeStr := ""
+		if m.FreezeWallMs > 0 {
+			freezeStr = formatElapsed(time.Duration(m.FreezeWallMs) * time.Millisecond)
+		}
+		freedStr := ""
+		if m.HeapFreedMB != 0 {
+			freedStr = p.Sprintf("%d MB", m.HeapFreedMB)
+		}
+		sb.WriteString(p.Sprintf("  %06d    %5d    %6d   %10s   %5d   %10s   %6s   %8s   %4d MB   %6s   %8.0f\n",
+			m.SegmentID, m.Ledgers, m.Events,
+			formatBytes(m.EventBytes), m.IndexTerms, formatBytes(m.IndexBytes),
+			formatElapsed(time.Duration(m.IngestWallMs)*time.Millisecond),
+			freezeStr, m.HeapInUseMB, freedStr, m.EventsPerSec))
+
+		totalEvents += m.Events
+		totalEventBytes += m.EventBytes
+		totalIndexBytes += m.IndexBytes
+		totalIngestMs += m.IngestWallMs
+		totalFreezeMs += m.FreezeWallMs
+		totalFreedMB += m.HeapFreedMB
+		totalTerms += m.IndexTerms
+	}
+
+	sb.WriteString("  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n")
+	totalIngestSec := totalIngestMs / 1000.0
+	var avgEventsPerSec float64
+	if totalIngestSec > 0 {
+		avgEventsPerSec = float64(totalEvents) / totalIngestSec
+	}
+	totalFreezeStr := ""
+	if totalFreezeMs > 0 {
+		totalFreezeStr = formatElapsed(time.Duration(totalFreezeMs) * time.Millisecond)
+	}
+	totalFreedStr := ""
+	if totalFreedMB != 0 {
+		totalFreedStr = p.Sprintf("%d MB", totalFreedMB)
+	}
+	sb.WriteString(p.Sprintf("  TOTAL              %6d   %10s   %5d   %10s   %6s   %8s            %6s   %8.0f\n",
+		totalEvents, formatBytes(totalEventBytes), totalTerms, formatBytes(totalIndexBytes),
+		formatElapsed(time.Duration(totalIngestMs)*time.Millisecond),
+		totalFreezeStr, totalFreedStr, avgEventsPerSec))
+	sb.WriteString(p.Sprintf("  Segments: %d\n", len(metrics)))
+}
 
 // printDistribution prints distribution stats for an index type
 func printDistribution(name string, stats *store.DistributionStats) {

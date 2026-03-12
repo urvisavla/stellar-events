@@ -49,6 +49,11 @@ func runBackfill(cfg *config.Config, args []string) {
 func cmdBackfill(cfg *config.Config, startLedger, endLedger uint32) {
 	fmt := message.NewPrinter(language.English)
 
+	// Tee all stderr output to a timestamped log file
+	logFile := fmt.Sprintf("backfill_%s.log", time.Now().Format("20060102T150405"))
+	cleanupLog := setupStderrTee(logFile)
+	defer cleanupLog()
+
 	// Resolve ledger range
 	if startLedger == 0 {
 		startLedger = ingest.FirstLedgerSequence
@@ -176,6 +181,13 @@ func cmdBackfill(cfg *config.Config, startLedger, endLedger uint32) {
 		fmt.Fprintf(os.Stderr, "Warning: failed to finalize last segment: %v\n", err)
 	}
 
+	// Persist per-segment metrics to progress.json
+	if progressWriter != nil {
+		for _, sm := range eventStore.SegmentMetrics() {
+			progressWriter.RecordSegmentStats(sm)
+		}
+	}
+
 	// Write completion to progress file
 	if progressWriter != nil {
 		pipeStats := pipeline.GetStats()
@@ -241,7 +253,7 @@ func cmdBackfill(cfg *config.Config, startLedger, endLedger uint32) {
 		summary.WriteString(fmt.Sprintf("  Disk read:               %s (%.1f%%)\n", formatElapsed(diskReadTime), float64(diskReadTime)/float64(totalWorkerTime)*100))
 		summary.WriteString(fmt.Sprintf("  Decompress (zstd):       %s (%.1f%%)\n", formatElapsed(decompressTime), float64(decompressTime)/float64(totalWorkerTime)*100))
 		summary.WriteString(fmt.Sprintf("  XDR unmarshal:           %s (%.1f%%)\n", formatElapsed(unmarshalTime), float64(unmarshalTime)/float64(totalWorkerTime)*100))
-		summary.WriteString(fmt.Sprintf("  Write to RocksDB:        %s (%.1f%%)\n", formatElapsed(writeTime), float64(writeTime)/float64(totalWorkerTime)*100))
+		summary.WriteString(fmt.Sprintf("  Write (store):           %s (%.1f%%)\n", formatElapsed(writeTime), float64(writeTime)/float64(totalWorkerTime)*100))
 	}
 
 	summary.WriteString("\n")
@@ -260,14 +272,9 @@ func cmdBackfill(cfg *config.Config, startLedger, endLedger uint32) {
 		printStorageSnapshot(&summary, preSnapshot)
 	}
 
-	fmt.Fprint(os.Stderr, summary.String())
+	writeSegmentMetricsSummary(&summary, eventStore.SegmentMetrics())
 
-	// Write backfill summary to file (timestamped)
-	filetime := time.Now().Format("20060102T150405")
-	summaryFile := fmt.Sprintf("summary_%s.txt", filetime)
-	if err := os.WriteFile(summaryFile, []byte(summary.String()), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to write summary file: %v\n", err)
-	}
+	fmt.Fprint(os.Stderr, summary.String())
 
 	var postSummary strings.Builder
 
@@ -311,11 +318,4 @@ func cmdBackfill(cfg *config.Config, startLedger, endLedger uint32) {
 	}
 
 	fmt.Fprint(os.Stderr, postSummary.String())
-
-	// Append to summary file
-	f, err := os.OpenFile(summaryFile, os.O_APPEND|os.O_WRONLY, 0644)
-	if err == nil {
-		_, _ = f.WriteString(postSummary.String())
-		_ = f.Close()
-	}
 }

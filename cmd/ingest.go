@@ -51,6 +51,11 @@ func runIngest(cfg *config.Config, args []string) {
 func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	fmt := message.NewPrinter(language.English)
 
+	// Tee all stderr output to a timestamped log file
+	logFile := fmt.Sprintf("ingest_%s.log", time.Now().Format("20060102T150405"))
+	cleanupLog := setupStderrTee(logFile)
+	defer cleanupLog()
+
 	// Resolve ledger range
 	if startLedger == 0 {
 		startLedger = ingest.FirstLedgerSequence
@@ -116,9 +121,14 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		}
 	}()
 
+	disableFsync := cfg.Ingestion.DisableFsync
+
 	fmt.Fprintf(os.Stderr, "Ingesting events (hot→cold) from ledgers %d to %d...\n", startLedger, endLedger)
 	fmt.Fprintf(os.Stderr, "Parallel mode: %d workers, batch size %d, queue size %d\n", workers, batchSize, queueSize)
 	fmt.Fprintf(os.Stderr, "Segment path: %s (hot/ → cold/)\n", segmentPath)
+	if disableFsync {
+		fmt.Fprintf(os.Stderr, "Per-ledger fsync: DISABLED (faster, less durable)\n")
+	}
 
 	pipelineConfig := ingest.PipelineConfig{
 		Workers:           workers,
@@ -189,6 +199,12 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	batchStartSeq := startLedger
 	var ledgersProcessed int
 
+	// Per-segment accumulators
+	var segStartTime time.Time
+	var segEvents int
+	var segLedgers int
+	var allSegmentMetrics []progress.SegmentStats
+
 	// Progress tracking
 	var progressWriter *progress.Writer
 	if cfg.Ingestion.ProgressFile != "" {
@@ -233,25 +249,78 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 								break
 							}
 							atomic.AddInt64(&writeTimeNs, time.Since(writeStart).Nanoseconds())
-							fsyncStart := time.Now()
-							if err := hotWriter.Fsync(); err != nil {
-								pipelineErr = fmtErr("fsync hot segment: %v", err)
-								break
+							if !disableFsync {
+								fsyncStart := time.Now()
+								if err := hotWriter.Fsync(); err != nil {
+									pipelineErr = fmtErr("fsync hot segment: %v", err)
+									break
+								}
+								atomic.AddInt64(&fsyncTimeNs, time.Since(fsyncStart).Nanoseconds())
 							}
-							atomic.AddInt64(&fsyncTimeNs, time.Since(fsyncStart).Nanoseconds())
 						}
 						if pipelineErr != nil {
 							break
 						}
 						eventBatch = eventBatch[:0]
 					}
-					freezeStats, err := hotWriter.ConvertToCold(indexStore, sdw)
-					if err != nil {
+
+					// Full flush before freeze — ensures hot files are durable on disk
+					if err := hotWriter.Fsync(); err != nil {
+						pipelineErr = fmtErr("fsync hot segment before freeze: %v", err)
+						break
+					}
+
+					// Log per-segment stats before conversion
+					meta := hotWriter.CommittedLengths()
+					indexEntries := int(meta.IndexDeltasLen / 21)
+					var ms runtime.MemStats
+					runtime.ReadMemStats(&ms)
+					wallMs := float64(time.Since(segStartTime).Milliseconds())
+					wallSec := wallMs / 1000.0
+					var eventsPerSec, eventThroughput, indexThroughput, avgEventBytes float64
+					if wallSec > 0 {
+						eventsPerSec = float64(segEvents) / wallSec
+						eventThroughput = float64(meta.EventsDatLen) / wallSec / (1024 * 1024)
+						indexThroughput = float64(meta.IndexDeltasLen) / wallSec / (1024 * 1024)
+					}
+					if segEvents > 0 {
+						avgEventBytes = float64(meta.EventsDatLen) / float64(segEvents)
+					}
+					heapMB := int64(ms.HeapInuse / (1024 * 1024))
+
+					fmt.Fprintf(os.Stderr, "[segment %06d] %d ledgers, %d events, %s events, %s index (%d entries)\n",
+						currentSegID, segLedgers, segEvents,
+						formatBytes(meta.EventsDatLen), formatBytes(meta.IndexDeltasLen), indexEntries)
+					fmt.Fprintf(os.Stderr, "[segment %06d] %.0f events/s, event I/O %.1f MB/s, index I/O %.1f MB/s, avg %.0f bytes/event\n",
+						currentSegID, eventsPerSec, eventThroughput, indexThroughput, avgEventBytes)
+					fmt.Fprintf(os.Stderr, "[segment %06d] heap: %d MB, wall: %.0fms\n",
+						currentSegID, heapMB, wallMs)
+
+					segStats := progress.SegmentStats{
+						SegmentID:       currentSegID,
+						Ledgers:         segLedgers,
+						Events:          segEvents,
+						EventBytes:      meta.EventsDatLen,
+						IndexBytes:      meta.IndexDeltasLen,
+						IndexEntries:    indexEntries,
+						AvgEventBytes:   avgEventBytes,
+						EventsPerSec:    eventsPerSec,
+						EventThroughput: eventThroughput,
+						IndexThroughput: indexThroughput,
+						HeapInUseMB:     heapMB,
+						IngestWallMs:          wallMs,
+					}
+
+					if err := hotWriter.ConvertToCold(indexStore, sdw, &segStats); err != nil {
 						pipelineErr = fmtErr("convert segment %d to cold: %v", currentSegID, err)
 						break
 					}
-					if freezeStats != nil && progressWriter != nil {
-						progressWriter.RecordFreeze(*freezeStats)
+					fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), %d terms, heap freed %d MB\n",
+						currentSegID, segStats.FreezeWallMs, segStats.EventsPackMs, segStats.MphfMs, segStats.IndexTerms, segStats.HeapFreedMB)
+
+					allSegmentMetrics = append(allSegmentMetrics, segStats)
+					if progressWriter != nil {
+						progressWriter.RecordSegmentStats(segStats)
 					}
 					hotWriter = nil
 				}
@@ -267,10 +336,16 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 				}
 				currentSegID = segID
 				hasCurrentSeg = true
+				segStartTime = time.Now()
+				segEvents = 0
+				segLedgers = 0
 			}
 
 			eventBatch = append(eventBatch, r.Events...)
 			atomic.AddInt64(&rawBytesTotal, r.RawBytes)
+
+			segLedgers++
+			segEvents += len(r.Events)
 
 			ledgersProcessed++
 			atomic.AddInt64(&totalLedgers, 1)
@@ -292,12 +367,14 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 						break
 					}
 					atomic.AddInt64(&writeTimeNs, time.Since(writeStart).Nanoseconds())
-					fsyncStart := time.Now()
-					if err := hotWriter.Fsync(); err != nil {
-						pipelineErr = fmtErr("fsync hot segment: %v", err)
-						break
+					if !disableFsync {
+						fsyncStart := time.Now()
+						if err := hotWriter.Fsync(); err != nil {
+							pipelineErr = fmtErr("fsync hot segment: %v", err)
+							break
+						}
+						atomic.AddInt64(&fsyncTimeNs, time.Since(fsyncStart).Nanoseconds())
 					}
-					atomic.AddInt64(&fsyncTimeNs, time.Since(fsyncStart).Nanoseconds())
 				}
 				if pipelineErr != nil {
 					break
@@ -336,15 +413,61 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 
 	// Finalize the last hot segment
 	if hotWriter != nil {
+		// Full flush before freeze
 		if err := hotWriter.Fsync(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to fsync last hot segment: %v\n", err)
 		}
-		freezeStats, err := hotWriter.ConvertToCold(indexStore, sdw)
-		if err != nil {
+
+		// Log per-segment stats for the final segment
+		meta := hotWriter.CommittedLengths()
+		indexEntries := int(meta.IndexDeltasLen / 21)
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		wallMs := float64(time.Since(segStartTime).Milliseconds())
+		wallSec := wallMs / 1000.0
+		var eventsPerSec, eventThroughput, indexThroughput, avgEventBytes float64
+		if wallSec > 0 {
+			eventsPerSec = float64(segEvents) / wallSec
+			eventThroughput = float64(meta.EventsDatLen) / wallSec / (1024 * 1024)
+			indexThroughput = float64(meta.IndexDeltasLen) / wallSec / (1024 * 1024)
+		}
+		if segEvents > 0 {
+			avgEventBytes = float64(meta.EventsDatLen) / float64(segEvents)
+		}
+		heapMB := int64(ms.HeapInuse / (1024 * 1024))
+
+		fmt.Fprintf(os.Stderr, "[segment %06d] %d ledgers, %d events, %s events, %s index (%d entries)\n",
+			currentSegID, segLedgers, segEvents,
+			formatBytes(meta.EventsDatLen), formatBytes(meta.IndexDeltasLen), indexEntries)
+		fmt.Fprintf(os.Stderr, "[segment %06d] %.0f events/s, event I/O %.1f MB/s, index I/O %.1f MB/s, avg %.0f bytes/event\n",
+			currentSegID, eventsPerSec, eventThroughput, indexThroughput, avgEventBytes)
+		fmt.Fprintf(os.Stderr, "[segment %06d] heap: %d MB, wall: %.0fms\n",
+			currentSegID, heapMB, wallMs)
+
+		segStats := progress.SegmentStats{
+			SegmentID:       currentSegID,
+			Ledgers:         segLedgers,
+			Events:          segEvents,
+			EventBytes:      meta.EventsDatLen,
+			IndexBytes:      meta.IndexDeltasLen,
+			IndexEntries:    indexEntries,
+			AvgEventBytes:   avgEventBytes,
+			EventsPerSec:    eventsPerSec,
+			EventThroughput: eventThroughput,
+			IndexThroughput: indexThroughput,
+			HeapInUseMB:     heapMB,
+			IngestWallMs:          wallMs,
+		}
+
+		if err := hotWriter.ConvertToCold(indexStore, sdw, &segStats); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to convert last segment to cold: %v\n", err)
 		}
-		if freezeStats != nil && progressWriter != nil {
-			progressWriter.RecordFreeze(*freezeStats)
+		fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), heap freed %d MB\n",
+			currentSegID, segStats.FreezeWallMs, segStats.EventsPackMs, segStats.MphfMs, segStats.HeapFreedMB)
+
+		allSegmentMetrics = append(allSegmentMetrics, segStats)
+		if progressWriter != nil {
+			progressWriter.RecordSegmentStats(segStats)
 		}
 		hotWriter = nil
 	}
@@ -400,7 +523,11 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		summary.WriteString(fmt.Sprintf("  Decompress (zstd):       %s (%.1f%%)\n", formatElapsed(decompressTime), float64(decompressTime)/float64(totalWorkerTime)*100))
 		summary.WriteString(fmt.Sprintf("  XDR unmarshal:           %s (%.1f%%)\n", formatElapsed(unmarshalTime), float64(unmarshalTime)/float64(totalWorkerTime)*100))
 		summary.WriteString(fmt.Sprintf("  Write (hot):             %s (%.1f%%)\n", formatElapsed(writeTime), float64(writeTime)/float64(totalWorkerTime)*100))
-		summary.WriteString(fmt.Sprintf("  Fsync (per-ledger):      %s (%.1f%%)\n", formatElapsed(fsyncTime), float64(fsyncTime)/float64(totalWorkerTime)*100))
+		if disableFsync {
+			summary.WriteString("  Fsync (per-ledger):      DISABLED\n")
+		} else {
+			summary.WriteString(fmt.Sprintf("  Fsync (per-ledger):      %s (%.1f%%)\n", formatElapsed(fsyncTime), float64(fsyncTime)/float64(totalWorkerTime)*100))
+		}
 	}
 
 	summary.WriteString("\n")
@@ -412,14 +539,9 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		summary.WriteString(fmt.Sprintf("  Avg bytes/event:         %.f\n", rawBytesPerEvent))
 	}
 
-	fmt.Fprint(os.Stderr, summary.String())
+	writeSegmentMetricsSummary(&summary, allSegmentMetrics)
 
-	// Write ingestion summary to file (timestamped)
-	filetime := time.Now().Format("20060102T150405")
-	summaryFile := fmt.Sprintf("summary_%s.txt", filetime)
-	if err := os.WriteFile(summaryFile, []byte(summary.String()), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to write summary file: %v\n", err)
-	}
+	fmt.Fprint(os.Stderr, summary.String())
 }
 
 // processLedger reads and parses a single ledger (used by hot ingest workers).

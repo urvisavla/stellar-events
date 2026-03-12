@@ -217,15 +217,23 @@ func (w *HotSegmentWriter) writeIndexDelta(fieldIndex byte, termHash [16]byte, e
 	return nil
 }
 
-// Fsync flushes all bufio writers then fsyncs all four hot files.
-func (w *HotSegmentWriter) Fsync() error {
-	// Flush buffered data to OS
+// FlushBuffers flushes all bufio writers to the OS page cache (no fdatasync).
+// Data is visible to subsequent reads (e.g. os.ReadFile) but not guaranteed
+// durable on disk until Fsync is called.
+func (w *HotSegmentWriter) FlushBuffers() error {
 	for _, bw := range []*bufio.Writer{w.eventsDatBuf, w.eventsIdxBuf, w.indexDeltasBuf, w.ledgerOffsBuf} {
 		if err := bw.Flush(); err != nil {
 			return fmt.Errorf("flush buffer: %w", err)
 		}
 	}
-	// Fsync to disk
+	return nil
+}
+
+// Fsync flushes all bufio writers then fsyncs all four hot files to disk.
+func (w *HotSegmentWriter) Fsync() error {
+	if err := w.FlushBuffers(); err != nil {
+		return err
+	}
 	for _, f := range []*os.File{w.eventsDat, w.eventsIdx, w.indexDeltas, w.ledgerOffs} {
 		if err := f.Sync(); err != nil {
 			return fmt.Errorf("fsync %s: %w", f.Name(), err)
@@ -258,7 +266,7 @@ func (w *HotSegmentWriter) CommittedLengths() HotSegmentMeta {
 //     - index.hash + index.pack: build from flushed bitmaps
 //  3. Delete hot directory
 //  4. Log detailed timing for each step
-func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDataWriter) (*progress.FreezeSegmentStats, error) {
+func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDataWriter, stats *progress.SegmentStats) error {
 	totalStart := time.Now()
 	segID := w.segmentID
 	coldBasePath := filepath.Join(w.basePath, "cold")
@@ -270,7 +278,7 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 	if w.nextEventID == 0 {
 		fmt.Fprintf(os.Stderr, "  [hot→cold %06d] empty segment, skipping\n", segID)
 		w.Cleanup()
-		return nil, nil
+		return nil
 	}
 
 	// Snapshot heap before flush to measure memory freed
@@ -281,14 +289,14 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 	// Step 1: Flush in-memory bitmaps
 	t0 := time.Now()
 	if err := indexStore.Flush(); err != nil {
-		return nil, fmt.Errorf("flush bitmap indexes: %w", err)
+		return fmt.Errorf("flush bitmap indexes: %w", err)
 	}
 	flushTime := time.Since(t0)
 	fmt.Fprintf(os.Stderr, "  [hot→cold %06d] flush bitmaps: %v\n", segID, flushTime)
 
 	cached := indexStore.PopSegmentTerms(segID)
 	if cached == nil {
-		return nil, fmt.Errorf("no cached terms for segment %d after flush", segID)
+		return fmt.Errorf("no cached terms for segment %d after flush", segID)
 	}
 
 	// Step 2a: Build events.pack from hot files
@@ -298,7 +306,7 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 	ledgerOffsPath := filepath.Join(w.hotDir, hotLedgerOffsFile)
 	ledgerOffsRaw, err := os.ReadFile(ledgerOffsPath)
 	if err != nil {
-		return nil, fmt.Errorf("read ledger_offsets.dat: %w", err)
+		return fmt.Errorf("read ledger_offsets.dat: %w", err)
 	}
 
 	// Pad to full SegmentLedgerOffsetsSize (40,000 bytes)
@@ -311,11 +319,11 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 
 	idxData, err := os.ReadFile(eventsIdxPath)
 	if err != nil {
-		return nil, fmt.Errorf("read events.idx: %w", err)
+		return fmt.Errorf("read events.idx: %w", err)
 	}
 	datData, err := os.ReadFile(eventsDatPath)
 	if err != nil {
-		return nil, fmt.Errorf("read events.dat: %w", err)
+		return fmt.Errorf("read events.dat: %w", err)
 	}
 
 	numEvents := len(idxData) / 8
@@ -323,7 +331,7 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 	// Start the SegmentDataWriter chunk for cold output
 	if sdw != nil {
 		if err := sdw.StartChunk(segID); err != nil {
-			return nil, fmt.Errorf("start cold chunk: %w", err)
+			return fmt.Errorf("start cold chunk: %w", err)
 		}
 
 		for i := 0; i < numEvents; i++ {
@@ -339,12 +347,12 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 
 			eventData := datData[offset:eventEnd]
 			if err := sdw.AppendEvent(uint32(i), eventData); err != nil {
-				return nil, fmt.Errorf("append event %d to cold pack: %w", i, err)
+				return fmt.Errorf("append event %d to cold pack: %w", i, err)
 			}
 		}
 
 		if err := sdw.FinalizeChunk(appData); err != nil {
-			return nil, fmt.Errorf("finalize cold events.pack: %w", err)
+			return fmt.Errorf("finalize cold events.pack: %w", err)
 		}
 	}
 
@@ -354,7 +362,7 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 	// Step 2b: Build index.hash + index.pack from flushed bitmaps
 	t2 := time.Now()
 	if err := WriteSegmentDir(coldBasePath, segID, cached.Contracts, cached.Topics); err != nil {
-		return nil, fmt.Errorf("write cold index files: %w", err)
+		return fmt.Errorf("write cold index files: %w", err)
 	}
 	mphfTime := time.Since(t2)
 	fmt.Fprintf(os.Stderr, "  [hot→cold %06d] MPHF index build: %v\n", segID, mphfTime)
@@ -378,18 +386,22 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 	fmt.Fprintf(os.Stderr, "  [hot→cold %06d] total: %v (flush=%v events.pack=%v mphf=%v cleanup=%v) heap freed %d MB (%d→%d)\n",
 		segID, totalTime, flushTime, eventsPackTime, mphfTime, cleanupTime, freedMB, beforeMB, afterMB)
 
-	stats := &progress.FreezeSegmentStats{
-		SegmentID:    segID,
-		Events:       numEvents,
-		FlushMs:      float64(flushTime.Microseconds()) / 1000,
-		EventsPackMs: float64(eventsPackTime.Microseconds()) / 1000,
-		MphfMs:       float64(mphfTime.Microseconds()) / 1000,
-		CleanupMs:    float64(cleanupTime.Microseconds()) / 1000,
-		TotalMs:      float64(totalTime.Microseconds()) / 1000,
-		HeapFreedMB:  freedMB,
+	// Fill freeze fields on the caller's SegmentStats
+	if stats != nil {
+		stats.FreezeWallMs = float64(totalTime.Microseconds()) / 1000
+		stats.FlushMs = float64(flushTime.Microseconds()) / 1000
+		stats.EventsPackMs = float64(eventsPackTime.Microseconds()) / 1000
+		stats.MphfMs = float64(mphfTime.Microseconds()) / 1000
+		stats.CleanupMs = float64(cleanupTime.Microseconds()) / 1000
+		stats.HeapFreedMB = freedMB
+		indexTerms := len(cached.Contracts)
+		for _, t := range cached.Topics {
+			indexTerms += len(t)
+		}
+		stats.IndexTerms = indexTerms
 	}
 
-	return stats, nil
+	return nil
 }
 
 // Cleanup deletes the hot segment directory and all its files.
