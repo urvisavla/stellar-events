@@ -26,21 +26,23 @@ import (
 type SegmentReader struct {
 	basePath string
 
-	mu           sync.Mutex
-	mmapCache    map[string]*MmapFile          // path -> mmap'd file (.meta, .pack, ledgermap)
-	hashCache    map[string]*streamhash.Index  // path -> streamhash index (.hash files)
-	eventCache   map[string]*eventstore.Reader // path -> eventstore reader (event data)
-	appDataCache map[string][]byte             // path -> cached appData from events.pack
+	mu              sync.Mutex
+	mmapCache       map[string]*MmapFile          // path -> mmap'd file (.meta, .pack, ledgermap)
+	hashCache       map[string]*streamhash.Index  // path -> streamhash index (.hash files)
+	eventCache      map[string]*eventstore.Reader // path -> eventstore reader (event data)
+	appDataCache    map[string][]byte             // path -> cached appData from events.pack
+	recordSizeCache map[string]int                // path -> packfile record size (block size)
 }
 
 // NewSegmentReader creates a new reader for segment flat file indexes.
 func NewSegmentReader(basePath string) *SegmentReader {
 	return &SegmentReader{
-		basePath:     basePath,
-		mmapCache:    make(map[string]*MmapFile),
-		hashCache:    make(map[string]*streamhash.Index),
-		eventCache:   make(map[string]*eventstore.Reader),
-		appDataCache: make(map[string][]byte),
+		basePath:        basePath,
+		mmapCache:       make(map[string]*MmapFile),
+		hashCache:       make(map[string]*streamhash.Index),
+		eventCache:      make(map[string]*eventstore.Reader),
+		appDataCache:    make(map[string][]byte),
+		recordSizeCache: make(map[string]int),
 	}
 }
 
@@ -140,12 +142,31 @@ func (r *SegmentReader) getEventstoreReader(dirPath string) (*eventstore.Reader,
 	if er, ok := r.eventCache[dirPath]; ok {
 		return er, nil
 	}
-	if _, err := os.Stat(filepath.Join(dirPath, EventsFileName)); err != nil {
+	eventsPath := filepath.Join(dirPath, EventsFileName)
+	if _, err := os.Stat(eventsPath); err != nil {
 		return nil, err
 	}
-	er := eventstore.Open(filepath.Join(dirPath, EventsFileName))
+	er := eventstore.Open(eventsPath)
 	r.eventCache[dirPath] = er
+
+	// Cache record size from packfile trailer (used for GroupsDecompressed counting)
+	if _, ok := r.recordSizeCache[dirPath]; !ok {
+		pr := packfile.Open(eventsPath)
+		if trailer, err := pr.Trailer(); err == nil && trailer.RecordSize > 0 {
+			r.recordSizeCache[dirPath] = int(trailer.RecordSize)
+		}
+		pr.Close()
+	}
+
 	return er, nil
+}
+
+// getRecordSize returns the cached record size for a segment directory.
+// Returns 0 if not cached (e.g. uncompressed or never opened).
+func (r *SegmentReader) getRecordSize(dirPath string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.recordSizeCache[dirPath]
 }
 
 // getAppData returns cached appData from an events.pack file, reading it on first access
@@ -379,6 +400,13 @@ func (r *SegmentReader) FetchByRange(startLedger, endLedger uint32, limit int) (
 			return nil, nil, fmt.Errorf("failed to open eventstore for segment %d: %w", segID, err)
 		}
 
+		// Count groups (records/blocks) decompressed for this segment
+		if recSize := r.getRecordSize(eventsPath); recSize > 0 {
+			firstRec := int(startID) / recSize
+			lastRec := (int(startID) + count - 1) / recSize
+			result.GroupsDecompressed += lastRec - firstRec + 1
+		}
+
 		// Sequential range read using eventstore.ReadEvents
 		eventIdx := 0
 		for blob, readErr := range er.ReadEvents(int(startID), count) {
@@ -476,6 +504,18 @@ func (r *SegmentReader) FetchByIDs(perSegment map[uint32]*roaring.Bitmap, limit 
 		indices := make([]int, len(denseIDs))
 		for i, id := range denseIDs {
 			indices[i] = int(id)
+		}
+
+		// Count distinct records (blocks) that will be decompressed
+		if recSize := r.getRecordSize(eventsPath); recSize > 0 {
+			prevRec := -1
+			for _, idx := range indices {
+				rec := idx / recSize
+				if rec != prevRec {
+					result.GroupsDecompressed++
+					prevRec = rec
+				}
+			}
 		}
 
 		// Use ReadIndices for parallel scattered event fetch

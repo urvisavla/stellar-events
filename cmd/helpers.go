@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/strkey"
@@ -120,6 +121,75 @@ func formatBytes(bytes int64) string {
 		return fmt.Sprintf("%.2f MB", float64(bytes)/MB)
 	}
 	return fmt.Sprintf("%.2f GB", float64(bytes)/GB)
+}
+
+// =============================================================================
+// Storage Summary Helpers
+// =============================================================================
+
+// printStorageSnapshot prints a storage snapshot in a formatted table
+func printStorageSnapshot(sb *strings.Builder, snapshot *store.StorageSnapshot) {
+	p := message.NewPrinter(language.English)
+
+	sb.WriteString("  Column Family      Keys          SST Files    Memtable     Files\n")
+	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
+
+	// Print in a consistent order
+	cfOrder := []string{
+		"events", "unique", "default",
+		"contracts_bm32", "topics_bm32",
+	}
+	for _, name := range cfOrder {
+		cf, ok := snapshot.ColumnFamilies[name]
+		if !ok {
+			continue
+		}
+		sstMB := float64(cf.SSTFilesBytes) / (1024 * 1024)
+		memMB := float64(cf.MemtableBytes) / (1024 * 1024)
+		sb.WriteString(p.Sprintf("  %-16s %12d    %8.1f MB  %8.1f MB  %5d\n",
+			cf.Name, cf.EstimatedKeys, sstMB, memMB, cf.NumFiles))
+	}
+
+	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
+	totalSSTMB := float64(snapshot.TotalSST) / (1024 * 1024)
+	totalMemMB := float64(snapshot.TotalMemtable) / (1024 * 1024)
+	sb.WriteString(p.Sprintf("  %-16s %12s    %8.1f MB  %8.1f MB  %5d\n",
+		"TOTAL", "", totalSSTMB, totalMemMB, snapshot.TotalFiles))
+}
+
+// printCompactionSummary prints the compaction results in a formatted table
+func printCompactionSummary(sb *strings.Builder, cs *store.CompactionSummary) {
+	p := message.NewPrinter(language.English)
+
+	sb.WriteString("\n")
+	sb.WriteString(p.Sprintf("=== Compaction Summary (%s) ===\n", formatElapsed(cs.Duration)))
+	sb.WriteString("\n")
+	sb.WriteString("  Column Family      Before       After        Reclaimed    Savings\n")
+	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
+
+	// Print in a consistent order
+	cfOrder := []string{
+		"events", "unique", "default",
+		"contracts_bm32", "topics_bm32",
+	}
+	for _, name := range cfOrder {
+		cf, ok := cs.PerCF[name]
+		if !ok {
+			continue
+		}
+		beforeMB := float64(cf.BeforeBytes) / (1024 * 1024)
+		afterMB := float64(cf.AfterBytes) / (1024 * 1024)
+		reclaimedMB := float64(cf.Reclaimed) / (1024 * 1024)
+		sb.WriteString(p.Sprintf("  %-16s %8.1f MB  %8.1f MB  %8.1f MB  %6.1f%%\n",
+			cf.Name, beforeMB, afterMB, reclaimedMB, cf.SavingsPercent))
+	}
+
+	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
+	beforeMB := float64(cs.Before.TotalSST) / (1024 * 1024)
+	afterMB := float64(cs.After.TotalSST) / (1024 * 1024)
+	reclaimedMB := float64(cs.TotalReclaimed) / (1024 * 1024)
+	sb.WriteString(p.Sprintf("  %-16s %8.1f MB  %8.1f MB  %8.1f MB  %6.1f%%\n",
+		"TOTAL", beforeMB, afterMB, reclaimedMB, cs.SavingsPercent))
 }
 
 // =============================================================================

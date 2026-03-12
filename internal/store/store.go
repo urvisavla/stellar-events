@@ -463,6 +463,11 @@ func (es *Store) RocksDB() *RocksDBBackend {
 	return es.rocksDB
 }
 
+// IndexStore returns the underlying IndexStore for direct bitmap access.
+func (es *Store) IndexStore() *IndexStore {
+	return es.indexStore
+}
+
 // StoreEvents stores events with optional index updates based on options.
 // Automatically finalizes completed segments when a segment boundary is crossed.
 // Returns the number of bytes written.

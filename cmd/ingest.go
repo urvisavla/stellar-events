@@ -6,21 +6,23 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 
 	"github.com/urvisavla/stellar-events/internal/config"
+	"github.com/urvisavla/stellar-events/internal/event"
 	"github.com/urvisavla/stellar-events/internal/ingest"
-	"github.com/urvisavla/stellar-events/internal/progress"
 	"github.com/urvisavla/stellar-events/internal/store"
 )
 
 // =============================================================================
-// Ingest Command
+// Ingest Command — hot segment path (write per-ledger, convert to cold)
 // =============================================================================
 
 func runIngest(cfg *config.Config, args []string) {
@@ -31,7 +33,7 @@ func runIngest(cfg *config.Config, args []string) {
 	end := fs.Uint("end", 0, "End ledger (0 = auto-detect max)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: ingest [options]\n\n")
-		fmt.Fprintf(os.Stderr, "Ingests contract events from ledger files into RocksDB.\n\n")
+		fmt.Fprintf(os.Stderr, "Ingests events via hot append-only files, converting to cold on segment boundaries.\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fmt.Fprintf(os.Stderr, "  --start <ledger>   Start ledger (default: %d)\n", ingest.FirstLedgerSequence)
 		fmt.Fprintf(os.Stderr, "  --end <ledger>     End ledger (0 = auto-detect max)\n\n")
@@ -73,13 +75,21 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		os.Exit(2)
 	}
 
-	// Open event store
-	eventStore, err := openStore(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to open event store: %v\n", err)
-		os.Exit(1)
+	segmentPath := cfg.Storage.SegmentPath
+	if segmentPath == "" {
+		fmt.Fprintf(os.Stderr, "Error: storage.segment_path is required for ingest command\n")
+		os.Exit(2)
 	}
-	defer eventStore.Close()
+
+	// Create an IndexStore for in-memory bitmap tracking (segment-file-only mode, no RocksDB).
+	flusher := &store.SegmentIndexFlusher{}
+	indexStore := store.NewIndexStore(flusher, nil, nil)
+	coldPath := filepath.Join(segmentPath, "cold")
+	indexStore.SetWriteConfig(coldPath, false)
+	defer indexStore.Close()
+
+	// Create a SegmentDataWriter for cold output (events.pack)
+	sdw := store.NewSegmentDataWriter(coldPath, cfg.Storage.CompressData, cfg.Storage.BlockSize)
 
 	networkPassphrase := cfg.GetNetworkPassphrase()
 
@@ -105,15 +115,9 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		}
 	}()
 
-	fmt.Fprintf(os.Stderr, "Ingesting events from ledgers %d to %d...\n", startLedger, endLedger)
+	fmt.Fprintf(os.Stderr, "Ingesting events (hot→cold) from ledgers %d to %d...\n", startLedger, endLedger)
 	fmt.Fprintf(os.Stderr, "Parallel mode: %d workers, batch size %d, queue size %d\n", workers, batchSize, queueSize)
-
-	// Create progress writer if configured
-	var progressWriter *progress.Writer
-	if cfg.Ingestion.ProgressFile != "" {
-		progressWriter = progress.NewWriter(cfg.Ingestion.ProgressFile, startLedger, endLedger)
-		fmt.Fprintf(os.Stderr, "Progress file: %s\n", cfg.Ingestion.ProgressFile)
-	}
+	fmt.Fprintf(os.Stderr, "Segment path: %s (hot/ → cold/)\n", segmentPath)
 
 	pipelineConfig := ingest.PipelineConfig{
 		Workers:           workers,
@@ -121,107 +125,239 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		QueueSize:         queueSize,
 		DataDir:           cfg.Source.LedgerDir,
 		NetworkPassphrase: networkPassphrase,
-		MaintainUniqueIdx: cfg.Ingestion.UniqueIndexes,
 	}
 
-	pipeline := ingest.NewPipeline(pipelineConfig, eventStore)
+	// We use a custom collector instead of the pipeline's built-in Store path.
+	// Create pipeline with a nil store — we'll handle writing in a custom collector.
+	// Actually, we need to use the pipeline's parallel reader but handle the writes ourselves.
+	// So we replicate the pipeline pattern with direct control over the hot writer.
 
-	// Aggregated stats for tracking
-	stats := ingest.NewLedgerStats()
-	var ledgerCount, totalEvents int
 	startTime := time.Now()
 
-	pipeline.SetProgressCallback(func(ledger uint32, ledgersProcessed, eventsTotal int, pipeStats *ingest.LedgerStats) {
-		ledgerCount = ledgersProcessed
-		totalEvents = eventsTotal
+	var totalLedgers, totalEvents int64
+	var diskReadTimeNs, decompressTimeNs, unmarshalTimeNs, writeTimeNs int64
+	var rawBytesTotal int64
 
-		stats.TotalLedgers = pipeStats.TotalLedgers
-		stats.TotalTransactions = pipeStats.TotalTransactions
-		stats.TotalEvents = pipeStats.TotalEvents
-		stats.OperationEvents = pipeStats.OperationEvents
-		stats.TransactionEvents = pipeStats.TransactionEvents
+	// Use the pipeline's worker pool for parallel reading, with a custom collector
+	// that writes to hot segments instead of Store.StoreEvents().
+	jobs := make(chan uint32, queueSize)
+	results := make(chan *ingest.LedgerResult, queueSize)
 
-		fmt.Fprintf(os.Stderr, "Processed %d ledgers, %d events (ledger %d)...\n", ledgersProcessed, eventsTotal, ledger)
+	// Start worker goroutines
+	var workersDone int32
+	for i := 0; i < workers; i++ {
+		go func(id int) {
+			defer func() {
+				if atomic.AddInt32(&workersDone, 1) == int32(workers) {
+					close(results)
+				}
+			}()
 
-		// Update progress file
-		if progressWriter != nil {
-			if err := progressWriter.Update(ledger, ledgersProcessed, eventsTotal); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to write progress: %v\n", err)
+			ledgerReader, err := ingest.NewLedgerReader(pipelineConfig.DataDir)
+			if err != nil {
+				results <- &ingest.LedgerResult{Error: fmtErr("worker %d: failed to create reader: %v", id, err)}
+				return
+			}
+			defer ledgerReader.Close()
+
+			for seq := range jobs {
+				result := processLedger(ledgerReader, seq, networkPassphrase)
+				results <- result
+			}
+		}(i)
+	}
+
+	// Feed jobs
+	go func() {
+		defer close(jobs)
+		for seq := startLedger; seq <= endLedger; seq++ {
+			jobs <- seq
+		}
+	}()
+
+	// Collect results in order and write to hot segment
+	pending := make(map[uint32]*ingest.LedgerResult)
+	nextSeq := startLedger
+
+	var hotWriter *store.HotSegmentWriter
+	var currentSegID uint32
+	var hasCurrentSeg bool
+
+	var eventBatch []*event.IngestEvent
+	batchStartSeq := startLedger
+	var ledgersProcessed int
+
+	var pipelineErr error
+
+	for result := range results {
+		if result.Error != nil {
+			fmt.Fprintf(os.Stderr, "Error processing ledger %d: %v\n", result.Sequence, result.Error)
+			pipelineErr = result.Error
+			break
+		}
+
+		pending[result.Sequence] = result
+
+		atomic.AddInt64(&diskReadTimeNs, result.DiskReadTime.Nanoseconds())
+		atomic.AddInt64(&decompressTimeNs, result.DecompressTime.Nanoseconds())
+		atomic.AddInt64(&unmarshalTimeNs, result.UnmarshalTime.Nanoseconds())
+
+		for {
+			r, ok := pending[nextSeq]
+			if !ok {
+				break
+			}
+			delete(pending, nextSeq)
+
+			segID := store.SegmentID(r.Sequence)
+
+			// Segment boundary: flush pending batch to current hot writer, then convert to cold
+			if hasCurrentSeg && segID != currentSegID {
+				if hotWriter != nil {
+					// Flush any pending events from the completed segment before conversion
+					if len(eventBatch) > 0 {
+						writeStart := time.Now()
+						ledgerEvents := groupEventsByLedger(eventBatch)
+						for _, le := range ledgerEvents {
+							if err := hotWriter.WriteLedger(le, indexStore); err != nil {
+								pipelineErr = fmtErr("write ledger to hot segment: %v", err)
+								break
+							}
+						}
+						if pipelineErr != nil {
+							break
+						}
+						atomic.AddInt64(&writeTimeNs, time.Since(writeStart).Nanoseconds())
+						eventBatch = eventBatch[:0]
+					}
+
+					if err := hotWriter.Fsync(); err != nil {
+						pipelineErr = fmtErr("fsync hot segment %d: %v", currentSegID, err)
+						break
+					}
+					if err := hotWriter.ConvertToCold(indexStore, sdw); err != nil {
+						pipelineErr = fmtErr("convert segment %d to cold: %v", currentSegID, err)
+						break
+					}
+					hotWriter = nil
+				}
+			}
+
+			// Open new hot writer if needed
+			if hotWriter == nil || segID != currentSegID {
+				var err error
+				hotWriter, err = store.NewHotSegmentWriter(segmentPath, segID)
+				if err != nil {
+					pipelineErr = fmtErr("open hot segment %d: %v", segID, err)
+					break
+				}
+				currentSegID = segID
+				hasCurrentSeg = true
+			}
+
+			eventBatch = append(eventBatch, r.Events...)
+			atomic.AddInt64(&rawBytesTotal, r.RawBytes)
+
+			ledgersProcessed++
+			atomic.AddInt64(&totalLedgers, 1)
+			atomic.AddInt64(&totalEvents, int64(len(r.Events)))
+
+			nextSeq++
+
+			// Write batch when full or at end
+			batchFull := ledgersProcessed%batchSize == 0
+			atEnd := nextSeq > endLedger
+
+			if (batchFull || atEnd) && len(eventBatch) > 0 {
+				writeStart := time.Now()
+
+				// Group events by ledger and write each ledger to hot segment
+				ledgerEvents := groupEventsByLedger(eventBatch)
+				for _, le := range ledgerEvents {
+					if err := hotWriter.WriteLedger(le, indexStore); err != nil {
+						pipelineErr = fmtErr("write ledger to hot segment: %v", err)
+						break
+					}
+				}
+				if pipelineErr != nil {
+					break
+				}
+
+				// Fsync after each batch
+				if err := hotWriter.Fsync(); err != nil {
+					pipelineErr = fmtErr("fsync hot segment: %v", err)
+					break
+				}
+
+				atomic.AddInt64(&writeTimeNs, time.Since(writeStart).Nanoseconds())
+
+				eventBatch = eventBatch[:0]
+				batchStartSeq = nextSeq
+			}
+			_ = batchStartSeq
+
+			// Progress callback every 1000 ledgers
+			if ledgersProcessed%1000 == 0 {
+				fmt.Fprintf(os.Stderr, "Processed %d ledgers, %d events (ledger %d)...\n",
+					ledgersProcessed, atomic.LoadInt64(&totalEvents), nextSeq-1)
 			}
 		}
-	})
 
-	pipeline.SetErrorCallback(func(ledger uint32, err error) {
-		fmt.Fprintf(os.Stderr, "Error processing ledger %d: %v\n", ledger, err)
-	})
-
-	if err := pipeline.Run(startLedger, endLedger); err != nil {
-		// Write failure to progress file
-		if progressWriter != nil {
-			_ = progressWriter.Failed(endLedger, ledgerCount, totalEvents, err)
+		if pipelineErr != nil {
+			break
 		}
-		fmt.Fprintf(os.Stderr, "Pipeline failed: %v\n", err)
+	}
+
+	if pipelineErr != nil {
+		if hotWriter != nil {
+			hotWriter.Close()
+		}
+		fmt.Fprintf(os.Stderr, "Pipeline failed: %v\n", pipelineErr)
 		os.Exit(1)
 	}
 
-	// Finalize the last segment (flush bitmap indexes + write flat file data)
-	if err := eventStore.Finalize(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to finalize last segment: %v\n", err)
-	}
-
-	// Write completion to progress file
-	if progressWriter != nil {
-		pipeStats := pipeline.GetStats()
-		if err := progressWriter.Complete(int(pipeStats.LedgersProcessed), int(pipeStats.EventsExtracted)); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to write progress: %v\n", err)
+	// Finalize the last hot segment
+	if hotWriter != nil {
+		if err := hotWriter.Fsync(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to fsync last hot segment: %v\n", err)
 		}
+		if err := hotWriter.ConvertToCold(indexStore, sdw); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to convert last segment to cold: %v\n", err)
+		}
+		hotWriter = nil
 	}
 
-	pipeStats := pipeline.GetStats()
-	ledgerCount = int(pipeStats.LedgersProcessed)
-	totalEvents = int(pipeStats.EventsExtracted)
+	// Final progress
+	fmt.Fprintf(os.Stderr, "Processed %d ledgers, %d events (ledger %d)...\n",
+		ledgersProcessed, atomic.LoadInt64(&totalEvents), nextSeq-1)
 
-	diskReadTime := pipeline.GetDiskReadTime()
-	decompressTime := pipeline.GetDecompressTime()
-	unmarshalTime := pipeline.GetUnmarshalTime()
-	writeTime := pipeline.GetWriteTime()
-	rawBytesTotal := pipeline.GetRawBytesTotal()
 	ingestionElapsed := time.Since(startTime)
-
-	// Flush memtables to SST files before getting accurate storage stats
-	fmt.Fprintf(os.Stderr, "\nFlushing memtables to disk...\n")
-	if db := eventStore.RocksDB(); db != nil {
-		if err := db.Flush(); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to flush memtables: %v\n", err)
-		}
-	}
 
 	// =========================================================================
 	// Ingestion Summary
 	// =========================================================================
 
-	var summary strings.Builder
-	rawDataMB := float64(rawBytesTotal) / (1024 * 1024)
+	ledgerCount := int(atomic.LoadInt64(&totalLedgers))
+	eventCount := int(atomic.LoadInt64(&totalEvents))
+	rawBytes := atomic.LoadInt64(&rawBytesTotal)
 
-	// Get pre-compaction storage snapshot
-	var preSnapshot *store.StorageSnapshot
-	if db := eventStore.RocksDB(); db != nil {
-		preSnapshot, err = db.GetStorageSnapshot()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to get storage stats: %v\n", err)
-		}
-	}
+	diskReadTime := time.Duration(atomic.LoadInt64(&diskReadTimeNs))
+	decompressTime := time.Duration(atomic.LoadInt64(&decompressTimeNs))
+	unmarshalTime := time.Duration(atomic.LoadInt64(&unmarshalTimeNs))
+	writeTime := time.Duration(atomic.LoadInt64(&writeTimeNs))
+
+	var summary strings.Builder
+	rawDataMB := float64(rawBytes) / (1024 * 1024)
 
 	summary.WriteString("\n")
-	summary.WriteString("=== Ingestion Complete ===\n")
+	summary.WriteString("=== Ingestion Complete (hot→cold) ===\n")
 	summary.WriteString("\n")
 	summary.WriteString(fmt.Sprintf("  Ledgers processed:       %d\n", ledgerCount))
-	summary.WriteString(fmt.Sprintf("  Transactions processed:  %d\n", stats.TotalTransactions))
-	summary.WriteString(fmt.Sprintf("  Events ingested:         %d\n", totalEvents))
+	summary.WriteString(fmt.Sprintf("  Events ingested:         %d\n", eventCount))
 
 	if ingestionElapsed.Seconds() > 0 {
 		ledgersPerSec := float64(ledgerCount) / ingestionElapsed.Seconds()
-		eventsPerSec := float64(totalEvents) / ingestionElapsed.Seconds()
+		eventsPerSec := float64(eventCount) / ingestionElapsed.Seconds()
 		summary.WriteString(fmt.Sprintf("  Avg ledgers/sec:         %.0f\n", ledgersPerSec))
 		summary.WriteString(fmt.Sprintf("  Avg events/sec:          %.0f\n", eventsPerSec))
 	}
@@ -234,23 +370,16 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		summary.WriteString(fmt.Sprintf("  Disk read:               %s (%.1f%%)\n", formatElapsed(diskReadTime), float64(diskReadTime)/float64(totalWorkerTime)*100))
 		summary.WriteString(fmt.Sprintf("  Decompress (zstd):       %s (%.1f%%)\n", formatElapsed(decompressTime), float64(decompressTime)/float64(totalWorkerTime)*100))
 		summary.WriteString(fmt.Sprintf("  XDR unmarshal:           %s (%.1f%%)\n", formatElapsed(unmarshalTime), float64(unmarshalTime)/float64(totalWorkerTime)*100))
-		summary.WriteString(fmt.Sprintf("  Write to RocksDB:        %s (%.1f%%)\n", formatElapsed(writeTime), float64(writeTime)/float64(totalWorkerTime)*100))
+		summary.WriteString(fmt.Sprintf("  Write (hot+cold):        %s (%.1f%%)\n", formatElapsed(writeTime), float64(writeTime)/float64(totalWorkerTime)*100))
 	}
 
 	summary.WriteString("\n")
 	summary.WriteString("Raw Event Data (XDR):\n")
 	summary.WriteString(fmt.Sprintf("  Total size:              %.2f MB\n", rawDataMB))
-	summary.WriteString(fmt.Sprintf("  Event count:             %d\n", totalEvents))
-	if totalEvents > 0 && rawDataMB > 0 {
-		rawBytesPerEvent := (rawDataMB * 1024 * 1024) / float64(totalEvents)
+	summary.WriteString(fmt.Sprintf("  Event count:             %d\n", eventCount))
+	if eventCount > 0 && rawDataMB > 0 {
+		rawBytesPerEvent := (rawDataMB * 1024 * 1024) / float64(eventCount)
 		summary.WriteString(fmt.Sprintf("  Avg bytes/event:         %.f\n", rawBytesPerEvent))
-	}
-
-	// Pre-compaction storage stats by column family
-	if preSnapshot != nil {
-		summary.WriteString("\n")
-		summary.WriteString("RocksDB Storage (pre-compaction):\n")
-		printStorageSnapshot(&summary, preSnapshot)
 	}
 
 	fmt.Fprint(os.Stderr, summary.String())
@@ -261,119 +390,70 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 	if err := os.WriteFile(summaryFile, []byte(summary.String()), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to write summary file: %v\n", err)
 	}
-
-	var postSummary strings.Builder
-
-	// Run compaction if enabled
-	if cfg.Ingestion.FinalCompaction && eventStore.RocksDB() != nil {
-		fmt.Fprintf(os.Stderr, "\nRunning final compaction...\n")
-		compactionSummary, err := eventStore.RocksDB().CompactAllWithStats()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: compaction failed: %v\n", err)
-		} else {
-			fmt.Fprintf(os.Stderr, "Compaction completed in %s\n", formatElapsed(compactionSummary.Duration))
-			printCompactionSummary(&postSummary, compactionSummary)
-		}
-	}
-
-	// Compute event stats if enabled
-	if cfg.Ingestion.ComputeStats && eventStore.RocksDB() != nil {
-		fmt.Fprintf(os.Stderr, "\nComputing event statistics using %d workers...\n", workers)
-
-		statsStart := time.Now()
-		eventStats, err := eventStore.RocksDB().ComputeEventStats(workers)
-		statsTime := time.Since(statsStart)
-		fmt.Fprintf(os.Stderr, "Stats computed in %s\n", formatElapsed(statsTime))
-
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to compute event stats: %v\n", err)
-		} else {
-			postSummary.WriteString("\n")
-			postSummary.WriteString("Event Statistics:\n")
-			postSummary.WriteString(fmt.Sprintf("  Computation time:        %s\n", formatElapsed(statsTime)))
-			postSummary.WriteString(fmt.Sprintf("  Contract events:         %d\n", eventStats.ContractEvents))
-			postSummary.WriteString(fmt.Sprintf("  System events:           %d\n", eventStats.SystemEvents))
-			postSummary.WriteString(fmt.Sprintf("  Diagnostic events:       %d\n", eventStats.DiagnosticEvents))
-			postSummary.WriteString("\n")
-			postSummary.WriteString(fmt.Sprintf("  Unique contracts:        %d\n", eventStats.UniqueContracts))
-			postSummary.WriteString(fmt.Sprintf("  Unique topic0:           %d\n", eventStats.UniqueTopic0))
-			postSummary.WriteString(fmt.Sprintf("  Unique topic1:           %d\n", eventStats.UniqueTopic1))
-			postSummary.WriteString(fmt.Sprintf("  Unique topic2:           %d\n", eventStats.UniqueTopic2))
-			postSummary.WriteString(fmt.Sprintf("  Unique topic3:           %d\n", eventStats.UniqueTopic3))
-		}
-	}
-
-	fmt.Fprint(os.Stderr, postSummary.String())
-
-	// Append to summary file
-	f, err := os.OpenFile(summaryFile, os.O_APPEND|os.O_WRONLY, 0644)
-	if err == nil {
-		_, _ = f.WriteString(postSummary.String())
-		_ = f.Close()
-	}
 }
 
-// printStorageSnapshot prints a storage snapshot in a formatted table
-func printStorageSnapshot(sb *strings.Builder, snapshot *store.StorageSnapshot) {
-	p := message.NewPrinter(language.English)
-
-	sb.WriteString("  Column Family      Keys          SST Files    Memtable     Files\n")
-	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
-
-	// Print in a consistent order
-	cfOrder := []string{
-		"events", "unique", "default",
-		"contracts_bm32", "topics_bm32",
-	}
-	for _, name := range cfOrder {
-		cf, ok := snapshot.ColumnFamilies[name]
-		if !ok {
-			continue
-		}
-		sstMB := float64(cf.SSTFilesBytes) / (1024 * 1024)
-		memMB := float64(cf.MemtableBytes) / (1024 * 1024)
-		sb.WriteString(p.Sprintf("  %-16s %12d    %8.1f MB  %8.1f MB  %5d\n",
-			cf.Name, cf.EstimatedKeys, sstMB, memMB, cf.NumFiles))
+// processLedger reads and parses a single ledger (used by hot ingest workers).
+func processLedger(reader *ingest.LedgerReader, seq uint32, networkPassphrase string) *ingest.LedgerResult {
+	result := &ingest.LedgerResult{
+		Sequence: seq,
+		Stats:    ingest.NewLedgerStats(),
 	}
 
-	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
-	totalSSTMB := float64(snapshot.TotalSST) / (1024 * 1024)
-	totalMemMB := float64(snapshot.TotalMemtable) / (1024 * 1024)
-	sb.WriteString(p.Sprintf("  %-16s %12s    %8.1f MB  %8.1f MB  %5d\n",
-		"TOTAL", "", totalSSTMB, totalMemMB, snapshot.TotalFiles))
+	xdrBytes, timing, err := reader.GetLedgerWithTiming(seq)
+	if timing != nil {
+		result.DiskReadTime = timing.DiskRead
+		result.DecompressTime = timing.Decompress
+	}
+
+	if err != nil {
+		result.Error = fmtErr("failed to read ledger %d: %v", seq, err)
+		return result
+	}
+
+	unmarshalStart := time.Now()
+	events, err := ingest.ExtractEventsFast(xdrBytes, networkPassphrase, result.Stats)
+	result.UnmarshalTime = time.Since(unmarshalStart)
+
+	if err != nil {
+		result.Error = fmtErr("failed to extract events from ledger %d: %v", seq, err)
+		return result
+	}
+
+	result.Events = events
+
+	for _, e := range events {
+		result.RawBytes += int64(len(e.RawXDR))
+	}
+
+	return result
 }
 
-// printCompactionSummary prints the compaction results in a formatted table
-func printCompactionSummary(sb *strings.Builder, cs *store.CompactionSummary) {
-	p := message.NewPrinter(language.English)
-
-	sb.WriteString("\n")
-	sb.WriteString(p.Sprintf("=== Compaction Summary (%s) ===\n", formatElapsed(cs.Duration)))
-	sb.WriteString("\n")
-	sb.WriteString("  Column Family      Before       After        Reclaimed    Savings\n")
-	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
-
-	// Print in a consistent order
-	cfOrder := []string{
-		"events", "unique", "default",
-		"contracts_bm32", "topics_bm32",
+// groupEventsByLedger groups events into per-ledger slices, preserving order.
+func groupEventsByLedger(events []*event.IngestEvent) [][]*event.IngestEvent {
+	if len(events) == 0 {
+		return nil
 	}
-	for _, name := range cfOrder {
-		cf, ok := cs.PerCF[name]
-		if !ok {
-			continue
+
+	var result [][]*event.IngestEvent
+	var current []*event.IngestEvent
+	var currentLedger uint32
+
+	for _, ev := range events {
+		if len(current) > 0 && ev.LedgerSequence != currentLedger {
+			result = append(result, current)
+			current = nil
 		}
-		beforeMB := float64(cf.BeforeBytes) / (1024 * 1024)
-		afterMB := float64(cf.AfterBytes) / (1024 * 1024)
-		reclaimedMB := float64(cf.Reclaimed) / (1024 * 1024)
-		sb.WriteString(p.Sprintf("  %-16s %8.1f MB  %8.1f MB  %8.1f MB  %6.1f%%\n",
-			cf.Name, beforeMB, afterMB, reclaimedMB, cf.SavingsPercent))
+		currentLedger = ev.LedgerSequence
+		current = append(current, ev)
+	}
+	if len(current) > 0 {
+		result = append(result, current)
 	}
 
-	sb.WriteString("  ─────────────────────────────────────────────────────────────────\n")
-	beforeMB := float64(cs.Before.TotalSST) / (1024 * 1024)
-	afterMB := float64(cs.After.TotalSST) / (1024 * 1024)
-	reclaimedMB := float64(cs.TotalReclaimed) / (1024 * 1024)
-	sb.WriteString(p.Sprintf("  %-16s %8.1f MB  %8.1f MB  %8.1f MB  %6.1f%%\n",
-		"TOTAL", beforeMB, afterMB, reclaimedMB, cs.SavingsPercent))
+	return result
+}
+
+// fmtErr creates a formatted error.
+func fmtErr(format string, args ...interface{}) error {
+	return fmt.Errorf(format, args...)
 }
