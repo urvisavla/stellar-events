@@ -272,51 +272,43 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 
 					// Log per-segment stats before conversion
 					meta := hotWriter.CommittedLengths()
-					indexEntries := int(meta.IndexDeltasLen / 21)
 					var ms runtime.MemStats
 					runtime.ReadMemStats(&ms)
 					wallMs := float64(time.Since(segStartTime).Milliseconds())
 					wallSec := wallMs / 1000.0
-					var eventsPerSec, eventThroughput, indexThroughput, avgEventBytes float64
+					var eventsPerSec, avgEventBytes float64
 					if wallSec > 0 {
 						eventsPerSec = float64(segEvents) / wallSec
-						eventThroughput = float64(meta.EventsDatLen) / wallSec / (1024 * 1024)
-						indexThroughput = float64(meta.IndexDeltasLen) / wallSec / (1024 * 1024)
 					}
 					if segEvents > 0 {
 						avgEventBytes = float64(meta.EventsDatLen) / float64(segEvents)
 					}
 					heapMB := int64(ms.HeapInuse / (1024 * 1024))
 
-					fmt.Fprintf(os.Stderr, "[segment %06d] %d ledgers, %d events, %s events, %s index (%d entries)\n",
+					fmt.Fprintf(os.Stderr, "[segment %06d] %d ledgers, %d events, %s raw, avg %.0f bytes/event\n",
 						currentSegID, segLedgers, segEvents,
-						formatBytes(meta.EventsDatLen), formatBytes(meta.IndexDeltasLen), indexEntries)
-					fmt.Fprintf(os.Stderr, "[segment %06d] %.0f events/s, event I/O %.1f MB/s, index I/O %.1f MB/s, avg %.0f bytes/event\n",
-						currentSegID, eventsPerSec, eventThroughput, indexThroughput, avgEventBytes)
-					fmt.Fprintf(os.Stderr, "[segment %06d] heap: %d MB, wall: %.0fms\n",
-						currentSegID, heapMB, wallMs)
+						formatBytes(meta.EventsDatLen), avgEventBytes)
+					fmt.Fprintf(os.Stderr, "[segment %06d] %.0f events/s, heap: %d MB, wall: %.0fms\n",
+						currentSegID, eventsPerSec, heapMB, wallMs)
 
 					segStats := progress.SegmentStats{
-						SegmentID:       currentSegID,
-						Ledgers:         segLedgers,
-						Events:          segEvents,
-						EventBytes:      meta.EventsDatLen,
-						IndexBytes:      meta.IndexDeltasLen,
-						IndexEntries:    indexEntries,
-						AvgEventBytes:   avgEventBytes,
-						EventsPerSec:    eventsPerSec,
-						EventThroughput: eventThroughput,
-						IndexThroughput: indexThroughput,
-						HeapInUseMB:     heapMB,
-						IngestWallMs:          wallMs,
+						SegmentID:     currentSegID,
+						Ledgers:       segLedgers,
+						Events:        segEvents,
+						HotEventBytes: meta.EventsDatLen,
+						AvgEventBytes: avgEventBytes,
+						EventsPerSec: eventsPerSec,
+						HeapInUseMB:   heapMB,
+						IngestWallMs:  wallMs,
 					}
 
 					if err := hotWriter.ConvertToCold(indexStore, sdw, &segStats); err != nil {
 						pipelineErr = fmtErr("convert segment %d to cold: %v", currentSegID, err)
 						break
 					}
-					fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), %d terms, heap freed %d MB\n",
-						currentSegID, segStats.FreezeWallMs, segStats.EventsPackMs, segStats.MphfMs, segStats.IndexTerms, segStats.HeapFreedMB)
+					fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), %d terms, cold: %s events, %s index, heap freed %d MB\n",
+						currentSegID, segStats.FreezeWallMs, segStats.EventsPackMs, segStats.MphfMs, segStats.IndexTerms,
+						formatBytes(segStats.ColdEventBytes), formatBytes(segStats.ColdIndexBytes), segStats.HeapFreedMB)
 
 					allSegmentMetrics = append(allSegmentMetrics, segStats)
 					if progressWriter != nil {
@@ -420,50 +412,42 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 
 		// Log per-segment stats for the final segment
 		meta := hotWriter.CommittedLengths()
-		indexEntries := int(meta.IndexDeltasLen / 21)
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
 		wallMs := float64(time.Since(segStartTime).Milliseconds())
 		wallSec := wallMs / 1000.0
-		var eventsPerSec, eventThroughput, indexThroughput, avgEventBytes float64
+		var eventsPerSec, avgEventBytes float64
 		if wallSec > 0 {
 			eventsPerSec = float64(segEvents) / wallSec
-			eventThroughput = float64(meta.EventsDatLen) / wallSec / (1024 * 1024)
-			indexThroughput = float64(meta.IndexDeltasLen) / wallSec / (1024 * 1024)
 		}
 		if segEvents > 0 {
 			avgEventBytes = float64(meta.EventsDatLen) / float64(segEvents)
 		}
 		heapMB := int64(ms.HeapInuse / (1024 * 1024))
 
-		fmt.Fprintf(os.Stderr, "[segment %06d] %d ledgers, %d events, %s events, %s index (%d entries)\n",
+		fmt.Fprintf(os.Stderr, "[segment %06d] %d ledgers, %d events, %s raw, avg %.0f bytes/event\n",
 			currentSegID, segLedgers, segEvents,
-			formatBytes(meta.EventsDatLen), formatBytes(meta.IndexDeltasLen), indexEntries)
-		fmt.Fprintf(os.Stderr, "[segment %06d] %.0f events/s, event I/O %.1f MB/s, index I/O %.1f MB/s, avg %.0f bytes/event\n",
-			currentSegID, eventsPerSec, eventThroughput, indexThroughput, avgEventBytes)
-		fmt.Fprintf(os.Stderr, "[segment %06d] heap: %d MB, wall: %.0fms\n",
-			currentSegID, heapMB, wallMs)
+			formatBytes(meta.EventsDatLen), avgEventBytes)
+		fmt.Fprintf(os.Stderr, "[segment %06d] %.0f events/s, heap: %d MB, wall: %.0fms\n",
+			currentSegID, eventsPerSec, heapMB, wallMs)
 
 		segStats := progress.SegmentStats{
-			SegmentID:       currentSegID,
-			Ledgers:         segLedgers,
-			Events:          segEvents,
-			EventBytes:      meta.EventsDatLen,
-			IndexBytes:      meta.IndexDeltasLen,
-			IndexEntries:    indexEntries,
-			AvgEventBytes:   avgEventBytes,
-			EventsPerSec:    eventsPerSec,
-			EventThroughput: eventThroughput,
-			IndexThroughput: indexThroughput,
-			HeapInUseMB:     heapMB,
-			IngestWallMs:          wallMs,
+			SegmentID:     currentSegID,
+			Ledgers:       segLedgers,
+			Events:        segEvents,
+			HotEventBytes: meta.EventsDatLen,
+			AvgEventBytes: avgEventBytes,
+			EventsPerSec:  eventsPerSec,
+			HeapInUseMB:   heapMB,
+			IngestWallMs:  wallMs,
 		}
 
 		if err := hotWriter.ConvertToCold(indexStore, sdw, &segStats); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to convert last segment to cold: %v\n", err)
 		}
-		fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), heap freed %d MB\n",
-			currentSegID, segStats.FreezeWallMs, segStats.EventsPackMs, segStats.MphfMs, segStats.HeapFreedMB)
+		fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), %d terms, cold: %s events, %s index, heap freed %d MB\n",
+			currentSegID, segStats.FreezeWallMs, segStats.EventsPackMs, segStats.MphfMs, segStats.IndexTerms,
+			formatBytes(segStats.ColdEventBytes), formatBytes(segStats.ColdIndexBytes), segStats.HeapFreedMB)
 
 		allSegmentMetrics = append(allSegmentMetrics, segStats)
 		if progressWriter != nil {

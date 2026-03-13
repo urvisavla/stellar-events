@@ -637,35 +637,37 @@ func (es *Store) finalizeCompletedSegment(segmentID uint32) error {
 	fmt.Fprintf(os.Stderr, "  [finalize %d] total: %v, heap freed %d MB (%d→%d)\n",
 		segmentID, time.Since(t0), freedMB, beforeMB, afterMB)
 
-	// Compute per-segment metrics after finalization (so we can stat cold output files)
-	var indexBytes int64
+	// Stat cold output files for on-disk sizes
+	var coldIndexBytes, coldEventBytes int64
 	if es.segmentPath != "" {
 		dirName := fmt.Sprintf("%06d", segmentID)
 		segDir := filepath.Join(es.segmentPath, dirName)
 		for _, name := range []string{"index.hash", "index.pack"} {
 			if fi, err := os.Stat(filepath.Join(segDir, name)); err == nil {
-				indexBytes += fi.Size()
+				coldIndexBytes += fi.Size()
 			}
+		}
+		if fi, err := os.Stat(filepath.Join(segDir, "events.pack")); err == nil {
+			coldEventBytes = fi.Size()
 		}
 	}
 
 	heapMB := int64(memAfter.HeapInuse / (1024 * 1024))
 	wallSec := segWallMs / 1000.0
-	var eventsPerSec, eventThroughput, indexThroughput, avgEventBytes float64
+	var eventsPerSec, avgEventBytes float64
 	if wallSec > 0 {
 		eventsPerSec = float64(es.segEvents) / wallSec
-		eventThroughput = float64(es.segEventBytes) / wallSec / (1024 * 1024)
-		indexThroughput = float64(indexBytes) / wallSec / (1024 * 1024)
 	}
 	if es.segEvents > 0 {
 		avgEventBytes = float64(es.segEventBytes) / float64(es.segEvents)
 	}
 
-	fmt.Fprintf(os.Stderr, "[segment %06d] %d ledgers, %d events, %s events, %s index (%d terms)\n",
+	fmt.Fprintf(os.Stderr, "[segment %06d] %d ledgers, %d events, %s raw, %d terms, cold: %s events, %s index\n",
 		segmentID, es.segLedgers, es.segEvents,
-		formatBytesStore(es.segEventBytes), formatBytesStore(indexBytes), indexTerms)
-	fmt.Fprintf(os.Stderr, "[segment %06d] %.0f events/s, event I/O %.1f MB/s, index I/O %.1f MB/s, avg %.0f bytes/event\n",
-		segmentID, eventsPerSec, eventThroughput, indexThroughput, avgEventBytes)
+		formatBytesStore(es.segEventBytes), indexTerms,
+		formatBytesStore(coldEventBytes), formatBytesStore(coldIndexBytes))
+	fmt.Fprintf(os.Stderr, "[segment %06d] %.0f events/s, avg %.0f bytes/event\n",
+		segmentID, eventsPerSec, avgEventBytes)
 	freezeMs := float64(time.Since(t0).Microseconds()) / 1000
 	flushMs := float64(time.Since(t1).Microseconds()) / 1000
 
@@ -675,22 +677,21 @@ func (es *Store) finalizeCompletedSegment(segmentID uint32) error {
 		segmentID, freezeMs, flushMs, freezeMs-flushMs, freedMB)
 
 	es.segmentMetrics = append(es.segmentMetrics, progress.SegmentStats{
-		SegmentID:       segmentID,
-		Ledgers:         es.segLedgers,
-		Events:          es.segEvents,
-		EventBytes:      es.segEventBytes,
-		IndexBytes:      indexBytes,
-		AvgEventBytes:   avgEventBytes,
-		EventsPerSec:    eventsPerSec,
-		EventThroughput: eventThroughput,
-		IndexThroughput: indexThroughput,
-		IndexTerms:      indexTerms,
-		HeapInUseMB:     heapMB,
-		IngestWallMs:          segWallMs,
-		FreezeWallMs:        freezeMs,
-		FlushMs:         flushMs,
-		MphfMs:          freezeMs - flushMs,
-		HeapFreedMB:     freedMB,
+		SegmentID:      segmentID,
+		Ledgers:        es.segLedgers,
+		Events:         es.segEvents,
+		HotEventBytes:  es.segEventBytes,
+		IndexTerms:     indexTerms,
+		ColdEventBytes: coldEventBytes,
+		ColdIndexBytes: coldIndexBytes,
+		AvgEventBytes:  avgEventBytes,
+		EventsPerSec:   eventsPerSec,
+		HeapInUseMB:    heapMB,
+		IngestWallMs:   segWallMs,
+		FreezeWallMs:   freezeMs,
+		FlushMs:        flushMs,
+		MphfMs:         freezeMs - flushMs,
+		HeapFreedMB:    freedMB,
 	})
 
 	return nil

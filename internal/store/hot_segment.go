@@ -399,6 +399,17 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 			indexTerms += len(t)
 		}
 		stats.IndexTerms = indexTerms
+
+		// Stat cold output files for on-disk sizes
+		coldDir := filepath.Join(coldBasePath, fmt.Sprintf("%06d", segID))
+		for _, name := range []string{"index.hash", "index.pack"} {
+			if fi, err := os.Stat(filepath.Join(coldDir, name)); err == nil {
+				stats.ColdIndexBytes += fi.Size()
+			}
+		}
+		if fi, err := os.Stat(filepath.Join(coldDir, "events.pack")); err == nil {
+			stats.ColdEventBytes = fi.Size()
+		}
 	}
 
 	return nil

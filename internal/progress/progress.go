@@ -54,14 +54,12 @@ type SegmentStats struct {
 	SegmentID       uint32  `json:"segment_id"`
 	Ledgers         int     `json:"ledgers"`
 	Events          int     `json:"events"`
-	EventBytes      int64   `json:"event_bytes"`          // bytes written to events.dat / events.pack
-	IndexBytes      int64   `json:"index_bytes"`          // bytes written to index files
-	IndexEntries    int     `json:"index_entries"`         // number of term delta entries
+	HotEventBytes   int64   `json:"hot_event_bytes"`       // events.dat on-disk size (raw, uncompressed)
 	IndexTerms      int     `json:"index_terms"`           // unique index terms (contracts + topics)
+	ColdEventBytes  int64   `json:"cold_event_bytes"`      // events.pack on-disk size
+	ColdIndexBytes  int64   `json:"cold_index_bytes"`      // index.hash + index.pack on-disk size
 	AvgEventBytes   float64 `json:"avg_event_bytes"`       // EventBytes / Events
 	EventsPerSec    float64 `json:"events_per_sec"`        // Events / wall time
-	EventThroughput float64 `json:"event_throughput_mb_s"` // EventBytes / wall time (MB/s)
-	IndexThroughput float64 `json:"index_throughput_mb_s"` // IndexBytes / wall time (MB/s)
 	HeapInUseMB     int64   `json:"heap_in_use_mb"`        // current heap after segment completes
 	IngestWallMs    float64 `json:"ingest_wall_ms"`        // wall clock time for ingestion (excludes freeze)
 
