@@ -1011,7 +1011,7 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 			})
 		}
 	}
-	// Contract + all topics at one position OR'd
+	// Contract + all topics at one position OR'd (max 3 topic values)
 	if cHigh != "" && len(activePos) > 0 {
 		pos := activePos[0]
 		allTopicVals := make([]string, 0)
@@ -1020,6 +1020,9 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 		}
 		for _, v := range topicDatas[pos].Medium {
 			allTopicVals = append(allTopicVals, v)
+		}
+		if len(allTopicVals) > 3 {
+			allTopicVals = allTopicVals[:3]
 		}
 		if len(allTopicVals) > 1 {
 			queries = append(queries, QuerySpec{
@@ -1033,7 +1036,7 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 	// =========================================================================
 	// Section 5: Worst-case extremes
 	// =========================================================================
-	// worst-all: all contracts OR'd + all topic positions with all values OR'd
+	// worst-all: all contracts OR'd + all topic positions with values OR'd (max 3 per position)
 	{
 		allContracts := make([]string, 0)
 		allContracts = append(allContracts, data.Contracts.High...)
@@ -1044,6 +1047,9 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 			var vals []string
 			vals = append(vals, topicDatas[pos].High...)
 			vals = append(vals, topicDatas[pos].Medium...)
+			if len(vals) > 3 {
+				vals = vals[:3]
+			}
 			if len(vals) > 0 {
 				topicsSpec[pos] = vals
 				hasTopics = true
@@ -1057,8 +1063,14 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 			})
 		}
 	}
-	// worst-and-all: high contract + high topic at every active position
+	// worst-and-all: up to 5 contracts OR'd + high topic at every active position
 	if cHigh != "" && len(activePos) >= 2 {
+		andContracts := make([]string, 0, 5)
+		andContracts = append(andContracts, data.Contracts.High...)
+		andContracts = append(andContracts, data.Contracts.Medium...)
+		if len(andContracts) > 5 {
+			andContracts = andContracts[:5]
+		}
 		pvs := make([]struct {
 			pos  int
 			vals []string
@@ -1068,7 +1080,7 @@ func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []Query
 		}
 		queries = append(queries, QuerySpec{
 			Name:        "worst-and-all",
-			ContractIDs: []string{cHigh},
+			ContractIDs: andContracts,
 			Topics:      makeTopics(pvs...),
 		})
 	}
