@@ -56,6 +56,11 @@ type SegmentStats struct {
 	Events          int     `json:"events"`
 	HotEventBytes   int64   `json:"hot_event_bytes"`       // events.dat on-disk size (raw, uncompressed)
 	IndexTerms      int     `json:"index_terms"`           // unique index terms (contracts + topics)
+	ContractTerms   int     `json:"contract_terms"`        // unique contract IDs
+	Topic0Terms     int     `json:"topic0_terms"`          // unique topic0 values
+	Topic1Terms     int     `json:"topic1_terms"`          // unique topic1 values
+	Topic2Terms     int     `json:"topic2_terms"`          // unique topic2 values
+	Topic3Terms     int     `json:"topic3_terms"`          // unique topic3 values
 	ColdEventBytes  int64   `json:"cold_event_bytes"`      // events.pack on-disk size
 	ColdIndexBytes  int64   `json:"cold_index_bytes"`      // index.hash + index.pack on-disk size
 	AvgEventBytes   float64 `json:"avg_event_bytes"`       // EventBytes / Events

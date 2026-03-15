@@ -65,6 +65,28 @@ func (r *SegmentReader) Close() error {
 	return nil
 }
 
+// PurgeCache closes and clears all cached mmaps, indexes, and readers so that
+// subsequent queries must re-open files from disk. Used by cold-cache benchmarks
+// to ensure OS page cache purge is effective (mmap'd pages can't be evicted).
+func (r *SegmentReader) PurgeCache() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, mm := range r.mmapCache {
+		mm.Close()
+	}
+	for _, hi := range r.hashCache {
+		hi.Close()
+	}
+	for _, er := range r.eventCache {
+		er.Close()
+	}
+	r.mmapCache = make(map[string]*MmapFile)
+	r.hashCache = make(map[string]*streamhash.Index)
+	r.eventCache = make(map[string]*eventstore.Reader)
+	r.appDataCache = make(map[string][]byte)
+	r.recordSizeCache = make(map[string]int)
+}
+
 // LoadTermBitmap loads a bitmap for a specific term in a specific segment,
 // trimmed to the given ledger range. Returns nil bitmap if the term doesn't exist.
 // fieldIndex: 0=contracts, 1-4=topic positions 0-3.

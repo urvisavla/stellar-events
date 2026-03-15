@@ -306,8 +306,9 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 						pipelineErr = fmtErr("convert segment %d to cold: %v", currentSegID, err)
 						break
 					}
-					fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), %d terms, cold: %s events, %s index, heap freed %d MB\n",
+					fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), %d terms (c:%d t0:%d t1:%d t2:%d t3:%d), cold: %s events, %s index, heap freed %d MB\n",
 						currentSegID, segStats.FreezeWallMs, segStats.EventsPackMs, segStats.MphfMs, segStats.IndexTerms,
+						segStats.ContractTerms, segStats.Topic0Terms, segStats.Topic1Terms, segStats.Topic2Terms, segStats.Topic3Terms,
 						formatBytes(segStats.ColdEventBytes), formatBytes(segStats.ColdIndexBytes), segStats.HeapFreedMB)
 
 					allSegmentMetrics = append(allSegmentMetrics, segStats)
@@ -445,8 +446,9 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 		if err := hotWriter.ConvertToCold(indexStore, sdw, &segStats); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to convert last segment to cold: %v\n", err)
 		}
-		fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), %d terms, cold: %s events, %s index, heap freed %d MB\n",
+		fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), %d terms (c:%d t0:%d t1:%d t2:%d t3:%d), cold: %s events, %s index, heap freed %d MB\n",
 			currentSegID, segStats.FreezeWallMs, segStats.EventsPackMs, segStats.MphfMs, segStats.IndexTerms,
+			segStats.ContractTerms, segStats.Topic0Terms, segStats.Topic1Terms, segStats.Topic2Terms, segStats.Topic3Terms,
 			formatBytes(segStats.ColdEventBytes), formatBytes(segStats.ColdIndexBytes), segStats.HeapFreedMB)
 
 		allSegmentMetrics = append(allSegmentMetrics, segStats)

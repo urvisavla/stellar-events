@@ -254,14 +254,14 @@ func writeSegmentMetricsSummary(sb *strings.Builder, metrics []progress.SegmentS
 
 	sb.WriteString("\n")
 	sb.WriteString("Per-Segment Metrics:\n")
-	sb.WriteString("  Segment    Events   Terms   Hot Events   Cold Events   Cold Index    Ingest     Freeze     Heap   GC Freed   Events/s\n")
-	sb.WriteString("  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n")
+	sb.WriteString("  Segment    Events   Terms   Contracts   Topic0   Topic1   Topic2   Topic3   Hot Events   Cold Events   Cold Index    Ingest     Freeze     Heap   GC Freed   Events/s\n")
+	sb.WriteString("  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n")
 
 	var totalEvents int
 	var totalHotEventBytes, totalColdEventBytes, totalColdIndexBytes int64
 	var totalIngestMs, totalFreezeMs float64
 	var totalFreedMB int64
-	var totalTerms int
+	var totalTerms, totalContracts, totalT0, totalT1, totalT2, totalT3 int
 	for _, m := range metrics {
 		freezeStr := ""
 		if m.FreezeWallMs > 0 {
@@ -271,8 +271,9 @@ func writeSegmentMetricsSummary(sb *strings.Builder, metrics []progress.SegmentS
 		if m.HeapFreedMB != 0 {
 			freedStr = p.Sprintf("%d MB", m.HeapFreedMB)
 		}
-		sb.WriteString(p.Sprintf("  %06d    %6d   %5d   %10s   %10s   %10s   %7s   %8s   %4d MB   %6s   %8.0f\n",
+		sb.WriteString(p.Sprintf("  %06d    %6d   %5d   %9d   %6d   %6d   %6d   %6d   %10s   %10s   %10s   %7s   %8s   %4d MB   %6s   %8.0f\n",
 			m.SegmentID, m.Events, m.IndexTerms,
+			m.ContractTerms, m.Topic0Terms, m.Topic1Terms, m.Topic2Terms, m.Topic3Terms,
 			formatBytes(m.HotEventBytes),
 			formatBytes(m.ColdEventBytes), formatBytes(m.ColdIndexBytes),
 			formatElapsed(time.Duration(m.IngestWallMs)*time.Millisecond),
@@ -286,9 +287,14 @@ func writeSegmentMetricsSummary(sb *strings.Builder, metrics []progress.SegmentS
 		totalFreezeMs += m.FreezeWallMs
 		totalFreedMB += m.HeapFreedMB
 		totalTerms += m.IndexTerms
+		totalContracts += m.ContractTerms
+		totalT0 += m.Topic0Terms
+		totalT1 += m.Topic1Terms
+		totalT2 += m.Topic2Terms
+		totalT3 += m.Topic3Terms
 	}
 
-	sb.WriteString("  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n")
+	sb.WriteString("  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n")
 	totalIngestSec := totalIngestMs / 1000.0
 	var avgEventsPerSec float64
 	if totalIngestSec > 0 {
@@ -302,8 +308,9 @@ func writeSegmentMetricsSummary(sb *strings.Builder, metrics []progress.SegmentS
 	if totalFreedMB != 0 {
 		totalFreedStr = p.Sprintf("%d MB", totalFreedMB)
 	}
-	sb.WriteString(p.Sprintf("  TOTAL     %6d   %5d   %10s   %10s   %10s   %7s   %8s            %6s   %8.0f\n",
+	sb.WriteString(p.Sprintf("  TOTAL     %6d   %5d   %9d   %6d   %6d   %6d   %6d   %10s   %10s   %10s   %7s   %8s            %6s   %8.0f\n",
 		totalEvents, totalTerms,
+		totalContracts, totalT0, totalT1, totalT2, totalT3,
 		formatBytes(totalHotEventBytes),
 		formatBytes(totalColdEventBytes), formatBytes(totalColdIndexBytes),
 		formatElapsed(time.Duration(totalIngestMs)*time.Millisecond),

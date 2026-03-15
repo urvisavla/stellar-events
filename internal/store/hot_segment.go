@@ -394,11 +394,20 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 		stats.MphfMs = float64(mphfTime.Microseconds()) / 1000
 		stats.CleanupMs = float64(cleanupTime.Microseconds()) / 1000
 		stats.HeapFreedMB = freedMB
-		indexTerms := len(cached.Contracts)
-		for _, t := range cached.Topics {
-			indexTerms += len(t)
+		stats.ContractTerms = len(cached.Contracts)
+		for i, t := range cached.Topics {
+			switch i {
+			case 0:
+				stats.Topic0Terms = len(t)
+			case 1:
+				stats.Topic1Terms = len(t)
+			case 2:
+				stats.Topic2Terms = len(t)
+			case 3:
+				stats.Topic3Terms = len(t)
+			}
 		}
-		stats.IndexTerms = indexTerms
+		stats.IndexTerms = stats.ContractTerms + stats.Topic0Terms + stats.Topic1Terms + stats.Topic2Terms + stats.Topic3Terms
 
 		// Stat cold output files for on-disk sizes
 		coldDir := filepath.Join(coldBasePath, fmt.Sprintf("%06d", segID))

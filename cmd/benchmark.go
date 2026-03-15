@@ -181,10 +181,19 @@ func runBenchmark(cfg *config.Config, args []string) {
 			originalStartLedger, originalEndLedger, originalEndLedger-originalStartLedger, maxLedgerRange)
 	}
 
-	// Parse datastores
+	// Parse datastores — only include backends that are actually enabled in config
 	var datastores []string
 	if *datastoreFlag == "all" {
-		datastores = []string{"rocksdb", "flatfiles"}
+		if cfg.Storage.RocksDB {
+			datastores = append(datastores, "rocksdb")
+		}
+		if cfg.Storage.SegmentFiles {
+			datastores = append(datastores, "flatfiles")
+		}
+		if len(datastores) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: no storage backends enabled in config\n")
+			os.Exit(2)
+		}
 	} else {
 		for _, name := range strings.Split(*datastoreFlag, ",") {
 			if name != "rocksdb" && name != "flatfiles" {
@@ -875,6 +884,7 @@ func runQueryBenchmark(eventStore *store.Store, data *BenchmarkData, spec QueryS
 	// Warmup runs (with timeout)
 	for i := 0; i < warmup; i++ {
 		if coldCache {
+			eventStore.PurgeQueryCache()
 			if err := purgePageCache(); err != nil {
 				fmt.Fprintf(os.Stderr, "\nWarning: failed to purge page cache: %v\n", err)
 			}
@@ -895,6 +905,7 @@ func runQueryBenchmark(eventStore *store.Store, data *BenchmarkData, spec QueryS
 	// Benchmark runs
 	for i := 0; i < iterations; i++ {
 		if coldCache {
+			eventStore.PurgeQueryCache()
 			if err := purgePageCache(); err != nil {
 				fmt.Fprintf(os.Stderr, "\nWarning: failed to purge page cache: %v\n", err)
 			}

@@ -442,16 +442,16 @@ func New(opts Config) (*Store, error) {
 		es.indexStore = NewIndexStore(flusher, nil, nil)
 	}
 
-	// Configure index write targets
-	segPath := ""
-	if opts.WriteSegmentFiles {
-		segPath = opts.SegmentPath
+	// Configure index write targets — cold segments live under <segmentPath>/cold/
+	coldPath := ""
+	if opts.WriteSegmentFiles && opts.SegmentPath != "" {
+		coldPath = filepath.Join(opts.SegmentPath, "cold")
 	}
-	es.indexStore.SetWriteConfig(segPath, es.rocksDB != nil)
+	es.indexStore.SetWriteConfig(coldPath, es.rocksDB != nil)
 
 	// Initialize segment data writer if segment files are enabled
-	if opts.WriteSegmentFiles && opts.SegmentPath != "" {
-		es.segmentDataWriter = NewSegmentDataWriter(opts.SegmentPath, opts.CompressData, opts.BlockSize)
+	if coldPath != "" {
+		es.segmentDataWriter = NewSegmentDataWriter(coldPath, opts.CompressData, opts.BlockSize)
 	}
 
 	// Initialize query backend — cold segments live under <segmentPath>/cold/
@@ -619,10 +619,12 @@ func (es *Store) finalizeCompletedSegment(segmentID uint32) error {
 	fmt.Fprintf(os.Stderr, "  [finalize %d] indexStore.Flush: %v\n", segmentID, time.Since(t1))
 
 	indexTerms := es.indexStore.SegmentTermCount(segmentID)
+	contractTerms, t0Terms, t1Terms, t2Terms, t3Terms := es.indexStore.SegmentTermCounts(segmentID)
 
+	coldPath := filepath.Join(es.segmentPath, "cold")
 	if es.segmentPath != "" {
 		t2 := time.Now()
-		if err := FinalizeSegment(es.indexStore, es.segmentPath, segmentID, es.segmentDataWriter); err != nil {
+		if err := FinalizeSegment(es.indexStore, coldPath, segmentID, es.segmentDataWriter); err != nil {
 			return err
 		}
 		fmt.Fprintf(os.Stderr, "  [finalize %d] FinalizeSegment: %v\n", segmentID, time.Since(t2))
@@ -641,7 +643,7 @@ func (es *Store) finalizeCompletedSegment(segmentID uint32) error {
 	var coldIndexBytes, coldEventBytes int64
 	if es.segmentPath != "" {
 		dirName := fmt.Sprintf("%06d", segmentID)
-		segDir := filepath.Join(es.segmentPath, dirName)
+		segDir := filepath.Join(coldPath, dirName)
 		for _, name := range []string{"index.hash", "index.pack"} {
 			if fi, err := os.Stat(filepath.Join(segDir, name)); err == nil {
 				coldIndexBytes += fi.Size()
@@ -682,6 +684,11 @@ func (es *Store) finalizeCompletedSegment(segmentID uint32) error {
 		Events:         es.segEvents,
 		HotEventBytes:  es.segEventBytes,
 		IndexTerms:     indexTerms,
+		ContractTerms:  contractTerms,
+		Topic0Terms:    t0Terms,
+		Topic1Terms:    t1Terms,
+		Topic2Terms:    t2Terms,
+		Topic3Terms:    t3Terms,
 		ColdEventBytes: coldEventBytes,
 		ColdIndexBytes: coldIndexBytes,
 		AvgEventBytes:  avgEventBytes,
@@ -772,6 +779,14 @@ func (es *Store) QueryEvents(contractIDs [][]byte, topicGroups [4][][]byte, star
 
 	result.TotalTime = time.Since(totalStart)
 	return result, events, nil
+}
+
+// PurgeQueryCache drops all cached mmaps, indexes, and readers from the query
+// backend so that the OS page cache purge is effective for cold-cache benchmarks.
+func (es *Store) PurgeQueryCache() {
+	if sr, ok := es.queryBackend.(*SegmentReader); ok {
+		sr.PurgeCache()
+	}
 }
 
 // Close closes the event store.
