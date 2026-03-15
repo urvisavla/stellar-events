@@ -783,313 +783,332 @@ func generateBenchmarkDataFromEvents(eventStore *store.Store, segmentPath string
 func generateQueryCombinations(data *BenchmarkData, maxCombinations int) []QuerySpec {
 	var queries []QuerySpec
 
-	// Helper: pick first value from a tier, empty string if unavailable
-	first := func(vals []string) string {
-		if len(vals) > 0 {
-			return vals[0]
+	// Flatten contracts
+	allContracts := append(append(data.Contracts.High, data.Contracts.Medium...), data.Contracts.Low...)
+
+	// Collect topics with position info
+	var allTopics []TopicWithPosition
+	addTopics := func(td TopicData, pos int) {
+		for _, t := range td.High {
+			allTopics = append(allTopics, TopicWithPosition{Position: pos, Value: t, Card: "high"})
 		}
-		return ""
-	}
-	second := func(vals []string) string {
-		if len(vals) >= 2 {
-			return vals[1]
+		for _, t := range td.Medium {
+			allTopics = append(allTopics, TopicWithPosition{Position: pos, Value: t, Card: "med"})
 		}
-		return ""
+		for _, t := range td.Low {
+			allTopics = append(allTopics, TopicWithPosition{Position: pos, Value: t, Card: "low"})
+		}
+	}
+	addTopics(data.Topic0, 0)
+	addTopics(data.Topic1, 1)
+	addTopics(data.Topic2, 2)
+	addTopics(data.Topic3, 3)
+
+	contractCardLabel := func(idx int) string {
+		if idx < len(data.Contracts.High) {
+			return "high"
+		} else if idx < len(data.Contracts.High)+len(data.Contracts.Medium) {
+			return "med"
+		}
+		return "low"
 	}
 
-	// Contract values
-	cHigh := first(data.Contracts.High)
-	cHigh2 := second(data.Contracts.High)
-	cMed := first(data.Contracts.Medium)
-	cLow := first(data.Contracts.Low)
-
-	// Topic values per position: [pos] -> TopicData
-	topicDatas := [4]TopicData{data.Topic0, data.Topic1, data.Topic2, data.Topic3}
-	tHigh := [4]string{}   // first high per position
-	tHigh2 := [4]string{}  // second high per position
-	tMed := [4]string{}    // first med per position
-	tLow := [4]string{}    // first low per position
-	for pos := 0; pos < 4; pos++ {
-		tHigh[pos] = first(topicDatas[pos].High)
-		tHigh2[pos] = second(topicDatas[pos].High)
-		tMed[pos] = first(topicDatas[pos].Medium)
-		tLow[pos] = first(topicDatas[pos].Low)
-	}
-
-	// Helper: create positional topic spec from (position, values...) pairs
-	makeTopics := func(pvs ...struct {
-		pos  int
-		vals []string
-	}) [][]string {
+	// Helper to create positional topic spec: Topics[position] = []values
+	makeTopics := func(topics ...TopicWithPosition) [][]string {
 		result := make([][]string, 4)
-		for _, pv := range pvs {
-			result[pv.pos] = pv.vals
+		for _, t := range topics {
+			result[t.Position] = append(result[t.Position], t.Value)
 		}
 		return result
 	}
-	pv := func(pos int, vals ...string) struct {
-		pos  int
-		vals []string
-	} {
-		// Filter empty values
-		var filtered []string
-		for _, v := range vals {
-			if v != "" {
-				filtered = append(filtered, v)
+
+	// 1. Contract-only queries (single contract)
+	for i, c := range allContracts {
+		card := contractCardLabel(i)
+		queries = append(queries, QuerySpec{
+			Name:        fmt.Sprintf("contract-%s", card),
+			ContractIDs: []string{c},
+		})
+	}
+
+	// 2. Single topic queries (with position info)
+	for _, t := range allTopics {
+		queries = append(queries, QuerySpec{
+			Name:   fmt.Sprintf("t%d-%s", t.Position, t.Card),
+			Topics: makeTopics(t),
+		})
+	}
+
+	// 3. Contract + single topic combinations
+	for ci, c := range allContracts {
+		cCard := contractCardLabel(ci)
+		for _, t := range allTopics {
+			queries = append(queries, QuerySpec{
+				Name:        fmt.Sprintf("c-%s+t%d-%s", cCard, t.Position, t.Card),
+				ContractIDs: []string{c},
+				Topics:      makeTopics(t),
+			})
+		}
+	}
+
+	// 4. Two topic combinations (different positions)
+	for i := 0; i < len(allTopics); i++ {
+		for j := i + 1; j < len(allTopics); j++ {
+			t1, t2 := allTopics[i], allTopics[j]
+			if t1.Position == t2.Position {
+				continue
 			}
-		}
-		return struct {
-			pos  int
-			vals []string
-		}{pos, filtered}
-	}
-
-	// Identify which topic positions have data (high tier)
-	var activePos []int
-	for pos := 0; pos < 4; pos++ {
-		if tHigh[pos] != "" {
-			activePos = append(activePos, pos)
-		}
-	}
-
-	// =========================================================================
-	// Section 1: Single-field baselines (high, med, low)
-	// =========================================================================
-	if cHigh != "" {
-		queries = append(queries, QuerySpec{Name: "contract-high", ContractIDs: []string{cHigh}})
-	}
-	if cMed != "" {
-		queries = append(queries, QuerySpec{Name: "contract-med", ContractIDs: []string{cMed}})
-	}
-	if cLow != "" {
-		queries = append(queries, QuerySpec{Name: "contract-low", ContractIDs: []string{cLow}})
-	}
-	for _, pos := range activePos {
-		queries = append(queries, QuerySpec{
-			Name:   fmt.Sprintf("t%d-high", pos),
-			Topics: makeTopics(pv(pos, tHigh[pos])),
-		})
-	}
-	for _, pos := range activePos {
-		if tMed[pos] != "" {
 			queries = append(queries, QuerySpec{
-				Name:   fmt.Sprintf("t%d-med", pos),
-				Topics: makeTopics(pv(pos, tMed[pos])),
-			})
-		}
-	}
-	for _, pos := range activePos {
-		if tLow[pos] != "" {
-			queries = append(queries, QuerySpec{
-				Name:   fmt.Sprintf("t%d-low", pos),
-				Topics: makeTopics(pv(pos, tLow[pos])),
+				Name:   fmt.Sprintf("t%d-%s+t%d-%s", t1.Position, t1.Card, t2.Position, t2.Card),
+				Topics: makeTopics(t1, t2),
 			})
 		}
 	}
 
-	// =========================================================================
-	// Section 2: Same-field OR — worst case
-	// =========================================================================
-	// Multi-contract OR
-	if cHigh != "" && cHigh2 != "" {
-		queries = append(queries, QuerySpec{
-			Name:        "multi-c(high+high)",
-			ContractIDs: []string{cHigh, cHigh2},
-		})
-	}
-	if cHigh != "" && cMed != "" {
-		queries = append(queries, QuerySpec{
-			Name:        "multi-c(high+med)",
-			ContractIDs: []string{cHigh, cMed},
-		})
-	}
-	// Multi-topic OR per position (high+high)
-	for _, pos := range activePos {
-		if tHigh2[pos] != "" {
-			queries = append(queries, QuerySpec{
-				Name:   fmt.Sprintf("multi-t%d(high+high)", pos),
-				Topics: makeTopics(pv(pos, tHigh[pos], tHigh2[pos])),
-			})
-		}
-	}
-	// Multi-topic OR per position (high+med)
-	for _, pos := range activePos {
-		if tMed[pos] != "" {
-			queries = append(queries, QuerySpec{
-				Name:   fmt.Sprintf("multi-t%d(high+med)", pos),
-				Topics: makeTopics(pv(pos, tHigh[pos], tMed[pos])),
-			})
-		}
-	}
-
-	// =========================================================================
-	// Section 3: Cross-field AND — worst case (high × high)
-	// =========================================================================
-	// Contract + one topic (high × high)
-	for _, pos := range activePos {
-		if cHigh != "" {
-			queries = append(queries, QuerySpec{
-				Name:        fmt.Sprintf("c-high+t%d-high", pos),
-				ContractIDs: []string{cHigh},
-				Topics:      makeTopics(pv(pos, tHigh[pos])),
-			})
-		}
-	}
-	// Two topics AND (high × high, all pairs)
-	for i := 0; i < len(activePos); i++ {
-		for j := i + 1; j < len(activePos); j++ {
-			p1, p2 := activePos[i], activePos[j]
-			queries = append(queries, QuerySpec{
-				Name:   fmt.Sprintf("t%d-high+t%d-high", p1, p2),
-				Topics: makeTopics(pv(p1, tHigh[p1]), pv(p2, tHigh[p2])),
-			})
-		}
-	}
-	// Contract + two topics AND
-	if cHigh != "" && len(activePos) >= 2 {
-		for i := 0; i < len(activePos); i++ {
-			for j := i + 1; j < len(activePos); j++ {
-				p1, p2 := activePos[i], activePos[j]
+	// 5. Contract + two topics (different positions)
+	for ci, c := range allContracts {
+		cCard := contractCardLabel(ci)
+		for i := 0; i < len(allTopics); i++ {
+			for j := i + 1; j < len(allTopics); j++ {
+				t1, t2 := allTopics[i], allTopics[j]
+				if t1.Position == t2.Position {
+					continue
+				}
 				queries = append(queries, QuerySpec{
-					Name:        fmt.Sprintf("c-high+t%d+t%d", p1, p2),
-					ContractIDs: []string{cHigh},
-					Topics:      makeTopics(pv(p1, tHigh[p1]), pv(p2, tHigh[p2])),
+					Name:        fmt.Sprintf("c-%s+t%d+t%d", cCard, t1.Position, t2.Position),
+					ContractIDs: []string{c},
+					Topics:      makeTopics(t1, t2),
 				})
 			}
 		}
 	}
-	// Three topics AND
-	if len(activePos) >= 3 {
-		for i := 0; i < len(activePos); i++ {
-			for j := i + 1; j < len(activePos); j++ {
-				for k := j + 1; k < len(activePos); k++ {
-					p1, p2, p3 := activePos[i], activePos[j], activePos[k]
+
+	// 6. Three topic combinations (different positions)
+	for i := 0; i < len(allTopics); i++ {
+		for j := i + 1; j < len(allTopics); j++ {
+			for k := j + 1; k < len(allTopics); k++ {
+				t1, t2, t3 := allTopics[i], allTopics[j], allTopics[k]
+				if t1.Position == t2.Position || t1.Position == t3.Position || t2.Position == t3.Position {
+					continue
+				}
+				queries = append(queries, QuerySpec{
+					Name:   fmt.Sprintf("t%d+t%d+t%d", t1.Position, t2.Position, t3.Position),
+					Topics: makeTopics(t1, t2, t3),
+				})
+			}
+		}
+	}
+
+	// 7. Four topic combinations (all different positions)
+	for i := 0; i < len(allTopics); i++ {
+		for j := i + 1; j < len(allTopics); j++ {
+			for k := j + 1; k < len(allTopics); k++ {
+				for l := k + 1; l < len(allTopics); l++ {
+					t1, t2, t3, t4 := allTopics[i], allTopics[j], allTopics[k], allTopics[l]
+					positions := map[int]bool{t1.Position: true, t2.Position: true, t3.Position: true, t4.Position: true}
+					if len(positions) != 4 {
+						continue
+					}
 					queries = append(queries, QuerySpec{
-						Name:   fmt.Sprintf("t%d+t%d+t%d", p1, p2, p3),
-						Topics: makeTopics(pv(p1, tHigh[p1]), pv(p2, tHigh[p2]), pv(p3, tHigh[p3])),
+						Name:   "t0+t1+t2+t3",
+						Topics: makeTopics(t1, t2, t3, t4),
 					})
 				}
 			}
 		}
 	}
 
-	// =========================================================================
-	// Section 4: Combined OR+AND — worst case
-	// =========================================================================
-	// Multi-contract OR + topic AND
-	if cHigh != "" && cHigh2 != "" && len(activePos) > 0 {
-		queries = append(queries, QuerySpec{
-			Name:        fmt.Sprintf("multi-c(high+high)+t%d-high", activePos[0]),
-			ContractIDs: []string{cHigh, cHigh2},
-			Topics:      makeTopics(pv(activePos[0], tHigh[activePos[0]])),
-		})
+	// 8. Contract + three topics
+	for _, c := range allContracts {
+		for i := 0; i < len(allTopics); i++ {
+			for j := i + 1; j < len(allTopics); j++ {
+				for k := j + 1; k < len(allTopics); k++ {
+					t1, t2, t3 := allTopics[i], allTopics[j], allTopics[k]
+					if t1.Position == t2.Position || t1.Position == t3.Position || t2.Position == t3.Position {
+						continue
+					}
+					queries = append(queries, QuerySpec{
+						Name:        fmt.Sprintf("c+t%d+t%d+t%d", t1.Position, t2.Position, t3.Position),
+						ContractIDs: []string{c},
+						Topics:      makeTopics(t1, t2, t3),
+					})
+				}
+			}
+		}
 	}
-	// Contract AND + multi-topic OR
-	if cHigh != "" && len(activePos) > 0 && tHigh2[activePos[0]] != "" {
-		queries = append(queries, QuerySpec{
-			Name:        fmt.Sprintf("c-high+multi-t%d(high+high)", activePos[0]),
-			ContractIDs: []string{cHigh},
-			Topics:      makeTopics(pv(activePos[0], tHigh[activePos[0]], tHigh2[activePos[0]])),
-		})
-	}
-	// Both OR'd: multi-contract + multi-topic
-	if cHigh != "" && cHigh2 != "" && len(activePos) > 0 && tHigh2[activePos[len(activePos)-1]] != "" {
-		lastPos := activePos[len(activePos)-1]
-		queries = append(queries, QuerySpec{
-			Name:        fmt.Sprintf("multi-c(high+high)+multi-t%d(high+high)", lastPos),
-			ContractIDs: []string{cHigh, cHigh2},
-			Topics:      makeTopics(pv(lastPos, tHigh[lastPos], tHigh2[lastPos])),
-		})
-	}
-	// All contracts OR'd + topic
-	if len(data.Contracts.High) > 1 && len(activePos) > 0 {
-		allContracts := make([]string, 0, len(data.Contracts.High)+len(data.Contracts.Medium))
-		allContracts = append(allContracts, data.Contracts.High...)
-		allContracts = append(allContracts, data.Contracts.Medium...)
-		if len(allContracts) > 1 {
-			lastPos := activePos[len(activePos)-1]
+
+	// 9. Multi-contract queries (OR of 2-3 contracts, no topics)
+	if len(allContracts) >= 2 {
+		for i := 0; i < len(allContracts); i++ {
+			for j := i + 1; j < len(allContracts); j++ {
+				queries = append(queries, QuerySpec{
+					Name:        fmt.Sprintf("multi-c(%s+%s)", contractCardLabel(i), contractCardLabel(j)),
+					ContractIDs: []string{allContracts[i], allContracts[j]},
+				})
+			}
+		}
+		if len(allContracts) >= 3 {
 			queries = append(queries, QuerySpec{
-				Name:        fmt.Sprintf("multi-c(%d)+t%d-high", len(allContracts), lastPos),
-				ContractIDs: allContracts,
-				Topics:      makeTopics(pv(lastPos, tHigh[lastPos])),
-			})
-		}
-	}
-	// Contract + all topics at one position OR'd (max 3 topic values)
-	if cHigh != "" && len(activePos) > 0 {
-		pos := activePos[0]
-		allTopicVals := make([]string, 0)
-		for _, v := range topicDatas[pos].High {
-			allTopicVals = append(allTopicVals, v)
-		}
-		for _, v := range topicDatas[pos].Medium {
-			allTopicVals = append(allTopicVals, v)
-		}
-		if len(allTopicVals) > 3 {
-			allTopicVals = allTopicVals[:3]
-		}
-		if len(allTopicVals) > 1 {
-			queries = append(queries, QuerySpec{
-				Name:        fmt.Sprintf("c-high+multi-t%d(%d)", pos, len(allTopicVals)),
-				ContractIDs: []string{cHigh},
-				Topics:      makeTopics(pv(pos, allTopicVals...)),
+				Name:        "multi-c(all3)",
+				ContractIDs: allContracts[:3],
 			})
 		}
 	}
 
-	// =========================================================================
-	// Section 5: Worst-case extremes
-	// =========================================================================
-	// worst-all: all contracts OR'd + all topic positions with values OR'd (max 3 per position)
-	{
-		allContracts := make([]string, 0)
-		allContracts = append(allContracts, data.Contracts.High...)
-		allContracts = append(allContracts, data.Contracts.Medium...)
-		topicsSpec := make([][]string, 4)
-		var hasTopics bool
-		for pos := 0; pos < 4; pos++ {
-			var vals []string
-			vals = append(vals, topicDatas[pos].High...)
-			vals = append(vals, topicDatas[pos].Medium...)
-			if len(vals) > 3 {
-				vals = vals[:3]
+	// 10. Multi-topic-per-position queries (2-3 values OR'd at one position)
+	topicsByPos := make(map[int][]TopicWithPosition)
+	for _, t := range allTopics {
+		topicsByPos[t.Position] = append(topicsByPos[t.Position], t)
+	}
+	for pos, posTopics := range topicsByPos {
+		if len(posTopics) >= 2 {
+			for i := 0; i < len(posTopics); i++ {
+				for j := i + 1; j < len(posTopics); j++ {
+					topicsSpec := make([][]string, 4)
+					topicsSpec[pos] = []string{posTopics[i].Value, posTopics[j].Value}
+					queries = append(queries, QuerySpec{
+						Name:   fmt.Sprintf("multi-t%d(%s+%s)", pos, posTopics[i].Card, posTopics[j].Card),
+						Topics: topicsSpec,
+					})
+				}
 			}
-			if len(vals) > 0 {
-				topicsSpec[pos] = vals
-				hasTopics = true
+			if len(posTopics) >= 3 {
+				topicsSpec := make([][]string, 4)
+				topicsSpec[pos] = []string{posTopics[0].Value, posTopics[1].Value, posTopics[2].Value}
+				queries = append(queries, QuerySpec{
+					Name:   fmt.Sprintf("multi-t%d(all3)", pos),
+					Topics: topicsSpec,
+				})
 			}
 		}
-		if len(allContracts) > 0 && hasTopics {
+	}
+
+	// 11. Mixed: multi-contract + single topic
+	if len(allContracts) >= 2 {
+		for _, t := range allTopics {
 			queries = append(queries, QuerySpec{
-				Name:        "worst-all",
-				ContractIDs: allContracts,
+				Name:        fmt.Sprintf("multi-c+t%d-%s", t.Position, t.Card),
+				ContractIDs: allContracts[:2],
+				Topics:      makeTopics(t),
+			})
+		}
+	}
+
+	// 12. Single contract + multi-topic at one position
+	for ci, c := range allContracts {
+		cCard := contractCardLabel(ci)
+		for pos, posTopics := range topicsByPos {
+			if len(posTopics) >= 2 {
+				topicsSpec := make([][]string, 4)
+				topicsSpec[pos] = []string{posTopics[0].Value, posTopics[1].Value}
+				queries = append(queries, QuerySpec{
+					Name:        fmt.Sprintf("c-%s+multi-t%d", cCard, pos),
+					ContractIDs: []string{c},
+					Topics:      topicsSpec,
+				})
+			}
+		}
+	}
+
+	// 13. Worst-case: 3 contracts + up to 3 values at each topic position
+	if len(allContracts) >= 3 {
+		topicsSpec := make([][]string, 4)
+		var nameParts []string
+		hasAnyTopics := false
+		for pos := 0; pos < 4; pos++ {
+			n := len(topicsByPos[pos])
+			if n == 0 {
+				continue
+			}
+			if n > 3 {
+				n = 3
+			}
+			vals := make([]string, n)
+			for i := 0; i < n; i++ {
+				vals[i] = topicsByPos[pos][i].Value
+			}
+			topicsSpec[pos] = vals
+			nameParts = append(nameParts, fmt.Sprintf("%dt%d", n, pos))
+			hasAnyTopics = true
+		}
+		if hasAnyTopics {
+			queries = append(queries, QuerySpec{
+				Name:        fmt.Sprintf("worst-3c+%s", strings.Join(nameParts, "+")),
+				ContractIDs: allContracts[:3],
 				Topics:      topicsSpec,
 			})
 		}
 	}
-	// worst-and-all: up to 5 contracts OR'd + high topic at every active position
-	if cHigh != "" && len(activePos) >= 2 {
-		andContracts := make([]string, 0, 5)
-		andContracts = append(andContracts, data.Contracts.High...)
-		andContracts = append(andContracts, data.Contracts.Medium...)
-		if len(andContracts) > 5 {
-			andContracts = andContracts[:5]
+
+	// Classify queries into three tiers:
+	// 1. singleTerm: one contract OR one topic (types 1-2) — always included
+	// 2. multiValueOR: multiple values in any field, i.e. OR within a group (types 9-12) — always included
+	// 3. singleValueAND: single value per field, multiple fields AND'd (types 3-8) — fill remaining
+	var singleTerm []QuerySpec
+	var multiValueOR []QuerySpec
+	var singleValueAND []QuerySpec
+	for _, q := range queries {
+		totalTopicValues := 0
+		maxTopicPerPos := 0
+		for _, tv := range q.Topics {
+			totalTopicValues += len(tv)
+			if len(tv) > maxTopicPerPos {
+				maxTopicPerPos = len(tv)
+			}
 		}
-		pvs := make([]struct {
-			pos  int
-			vals []string
-		}, 0, len(activePos))
-		for _, pos := range activePos {
-			pvs = append(pvs, pv(pos, tHigh[pos]))
+		isSingleTerm := (len(q.ContractIDs) <= 1 && totalTopicValues == 0) || (len(q.ContractIDs) == 0 && totalTopicValues == 1)
+		isMultiValue := len(q.ContractIDs) > 1 || maxTopicPerPos > 1
+
+		if isSingleTerm {
+			singleTerm = append(singleTerm, q)
+		} else if isMultiValue {
+			multiValueOR = append(multiValueOR, q)
+		} else {
+			singleValueAND = append(singleValueAND, q)
 		}
-		queries = append(queries, QuerySpec{
-			Name:        "worst-and-all",
-			ContractIDs: andContracts,
-			Topics:      makeTopics(pvs...),
-		})
 	}
 
-	return queries
+	// Extract worst-case queries from multiValueOR — always include them
+	var worstCase []QuerySpec
+	var remainingMV []QuerySpec
+	for _, q := range multiValueOR {
+		if strings.HasPrefix(q.Name, "worst-") {
+			worstCase = append(worstCase, q)
+		} else {
+			remainingMV = append(remainingMV, q)
+		}
+	}
+	multiValueOR = remainingMV
+
+	// Always include all single-term + worst-case queries
+	result := append(singleTerm, worstCase...)
+
+	// Shuffle + cap remaining multi-value OR queries at 25% of max
+	mvLimit := maxCombinations / 4
+	if mvLimit < 20 {
+		mvLimit = 20
+	}
+	rand.Shuffle(len(multiValueOR), func(i, j int) {
+		multiValueOR[i], multiValueOR[j] = multiValueOR[j], multiValueOR[i]
+	})
+	if len(multiValueOR) > mvLimit {
+		multiValueOR = multiValueOR[:mvLimit]
+	}
+	result = append(result, multiValueOR...)
+
+	// Fill remaining with single-value AND queries
+	remaining := maxCombinations - len(result)
+	if remaining > 0 && len(singleValueAND) > 0 {
+		rand.Shuffle(len(singleValueAND), func(i, j int) {
+			singleValueAND[i], singleValueAND[j] = singleValueAND[j], singleValueAND[i]
+		})
+		if len(singleValueAND) > remaining {
+			singleValueAND = singleValueAND[:remaining]
+		}
+		result = append(result, singleValueAND...)
+	}
+
+	return result
 }
 
 // =============================================================================
