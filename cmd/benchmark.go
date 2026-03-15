@@ -133,6 +133,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 	outputFormat := fs.String("format", "table", "Output format: table, csv, json")
 	generateData := fs.Bool("generate", false, "Generate sample benchmark data file")
 	generateDataFromEvents := fs.String("generate-data", "", "Auto-generate benchmark data from actual events (writes JSON to file)")
+	scanSegments := fs.Int("scan-segments", 0, "Max segments to scan for --generate-data (0 = all)")
 	validate := fs.Bool("validate", false, "Validate queries by running each once, report/skip queries returning 0 results")
 	maxCombinations := fs.Int("max-combinations", 50, "Maximum query combinations to test")
 	seed := fs.Int64("seed", 0, "Random seed for combination selection (0 = use time)")
@@ -178,7 +179,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		}
 		defer eventStore.Close()
 
-		data, err := generateBenchmarkDataFromEvents(eventStore, cfg.Storage.SegmentPath)
+		data, err := generateBenchmarkDataFromEvents(eventStore, cfg.Storage.SegmentPath, *scanSegments)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating benchmark data: %v\n", err)
 			os.Exit(1)
@@ -637,7 +638,7 @@ func generateSampleData() {
 
 // generateBenchmarkDataFromEvents scans actual stored events and builds BenchmarkData
 // with values guaranteed to co-occur. Works with any backend (flatfiles or RocksDB).
-func generateBenchmarkDataFromEvents(eventStore *store.Store, segmentPath string) (*BenchmarkData, error) {
+func generateBenchmarkDataFromEvents(eventStore *store.Store, segmentPath string, maxSegments int) (*BenchmarkData, error) {
 	// Discover ledger range by scanning segment directories
 	coldPath := filepath.Join(segmentPath, "cold")
 	entries, err := os.ReadDir(coldPath)
@@ -645,8 +646,8 @@ func generateBenchmarkDataFromEvents(eventStore *store.Store, segmentPath string
 		return nil, fmt.Errorf("failed to read segment directory %s: %w", coldPath, err)
 	}
 
-	var minSeg, maxSeg uint32
-	first := true
+	// Collect all segment IDs
+	var segIDs []uint32
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -655,23 +656,26 @@ func generateBenchmarkDataFromEvents(eventStore *store.Store, segmentPath string
 		if _, err := fmt.Sscanf(e.Name(), "%d", &segID); err != nil {
 			continue
 		}
-		if first || segID < minSeg {
-			minSeg = segID
-		}
-		if first || segID > maxSeg {
-			maxSeg = segID
-		}
-		first = false
+		segIDs = append(segIDs, segID)
 	}
-	if first {
+	if len(segIDs) == 0 {
 		return nil, fmt.Errorf("no segments found in %s", coldPath)
 	}
+	sort.Slice(segIDs, func(i, j int) bool { return segIDs[i] < segIDs[j] })
 
+	// Limit number of segments to scan
+	if maxSegments > 0 && len(segIDs) > maxSegments {
+		fmt.Fprintf(os.Stderr, "Limiting scan to %d of %d segments\n", maxSegments, len(segIDs))
+		segIDs = segIDs[:maxSegments]
+	}
+
+	minSeg := segIDs[0]
+	maxSeg := segIDs[len(segIDs)-1]
 	startLedger := minSeg * store.SegmentSize
 	endLedger := (maxSeg+1)*store.SegmentSize - 1
 
 	fmt.Fprintf(os.Stderr, "Scanning events in ledger range %d-%d (%d segments)...\n",
-		startLedger, endLedger, maxSeg-minSeg+1)
+		startLedger, endLedger, len(segIDs))
 
 	// Scan events and build frequency maps
 	contractCounts := make(map[string]int)
