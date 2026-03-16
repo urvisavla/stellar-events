@@ -278,6 +278,7 @@ func NewRocksDBReader(bitmap *eventBitmap32Index, fetcher EventFetcher, lmLoader
 func (l *RocksDBReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey [16]byte,
 	startLedger, endLedger uint32) (*roaring.Bitmap, BitmapLoadStats, error) {
 
+	totalStart := time.Now()
 	// Load bitmap for this single segment (checks hot cache first, then RocksDB).
 	bm, segBytes, readTime, decodeTime, fromCache, err := l.bitmap.getSegmentWithStats(fieldIndex, termKey, segmentID)
 	if err != nil {
@@ -291,6 +292,7 @@ func (l *RocksDBReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey
 	}
 
 	if bm == nil || bm.IsEmpty() {
+		stats.TotalTime = time.Since(totalStart)
 		return nil, stats, nil
 	}
 
@@ -338,6 +340,7 @@ func (l *RocksDBReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey
 		bm = bm.Clone()
 	}
 
+	stats.TotalTime = time.Since(totalStart)
 	if bm.IsEmpty() {
 		return nil, stats, nil
 	}

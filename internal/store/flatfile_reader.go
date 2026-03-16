@@ -94,6 +94,7 @@ func (r *SegmentReader) PurgeCache() {
 func (r *SegmentReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey [16]byte,
 	startLedger, endLedger uint32) (*roaring.Bitmap, BitmapLoadStats, error) {
 
+	totalStart := time.Now()
 	bm, bytesRead, readTime, decodeTime, err := r.loadBitmapFromFile(segmentID, fieldIndex, termKey)
 	if err != nil {
 		return nil, BitmapLoadStats{}, err
@@ -106,11 +107,13 @@ func (r *SegmentReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey
 	}
 
 	if bm == nil || bm.IsEmpty() {
+		stats.TotalTime = time.Since(totalStart)
 		return nil, stats, nil
 	}
 
 	// Trim to ledger range.
 	bm = r.trimToLedgerRange(segmentID, bm, startLedger, endLedger)
+	stats.TotalTime = time.Since(totalStart)
 	if bm == nil || bm.IsEmpty() {
 		return nil, stats, nil
 	}

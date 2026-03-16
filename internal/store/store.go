@@ -82,8 +82,9 @@ type BitmapLoader interface {
 // BitmapLoadStats holds I/O stats from loading a single bitmap term.
 type BitmapLoadStats struct {
 	BytesRead  int64
-	ReadTime   time.Duration
-	DecodeTime time.Duration
+	ReadTime   time.Duration // Hash lookup + mmap access + offset reads (I/O)
+	DecodeTime time.Duration // Bitmap decode (CPU)
+	TotalTime  time.Duration // Full LoadTermBitmap call including trim
 }
 
 // EventFetcher provides event blob retrieval from a storage backend.
@@ -150,9 +151,9 @@ type QueryResult struct {
 	EventBytesRead int64 // Bytes read from event storage
 
 	// Timing breakdown
-	IndexLookupTime    time.Duration // Time querying bitmap index
-	IndexReadTime      time.Duration // Time reading bitmap segments from storage (I/O)
-	IndexDecodeTime    time.Duration // Time decoding bitmap segments (CPU - near zero with FromBuffer)
+	IndexLookupTime    time.Duration // Total wall-clock time for index operations (read + decode + intersect + overhead)
+	IndexReadTime      time.Duration // Time per-term: hash lookup, mmap access, I/O, trim (everything except decode)
+	IndexDecodeTime    time.Duration // Time decoding bitmaps (CPU - near zero with FromBuffer)
 	IndexIntersectTime time.Duration // Time spent on bitmap OR/AND operations
 	EventFetchTime     time.Duration // Time fetching events
 	GroupsDecompressed int           // Number of group blocks decompressed
@@ -901,7 +902,7 @@ func collectBitmaps(
 					continue
 				}
 				result.IndexBytesRead += stats.BytesRead
-				result.IndexReadTime += stats.ReadTime
+				result.IndexReadTime += stats.TotalTime - stats.DecodeTime
 				result.IndexDecodeTime += stats.DecodeTime
 				if bm != nil && !bm.IsEmpty() {
 					result.SegmentsScanned++
@@ -929,7 +930,7 @@ func collectBitmaps(
 					continue
 				}
 				result.IndexBytesRead += stats.BytesRead
-				result.IndexReadTime += stats.ReadTime
+				result.IndexReadTime += stats.TotalTime - stats.DecodeTime
 				result.IndexDecodeTime += stats.DecodeTime
 				if bm != nil && !bm.IsEmpty() {
 					result.SegmentsScanned++
