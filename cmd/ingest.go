@@ -32,6 +32,7 @@ func runIngest(cfg *config.Config, args []string) {
 
 	start := fs.Uint("start", 0, "Start ledger (0 = default/source min)")
 	end := fs.Uint("end", 0, "End ledger (0 = auto-detect max)")
+	noFreeze := fs.Bool("no-freeze", false, "Keep hot segments without converting to cold")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: ingest [options]\n\n")
 		fmt.Fprintf(os.Stderr, "Ingests events via hot append-only files, converting to cold on segment boundaries.\n\n")
@@ -45,10 +46,10 @@ func runIngest(cfg *config.Config, args []string) {
 		os.Exit(2)
 	}
 
-	cmdIngest(cfg, uint32(*start), uint32(*end))
+	cmdIngest(cfg, uint32(*start), uint32(*end), *noFreeze)
 }
 
-func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
+func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool) {
 	fmt := message.NewPrinter(language.English)
 
 	// Tee all stderr output to a timestamped log file
@@ -302,14 +303,23 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 						IngestWallMs:  wallMs,
 					}
 
-					if err := hotWriter.ConvertToCold(indexStore, sdw, &segStats); err != nil {
-						pipelineErr = fmtErr("convert segment %d to cold: %v", currentSegID, err)
-						break
+					if noFreeze {
+						if err := hotWriter.Fsync(); err != nil {
+							pipelineErr = fmtErr("fsync hot segment %d before close: %v", currentSegID, err)
+							break
+						}
+						hotWriter.Close()
+						fmt.Fprintf(os.Stderr, "[segment %06d] no-freeze: hot segment kept on disk\n", currentSegID)
+					} else {
+						if err := hotWriter.ConvertToCold(indexStore, sdw, &segStats); err != nil {
+							pipelineErr = fmtErr("convert segment %d to cold: %v", currentSegID, err)
+							break
+						}
+						fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), %d terms (c:%d t0:%d t1:%d t2:%d t3:%d), cold: %s events, %s index, heap freed %d MB\n",
+							currentSegID, segStats.FreezeWallMs, segStats.EventsPackMs, segStats.MphfMs, segStats.IndexTerms,
+							segStats.ContractTerms, segStats.Topic0Terms, segStats.Topic1Terms, segStats.Topic2Terms, segStats.Topic3Terms,
+							formatBytes(segStats.ColdEventBytes), formatBytes(segStats.ColdIndexBytes), segStats.HeapFreedMB)
 					}
-					fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), %d terms (c:%d t0:%d t1:%d t2:%d t3:%d), cold: %s events, %s index, heap freed %d MB\n",
-						currentSegID, segStats.FreezeWallMs, segStats.EventsPackMs, segStats.MphfMs, segStats.IndexTerms,
-						segStats.ContractTerms, segStats.Topic0Terms, segStats.Topic1Terms, segStats.Topic2Terms, segStats.Topic3Terms,
-						formatBytes(segStats.ColdEventBytes), formatBytes(segStats.ColdIndexBytes), segStats.HeapFreedMB)
 
 					allSegmentMetrics = append(allSegmentMetrics, segStats)
 					if progressWriter != nil {
@@ -443,13 +453,19 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32) {
 			IngestWallMs:  wallMs,
 		}
 
-		if err := hotWriter.ConvertToCold(indexStore, sdw, &segStats); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to convert last segment to cold: %v\n", err)
+		if noFreeze {
+			// Fsync already called above; just close without converting to cold
+			hotWriter.Close()
+			fmt.Fprintf(os.Stderr, "[segment %06d] no-freeze: hot segment kept on disk\n", currentSegID)
+		} else {
+			if err := hotWriter.ConvertToCold(indexStore, sdw, &segStats); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to convert last segment to cold: %v\n", err)
+			}
+			fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), %d terms (c:%d t0:%d t1:%d t2:%d t3:%d), cold: %s events, %s index, heap freed %d MB\n",
+				currentSegID, segStats.FreezeWallMs, segStats.EventsPackMs, segStats.MphfMs, segStats.IndexTerms,
+				segStats.ContractTerms, segStats.Topic0Terms, segStats.Topic1Terms, segStats.Topic2Terms, segStats.Topic3Terms,
+				formatBytes(segStats.ColdEventBytes), formatBytes(segStats.ColdIndexBytes), segStats.HeapFreedMB)
 		}
-		fmt.Fprintf(os.Stderr, "[segment %06d] freeze: %.0fms (events.pack %.0fms, mphf %.0fms), %d terms (c:%d t0:%d t1:%d t2:%d t3:%d), cold: %s events, %s index, heap freed %d MB\n",
-			currentSegID, segStats.FreezeWallMs, segStats.EventsPackMs, segStats.MphfMs, segStats.IndexTerms,
-			segStats.ContractTerms, segStats.Topic0Terms, segStats.Topic1Terms, segStats.Topic2Terms, segStats.Topic3Terms,
-			formatBytes(segStats.ColdEventBytes), formatBytes(segStats.ColdIndexBytes), segStats.HeapFreedMB)
 
 		allSegmentMetrics = append(allSegmentMetrics, segStats)
 		if progressWriter != nil {
