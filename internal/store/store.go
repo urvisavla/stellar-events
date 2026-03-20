@@ -457,7 +457,28 @@ func New(opts Config) (*Store, error) {
 
 	// Initialize query backend — cold segments live under <segmentPath>/cold/
 	if opts.SegmentPath != "" {
-		es.queryBackend = NewSegmentReader(filepath.Join(opts.SegmentPath, "cold"))
+		coldReader := NewSegmentReader(filepath.Join(opts.SegmentPath, "cold"))
+
+		if es.rocksDB != nil {
+			// Hot queries via RocksDB
+			hotReader := NewRocksDBReader(
+				es.indexStore.bitmap,
+				NewRocksDBEventFetcher(es.rocksDB.db, es.rocksDB.ro, es.rocksDB.cfEvents),
+				es.rocksDB.bitmapStore,
+			)
+			es.queryBackend = NewHybridReader(coldReader, hotReader, filepath.Join(opts.SegmentPath, "cold"))
+		} else {
+			// Check for hot segments on disk (no RocksDB)
+			hotReader, hotErr := NewHotSegmentReader(opts.SegmentPath)
+			if hotErr == nil && hotReader.HasSegments() {
+				es.queryBackend = NewHybridReader(coldReader, hotReader, filepath.Join(opts.SegmentPath, "cold"))
+			} else {
+				if hotErr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to load hot segments: %v\n", hotErr)
+				}
+				es.queryBackend = coldReader
+			}
+		}
 	} else if es.rocksDB != nil {
 		es.queryBackend = NewRocksDBReader(
 			es.indexStore.bitmap,
