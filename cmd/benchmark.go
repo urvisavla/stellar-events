@@ -368,15 +368,24 @@ func runBenchmark(cfg *config.Config, args []string) {
 		}
 	}
 
-	// Open event store
-	eventStore, err := openStore(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to open event store: %v\n", err)
-		os.Exit(1)
+	// Open per-datastore stores
+	stores := make(map[string]*store.Store)
+	for _, ds := range datastores {
+		s, err := openStoreForDatastore(cfg, ds)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open %s store: %v\n", ds, err)
+			os.Exit(1)
+		}
+		stores[ds] = s
 	}
-	defer eventStore.Close()
+	defer func() {
+		for _, s := range stores {
+			s.Close()
+		}
+	}()
 
 	// Create log writer if enabled
+	var err error
 	var logWriter *os.File
 	if *logFile != "none" && *logFile != "" {
 		logWriter, err = os.Create(*logFile)
@@ -491,7 +500,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 				StartLedger: queryStart,
 				EndLedger:   queryEnd,
 			}
-			result := runQueryBenchmark(eventStore, queryData, q, ds, *iterations, *warmup, *limit, *timeout, *coldCache)
+			result := runQueryBenchmark(stores[ds], queryData, q, ds, *iterations, *warmup, *limit, *timeout, *coldCache)
 			results = append(results, result)
 
 			// Log query result

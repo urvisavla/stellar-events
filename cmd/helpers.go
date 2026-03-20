@@ -37,6 +37,24 @@ func openStore(cfg *config.Config) (*store.Store, error) {
 	return store.New(opts)
 }
 
+// openStoreForDatastore opens a store configured for a specific backend type.
+// "rocksdb" opens RocksDB only; "flatfiles" opens segment files only (cold + hot via HybridReader).
+func openStoreForDatastore(cfg *config.Config, datastore string) (*store.Store, error) {
+	opts := store.Config{}
+	switch datastore {
+	case "rocksdb":
+		opts.DBPath = cfg.Storage.DBPath
+		opts.RocksOpts = configToRocksDBOptions(&cfg.Storage)
+	case "flatfiles":
+		opts.SegmentPath = cfg.Storage.SegmentPath
+		opts.CompressData = cfg.Storage.CompressData
+		opts.BlockSize = cfg.Storage.BlockSize
+	default:
+		return nil, fmt.Errorf("unknown datastore: %s", datastore)
+	}
+	return store.New(opts)
+}
+
 // configToRocksDBOptions converts config.StorageConfig to store.RocksDBOptions
 func configToRocksDBOptions(cfg *config.StorageConfig) *store.RocksDBOptions {
 	return &store.RocksDBOptions{
