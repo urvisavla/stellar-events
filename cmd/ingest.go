@@ -88,7 +88,20 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 		os.Exit(2)
 	}
 
-	// Create an IndexStore for in-memory bitmap tracking (segment-file-only mode, no RocksDB).
+	// Open RocksDB backend if configured
+	var rocksBackend *store.RocksDBBackend
+	if cfg.Storage.RocksDB {
+		var err error
+		rocksBackend, err = store.NewRocksDBBackend(cfg.Storage.DBPath, configToRocksDBOptions(&cfg.Storage))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to open RocksDB: %v\n", err)
+			os.Exit(1)
+		}
+		defer rocksBackend.Close()
+		fmt.Fprintf(os.Stderr, "RocksDB hot segments enabled (db_path=%s)\n", cfg.Storage.DBPath)
+	}
+
+	// Create an IndexStore for in-memory bitmap tracking.
 	flusher := &store.SegmentIndexFlusher{}
 	indexStore := store.NewIndexStore(flusher, nil, nil)
 	coldPath := filepath.Join(segmentPath, "cold")
@@ -192,12 +205,10 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 	pending := make(map[uint32]*ingest.LedgerResult)
 	nextSeq := startLedger
 
-	var hotWriter *store.HotSegmentWriter
+	var hotWriter store.HotWriter
 	var currentSegID uint32
 	var hasCurrentSeg bool
 
-	var eventBatch []*event.IngestEvent
-	batchStartSeq := startLedger
 	var ledgersProcessed int
 
 	// Per-segment accumulators
@@ -237,35 +248,10 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 
 			segID := store.SegmentID(r.Sequence)
 
-			// Segment boundary: flush pending batch to current hot writer, then convert to cold
+			// Segment boundary: finalize current hot writer, then convert to cold
 			if hasCurrentSeg && segID != currentSegID {
 				if hotWriter != nil {
-					// Flush any pending events from the completed segment before conversion
-					if len(eventBatch) > 0 {
-						ledgerEvents := groupEventsByLedger(eventBatch)
-						for _, le := range ledgerEvents {
-							writeStart := time.Now()
-							if err := hotWriter.WriteLedger(le, indexStore); err != nil {
-								pipelineErr = fmtErr("write ledger to hot segment: %v", err)
-								break
-							}
-							atomic.AddInt64(&writeTimeNs, time.Since(writeStart).Nanoseconds())
-							if !disableFsync {
-								fsyncStart := time.Now()
-								if err := hotWriter.Fsync(); err != nil {
-									pipelineErr = fmtErr("fsync hot segment: %v", err)
-									break
-								}
-								atomic.AddInt64(&fsyncTimeNs, time.Since(fsyncStart).Nanoseconds())
-							}
-						}
-						if pipelineErr != nil {
-							break
-						}
-						eventBatch = eventBatch[:0]
-					}
-
-					// Full flush before freeze — ensures hot files are durable on disk
+					// All ledgers already written per-ledger; just ensure durability
 					if err := hotWriter.Fsync(); err != nil {
 						pipelineErr = fmtErr("fsync hot segment before freeze: %v", err)
 						break
@@ -304,12 +290,19 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 					}
 
 					if noFreeze {
-						if err := hotWriter.Fsync(); err != nil {
-							pipelineErr = fmtErr("fsync hot segment %d before close: %v", currentSegID, err)
-							break
-						}
+						// Fsync already called above; just close
 						hotWriter.Close()
-						fmt.Fprintf(os.Stderr, "[segment %06d] no-freeze: hot segment kept on disk\n", currentSegID)
+						// Flush bitmaps and populate term counts (normally done inside ConvertToCold)
+						indexStore.Flush()
+						c, t0, t1, t2, t3 := indexStore.SegmentTermCounts(currentSegID)
+						segStats.ContractTerms = c
+						segStats.Topic0Terms = t0
+						segStats.Topic1Terms = t1
+						segStats.Topic2Terms = t2
+						segStats.Topic3Terms = t3
+						segStats.IndexTerms = c + t0 + t1 + t2 + t3
+						fmt.Fprintf(os.Stderr, "[segment %06d] no-freeze: hot segment kept on disk, %d terms (c:%d t0:%d t1:%d t2:%d t3:%d)\n",
+							currentSegID, segStats.IndexTerms, c, t0, t1, t2, t3)
 					} else {
 						if err := hotWriter.ConvertToCold(indexStore, sdw, &segStats); err != nil {
 							pipelineErr = fmtErr("convert segment %d to cold: %v", currentSegID, err)
@@ -332,7 +325,11 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 			// Open new hot writer if needed
 			if hotWriter == nil || segID != currentSegID {
 				var err error
-				hotWriter, err = store.NewHotSegmentWriter(segmentPath, segID)
+				if rocksBackend != nil {
+					hotWriter = store.NewRocksDBHotSegmentWriter(rocksBackend, segmentPath, segID)
+				} else {
+					hotWriter, err = store.NewHotSegmentWriter(segmentPath, segID)
+				}
 				if err != nil {
 					pipelineErr = fmtErr("open hot segment %d: %v", segID, err)
 					break
@@ -344,7 +341,23 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 				segLedgers = 0
 			}
 
-			eventBatch = append(eventBatch, r.Events...)
+			// Write this ledger directly (including empty ledgers for correct
+			// cumulative offset tracking in the ledger offsets array).
+			writeStart := time.Now()
+			if err := hotWriter.WriteLedger(r.Events, indexStore); err != nil {
+				pipelineErr = fmtErr("write ledger to hot segment: %v", err)
+				break
+			}
+			atomic.AddInt64(&writeTimeNs, time.Since(writeStart).Nanoseconds())
+			if !disableFsync && len(r.Events) > 0 {
+				fsyncStart := time.Now()
+				if err := hotWriter.Fsync(); err != nil {
+					pipelineErr = fmtErr("fsync hot segment: %v", err)
+					break
+				}
+				atomic.AddInt64(&fsyncTimeNs, time.Since(fsyncStart).Nanoseconds())
+			}
+
 			atomic.AddInt64(&rawBytesTotal, r.RawBytes)
 
 			segLedgers++
@@ -355,38 +368,6 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 			atomic.AddInt64(&totalEvents, int64(len(r.Events)))
 
 			nextSeq++
-
-			// Write batch when full or at end
-			batchFull := ledgersProcessed%batchSize == 0
-			atEnd := nextSeq > endLedger
-
-			if (batchFull || atEnd) && len(eventBatch) > 0 {
-				// Group events by ledger and write each ledger to hot segment
-				ledgerEvents := groupEventsByLedger(eventBatch)
-				for _, le := range ledgerEvents {
-					writeStart := time.Now()
-					if err := hotWriter.WriteLedger(le, indexStore); err != nil {
-						pipelineErr = fmtErr("write ledger to hot segment: %v", err)
-						break
-					}
-					atomic.AddInt64(&writeTimeNs, time.Since(writeStart).Nanoseconds())
-					if !disableFsync {
-						fsyncStart := time.Now()
-						if err := hotWriter.Fsync(); err != nil {
-							pipelineErr = fmtErr("fsync hot segment: %v", err)
-							break
-						}
-						atomic.AddInt64(&fsyncTimeNs, time.Since(fsyncStart).Nanoseconds())
-					}
-				}
-				if pipelineErr != nil {
-					break
-				}
-
-				eventBatch = eventBatch[:0]
-				batchStartSeq = nextSeq
-			}
-			_ = batchStartSeq
 
 			// Progress callback every 1000 ledgers
 			if ledgersProcessed%1000 == 0 {
@@ -456,7 +437,17 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 		if noFreeze {
 			// Fsync already called above; just close without converting to cold
 			hotWriter.Close()
-			fmt.Fprintf(os.Stderr, "[segment %06d] no-freeze: hot segment kept on disk\n", currentSegID)
+			// Flush bitmaps and populate term counts (normally done inside ConvertToCold)
+			indexStore.Flush()
+			c, t0, t1, t2, t3 := indexStore.SegmentTermCounts(currentSegID)
+			segStats.ContractTerms = c
+			segStats.Topic0Terms = t0
+			segStats.Topic1Terms = t1
+			segStats.Topic2Terms = t2
+			segStats.Topic3Terms = t3
+			segStats.IndexTerms = c + t0 + t1 + t2 + t3
+			fmt.Fprintf(os.Stderr, "[segment %06d] no-freeze: hot segment kept on disk, %d terms (c:%d t0:%d t1:%d t2:%d t3:%d)\n",
+				currentSegID, segStats.IndexTerms, c, t0, t1, t2, t3)
 		} else {
 			if err := hotWriter.ConvertToCold(indexStore, sdw, &segStats); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to convert last segment to cold: %v\n", err)
