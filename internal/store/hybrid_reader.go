@@ -54,12 +54,15 @@ func (h *HybridReader) isSegmentFinalized(segmentID uint32) bool {
 	return true
 }
 
-// isSegmentHot checks if a segment exists in the hot reader (if it's a HotSegmentReader).
+// isSegmentHot checks if a segment exists in the hot reader.
 func (h *HybridReader) isSegmentHot(segmentID uint32) bool {
 	if hr, ok := h.hotReader.(*HotSegmentReader); ok {
 		return hr.HasSegment(segmentID)
 	}
-	// For RocksDB hot reader, any non-finalized segment is considered hot
+	if rhr, ok := h.hotReader.(*RocksDBHotSegmentReader); ok {
+		return rhr.HasSegment(segmentID)
+	}
+	// For RocksDB bitmap reader, any non-finalized segment is considered hot
 	return true
 }
 

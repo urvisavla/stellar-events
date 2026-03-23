@@ -17,6 +17,8 @@ const (
 	// 32-bit bitmap indexes (event-level, FromBuffer decode)
 	CFContractsBM32 = "contracts_bm32" // Contract ID bitmap32 index
 	CFTopicsBM32    = "topics_bm32"    // Topic bitmap32 index
+
+	CFIndexDeltas = "index_deltas" // Hot segment index deltas
 )
 
 // RocksDBOptions contains tuning parameters for RocksDB.
@@ -130,9 +132,10 @@ type RocksDBBackend struct {
 	ro     *grocksdb.ReadOptions
 
 	cfHandles       []*grocksdb.ColumnFamilyHandle
-	cfDefault *grocksdb.ColumnFamilyHandle
-	cfEvents  *grocksdb.ColumnFamilyHandle
-	cfUnique  *grocksdb.ColumnFamilyHandle
+	cfDefault     *grocksdb.ColumnFamilyHandle
+	cfEvents      *grocksdb.ColumnFamilyHandle
+	cfUnique      *grocksdb.ColumnFamilyHandle
+	cfIndexDeltas *grocksdb.ColumnFamilyHandle
 
 	baseOpts *grocksdb.Options
 	cfOpts   []*grocksdb.Options
@@ -187,17 +190,30 @@ func NewRocksDBBackend(dbPath string, rocksOpts *RocksDBOptions) (*RocksDBBacken
 	contractsBM32Opts, contractsBM32BBTO := createBitmapCFOpts()
 	topicsBM32Opts, topicsBM32BBTO := createBitmapCFOpts()
 
+	// index_deltas CF: small 21-byte values, prefix scans by segmentID
+	indexDeltasOpts := grocksdb.NewDefaultOptions()
+	applyRocksDBOptions(indexDeltasOpts, rocksOpts)
+	indexDeltasBBTO := grocksdb.NewDefaultBlockBasedTableOptions()
+	indexDeltasBBTO.SetBlockSize(4 * 1024)
+	if rocksOpts != nil && rocksOpts.BloomFilterBitsPerKey > 0 {
+		indexDeltasBBTO.SetFilterPolicy(grocksdb.NewBloomFilter(float64(rocksOpts.BloomFilterBitsPerKey)))
+	}
+	indexDeltasOpts.SetBlockBasedTableFactory(indexDeltasBBTO)
+
 	cfNames := []string{
 		CFDefault, CFEvents, CFUnique,
 		CFContractsBM32, CFTopicsBM32,
+		CFIndexDeltas,
 	}
 	cfOpts := []*grocksdb.Options{
 		defaultOpts, eventsOpts, uniqueOpts,
 		contractsBM32Opts, topicsBM32Opts,
+		indexDeltasOpts,
 	}
 	bbtoList := []*grocksdb.BlockBasedTableOptions{
 		eventsBBTO, uniqueBBTO,
 		contractsBM32BBTO, topicsBM32BBTO,
+		indexDeltasBBTO,
 	}
 
 	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(baseOpts, dbPath, cfNames, cfOpts)
@@ -218,18 +234,19 @@ func NewRocksDBBackend(dbPath string, rocksOpts *RocksDBOptions) (*RocksDBBacken
 	}
 
 	return &RocksDBBackend{
-		db:        db,
-		wo:        wo,
-		ro:        grocksdb.NewDefaultReadOptions(),
-		cfHandles: cfHandles,
-		cfDefault: cfHandles[0],
-		cfEvents:  cfHandles[1],
-		cfUnique:  cfHandles[2],
-		baseOpts:        baseOpts,
-		cfOpts:          cfOpts,
-		bbtoList:        bbtoList,
-		mergeOp:         mergeOp,
-		bitmapStore:     bitmapStore,
+		db:            db,
+		wo:            wo,
+		ro:            grocksdb.NewDefaultReadOptions(),
+		cfHandles:     cfHandles,
+		cfDefault:     cfHandles[0],
+		cfEvents:      cfHandles[1],
+		cfUnique:      cfHandles[2],
+		cfIndexDeltas: cfHandles[5],
+		baseOpts:      baseOpts,
+		cfOpts:        cfOpts,
+		bbtoList:      bbtoList,
+		mergeOp:       mergeOp,
+		bitmapStore:   bitmapStore,
 	}, nil
 }
 
@@ -317,4 +334,37 @@ func DecodeKey(key []byte) (segmentID uint32, denseID uint32) {
 	segmentID = binary.BigEndian.Uint32(key[0:4])
 	denseID = binary.BigEndian.Uint32(key[4:8])
 	return
+}
+
+// FlushHotCFs flushes the index_deltas and events column families to SST files.
+func (rb *RocksDBBackend) FlushHotCFs() error {
+	flushOpts := grocksdb.NewDefaultFlushOptions()
+	defer flushOpts.Destroy()
+	flushOpts.SetWait(true)
+
+	for _, cf := range []*grocksdb.ColumnFamilyHandle{rb.cfIndexDeltas, rb.cfEvents, rb.cfDefault} {
+		if err := rb.db.FlushCF(cf, flushOpts); err != nil {
+			return fmt.Errorf("failed to flush hot CF: %w", err)
+		}
+	}
+	return nil
+}
+
+// DeleteHotSegment removes all hot segment data for a given segment ID from
+// index_deltas CF, events CF, and the ledger offsets key in default CF.
+func (rb *RocksDBBackend) DeleteHotSegment(segmentID uint32) error {
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+
+	// Key range: [segID, 0x00000000] to [segID+1, 0x00000000] (exclusive end)
+	startKey := EncodeKey(segmentID, 0)
+	endKey := EncodeKey(segmentID+1, 0)
+
+	batch.DeleteRangeCF(rb.cfIndexDeltas, startKey, endKey)
+	batch.DeleteRangeCF(rb.cfEvents, startKey, endKey)
+
+	// Delete ledger offsets from default CF
+	batch.DeleteCF(rb.cfDefault, SegmentLedgerOffsetsKey(segmentID))
+
+	return rb.db.Write(rb.wo, batch)
 }

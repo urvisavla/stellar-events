@@ -45,6 +45,9 @@ func openStoreForDatastore(cfg *config.Config, datastore string) (*store.Store, 
 	case "rocksdb":
 		opts.DBPath = cfg.Storage.DBPath
 		opts.RocksOpts = configToRocksDBOptions(&cfg.Storage)
+		opts.SegmentPath = cfg.Storage.SegmentPath
+		opts.CompressData = cfg.Storage.CompressData
+		opts.BlockSize = cfg.Storage.BlockSize
 	case "flatfiles":
 		opts.SegmentPath = cfg.Storage.SegmentPath
 		opts.CompressData = cfg.Storage.CompressData

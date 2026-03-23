@@ -29,11 +29,11 @@ func runQuery(cfg *config.Config, args []string) {
 	topic3 := fs.String("topic3", "", "Topic3 (base64) - positional filter at position 3")
 	limit := fs.Int("limit", 0, "Max results (0 = use config default)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: query <start> [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: query <start> [end] [options]\n\n")
 		fmt.Fprintf(os.Stderr, "Queries contract events.\n\n")
 		fmt.Fprintf(os.Stderr, "Arguments:\n")
 		fmt.Fprintf(os.Stderr, "  <start>           Start ledger (required)\n")
-		fmt.Fprintf(os.Stderr, "  Range is start + %d (max_ledger_range from config)\n\n", cfg.Query.MaxLedgerRange)
+		fmt.Fprintf(os.Stderr, "  [end]             End ledger (optional, default: start + %d)\n\n", cfg.Query.MaxLedgerRange)
 		fmt.Fprintf(os.Stderr, "Filter options:\n")
 		fmt.Fprintf(os.Stderr, "  --contract <id>   Filter by contract ID (C... strkey format)\n")
 		fmt.Fprintf(os.Stderr, "  --topics <list>   Comma-separated topics (base64), position-independent AND\n")
@@ -87,6 +87,13 @@ func runQuery(cfg *config.Config, args []string) {
 	}
 
 	endLedger := startLedger + uint64(cfg.Query.MaxLedgerRange)
+	if len(positionalArgs) >= 2 {
+		endLedger, err = strconv.ParseUint(positionalArgs[1], 10, 32)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid end ledger: %v\n", err)
+			os.Exit(2)
+		}
+	}
 
 	// Apply config defaults for limit
 	queryLimit := *limit

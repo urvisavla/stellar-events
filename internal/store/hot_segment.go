@@ -15,6 +15,20 @@ import (
 
 const hotBufSize = 256 * 1024 // 256 KB write buffer per file
 
+// HotWriter is the interface for writing hot segment data during ingestion.
+// Implementations: HotSegmentWriter (file-based), RocksDBHotSegmentWriter (RocksDB-based).
+type HotWriter interface {
+	WriteLedger(events []*event.IngestEvent, indexStore *IndexStore) error
+	FlushBuffers() error
+	Fsync() error
+	CommittedLengths() HotSegmentMeta
+	ConvertToCold(indexStore *IndexStore, sdw *SegmentDataWriter, stats *progress.SegmentStats) error
+	Close() error
+	Cleanup() error
+}
+
+var _ HotWriter = (*HotSegmentWriter)(nil)
+
 // =============================================================================
 // Hot Segment Writer — append-only files for per-ledger durability
 // =============================================================================

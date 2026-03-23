@@ -457,21 +457,31 @@ func New(opts Config) (*Store, error) {
 
 	// Initialize query backend — cold segments live under <segmentPath>/cold/
 	if opts.SegmentPath != "" {
-		coldReader := NewSegmentReader(filepath.Join(opts.SegmentPath, "cold"))
+		coldPath := filepath.Join(opts.SegmentPath, "cold")
+		coldReader := NewSegmentReader(coldPath)
 
 		if es.rocksDB != nil {
-			// Hot queries via RocksDB
-			hotReader := NewRocksDBReader(
-				es.indexStore.bitmap,
-				NewRocksDBEventFetcher(es.rocksDB.db, es.rocksDB.ro, es.rocksDB.cfEvents),
-				es.rocksDB.bitmapStore,
-			)
-			es.queryBackend = NewHybridReader(coldReader, hotReader, filepath.Join(opts.SegmentPath, "cold"))
+			// Check for RocksDB-backed hot segments first
+			rocksHotReader, hotErr := NewRocksDBHotSegmentReader(es.rocksDB)
+			if hotErr == nil && rocksHotReader.HasSegments() {
+				es.queryBackend = NewHybridReader(coldReader, rocksHotReader, coldPath)
+			} else {
+				if hotErr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to load RocksDB hot segments: %v\n", hotErr)
+				}
+				// Fallback to RocksDB bitmap reader for hot queries
+				hotReader := NewRocksDBReader(
+					es.indexStore.bitmap,
+					NewRocksDBEventFetcher(es.rocksDB.db, es.rocksDB.ro, es.rocksDB.cfEvents),
+					es.rocksDB.bitmapStore,
+				)
+				es.queryBackend = NewHybridReader(coldReader, hotReader, coldPath)
+			}
 		} else {
-			// Check for hot segments on disk (no RocksDB)
+			// Check for file-based hot segments on disk (no RocksDB)
 			hotReader, hotErr := NewHotSegmentReader(opts.SegmentPath)
 			if hotErr == nil && hotReader.HasSegments() {
-				es.queryBackend = NewHybridReader(coldReader, hotReader, filepath.Join(opts.SegmentPath, "cold"))
+				es.queryBackend = NewHybridReader(coldReader, hotReader, coldPath)
 			} else {
 				if hotErr != nil {
 					fmt.Fprintf(os.Stderr, "Warning: failed to load hot segments: %v\n", hotErr)
