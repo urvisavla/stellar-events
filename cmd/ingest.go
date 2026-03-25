@@ -83,10 +83,6 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 	}
 
 	segmentPath := cfg.Storage.SegmentPath
-	if segmentPath == "" {
-		fmt.Fprintf(os.Stderr, "Error: storage.segment_path is required for ingest command\n")
-		os.Exit(2)
-	}
 
 	// Open RocksDB backend if configured
 	var rocksBackend *store.RocksDBBackend
@@ -101,15 +97,29 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 		fmt.Fprintf(os.Stderr, "RocksDB hot segments enabled (db_path=%s)\n", cfg.Storage.DBPath)
 	}
 
+	// segment_path is required unless using RocksDB with --no-freeze
+	// (in that case data stays in RocksDB, no cold output needed)
+	needsColdPath := !noFreeze || rocksBackend == nil
+	if segmentPath == "" && needsColdPath {
+		fmt.Fprintf(os.Stderr, "Error: storage.segment_path is required (needed for cold segment output)\n")
+		os.Exit(2)
+	}
+
 	// Create an IndexStore for in-memory bitmap tracking.
 	flusher := &store.SegmentIndexFlusher{}
 	indexStore := store.NewIndexStore(flusher, nil, nil)
-	coldPath := filepath.Join(segmentPath, "cold")
-	indexStore.SetWriteConfig(coldPath, false)
+	var coldPath string
+	if segmentPath != "" {
+		coldPath = filepath.Join(segmentPath, "cold")
+		indexStore.SetWriteConfig(coldPath, false)
+	}
 	defer indexStore.Close()
 
 	// Create a SegmentDataWriter for cold output (events.pack)
-	sdw := store.NewSegmentDataWriter(coldPath, cfg.Storage.CompressData, cfg.Storage.BlockSize)
+	var sdw *store.SegmentDataWriter
+	if coldPath != "" {
+		sdw = store.NewSegmentDataWriter(coldPath, cfg.Storage.CompressData, cfg.Storage.BlockSize)
+	}
 
 	networkPassphrase := cfg.GetNetworkPassphrase()
 
