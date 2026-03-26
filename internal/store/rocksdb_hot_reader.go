@@ -331,7 +331,7 @@ func (r *RocksDBHotSegmentReader) LoadTermBitmap(segmentID uint32, fieldIndex in
 	return result, stats, nil
 }
 
-// FetchByIDs resolves dense IDs to events via RocksDB point Gets.
+// FetchByIDs resolves dense IDs to events via BatchedMultiGetCF.
 func (r *RocksDBHotSegmentReader) FetchByIDs(perSegment map[uint32]*roaring.Bitmap, limit int, result *QueryResult) ([]*query.Event, error) {
 	segIDs := make([]uint32, 0, len(perSegment))
 	for segID := range perSegment {
@@ -344,10 +344,16 @@ func (r *RocksDBHotSegmentReader) FetchByIDs(perSegment map[uint32]*roaring.Bitm
 		fetchCap = limit
 	}
 
-	events := make([]*query.Event, 0, fetchCap)
+	// Collect all keys and their metadata for a single BatchedMultiGetCF call.
+	type keyMeta struct {
+		segID   uint32
+		denseID uint32
+	}
+	keys := make([][]byte, 0, fetchCap)
+	metas := make([]keyMeta, 0, fetchCap)
 
 	for _, segID := range segIDs {
-		if len(events) >= fetchCap {
+		if len(keys) >= fetchCap {
 			break
 		}
 
@@ -361,34 +367,54 @@ func (r *RocksDBHotSegmentReader) FetchByIDs(perSegment map[uint32]*roaring.Bitm
 
 		bitmapIter := perSegment[segID].Iterator()
 		for bitmapIter.HasNext() {
-			if len(events) >= fetchCap {
+			if len(keys) >= fetchCap {
 				break
 			}
-
 			denseID := bitmapIter.Next()
-
-			fetchStart := time.Now()
-			eventData, err := r.readEvent(seg, segID, denseID)
-			result.EventFetchTime += time.Since(fetchStart)
-			if err != nil {
+			if int(denseID) >= seg.eventCount {
 				continue
 			}
-
-			result.EventBytesRead += int64(len(eventData))
-			result.EventsScanned++
-
-			ledger, eventSeq := seg.ledgerOffs.DenseIDToLedgerAndSeq(denseID)
-
-			decStart := time.Now()
-			ev, err := event.DecodeBinaryToQueryEvent(eventData, ledger, eventSeq)
-			result.DecodeTime += time.Since(decStart)
-
-			if err != nil {
-				continue
-			}
-
-			events = append(events, ev)
+			keys = append(keys, EncodeKey(segID, denseID))
+			metas = append(metas, keyMeta{segID: segID, denseID: denseID})
 		}
+	}
+
+	if len(keys) == 0 {
+		result.EventsReturned = 0
+		return nil, nil
+	}
+
+	// Single batched fetch — keys are already sorted by (segID, denseID).
+	fetchStart := time.Now()
+	values, err := r.backend.db.BatchedMultiGetCF(r.backend.ro, r.backend.cfEvents, true, keys...)
+	result.EventFetchTime += time.Since(fetchStart)
+	if err != nil {
+		return nil, fmt.Errorf("batched multi-get events: %w", err)
+	}
+	defer values.Destroy()
+
+	events := make([]*query.Event, 0, len(keys))
+	for i, val := range values {
+		data := val.Data()
+		if len(data) == 0 {
+			continue
+		}
+
+		result.EventBytesRead += int64(len(data))
+		result.EventsScanned++
+
+		seg, _ := r.getSegment(metas[i].segID)
+		ledger, eventSeq := seg.ledgerOffs.DenseIDToLedgerAndSeq(metas[i].denseID)
+
+		decStart := time.Now()
+		ev, err := event.DecodeBinaryToQueryEvent(data, ledger, eventSeq)
+		result.DecodeTime += time.Since(decStart)
+
+		if err != nil {
+			continue
+		}
+
+		events = append(events, ev)
 	}
 
 	result.EventsReturned = len(events)
@@ -409,10 +435,17 @@ func (r *RocksDBHotSegmentReader) FetchByRange(startLedger, endLedger uint32, li
 	if limit > 0 {
 		fetchCap = limit
 	}
-	events := make([]*query.Event, 0)
+
+	// Collect all keys and metadata for a single BatchedMultiGetCF call.
+	type keyMeta struct {
+		segID   uint32
+		denseID uint32
+	}
+	var keys [][]byte
+	var metas []keyMeta
 
 	for _, segID := range segments {
-		if fetchCap > 0 && len(events) >= fetchCap {
+		if fetchCap > 0 && len(keys) >= fetchCap {
 			break
 		}
 
@@ -440,40 +473,55 @@ func (r *RocksDBHotSegmentReader) FetchByRange(startLedger, endLedger uint32, li
 		}
 
 		count := int(endID - startID + 1)
-		if fetchCap > 0 && count > fetchCap-len(events) {
-			count = fetchCap - len(events)
+		if fetchCap > 0 && count > fetchCap-len(keys) {
+			count = fetchCap - len(keys)
 		}
 		result.MatchingLocalIDs += count
 
 		for i := 0; i < count; i++ {
 			denseID := startID + uint32(i)
-
-			fetchStart := time.Now()
-			eventData, err := r.readEvent(seg, segID, denseID)
-			result.EventFetchTime += time.Since(fetchStart)
-			if err != nil {
-				continue
-			}
-
-			result.EventBytesRead += int64(len(eventData))
-			result.EventsScanned++
-
-			ledger, eventSeq := seg.ledgerOffs.DenseIDToLedgerAndSeq(denseID)
-
-			decStart := time.Now()
-			ev, err := event.DecodeBinaryToQueryEvent(eventData, ledger, eventSeq)
-			result.DecodeTime += time.Since(decStart)
-
-			if err != nil {
-				continue
-			}
-
-			events = append(events, ev)
+			keys = append(keys, EncodeKey(segID, denseID))
+			metas = append(metas, keyMeta{segID: segID, denseID: denseID})
 		}
 	}
 
-	if fetchCap > 0 && len(events) > fetchCap {
-		events = events[:fetchCap]
+	if len(keys) == 0 {
+		result.EventsReturned = 0
+		result.TotalTime = time.Since(totalStart)
+		return result, nil, nil
+	}
+
+	// Single batched fetch — keys are sorted by (segID, denseID).
+	fetchStart := time.Now()
+	values, err := r.backend.db.BatchedMultiGetCF(r.backend.ro, r.backend.cfEvents, true, keys...)
+	result.EventFetchTime += time.Since(fetchStart)
+	if err != nil {
+		return nil, nil, fmt.Errorf("batched multi-get events: %w", err)
+	}
+	defer values.Destroy()
+
+	events := make([]*query.Event, 0, len(keys))
+	for i, val := range values {
+		data := val.Data()
+		if len(data) == 0 {
+			continue
+		}
+
+		result.EventBytesRead += int64(len(data))
+		result.EventsScanned++
+
+		seg, _ := r.getSegment(metas[i].segID)
+		ledger, eventSeq := seg.ledgerOffs.DenseIDToLedgerAndSeq(metas[i].denseID)
+
+		decStart := time.Now()
+		ev, err := event.DecodeBinaryToQueryEvent(data, ledger, eventSeq)
+		result.DecodeTime += time.Since(decStart)
+
+		if err != nil {
+			continue
+		}
+
+		events = append(events, ev)
 	}
 
 	result.EventsReturned = len(events)
