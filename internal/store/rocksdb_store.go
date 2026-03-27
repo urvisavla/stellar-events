@@ -18,7 +18,8 @@ const (
 	CFContractsBM32 = "contracts_bm32" // Contract ID bitmap32 index
 	CFTopicsBM32    = "topics_bm32"    // Topic bitmap32 index
 
-	CFIndexDeltas = "index_deltas" // Hot segment index deltas
+	CFIndexDeltas      = "index_deltas"      // Hot segment index deltas
+	CFBitmapSnapshots  = "bitmap_snapshots"  // Pre-serialized roaring bitmaps per term
 )
 
 // RocksDBOptions contains tuning parameters for RocksDB.
@@ -135,7 +136,8 @@ type RocksDBBackend struct {
 	cfDefault     *grocksdb.ColumnFamilyHandle
 	cfEvents      *grocksdb.ColumnFamilyHandle
 	cfUnique      *grocksdb.ColumnFamilyHandle
-	cfIndexDeltas *grocksdb.ColumnFamilyHandle
+	cfIndexDeltas     *grocksdb.ColumnFamilyHandle
+	cfBitmapSnapshots *grocksdb.ColumnFamilyHandle
 
 	baseOpts *grocksdb.Options
 	cfOpts   []*grocksdb.Options
@@ -200,20 +202,30 @@ func NewRocksDBBackend(dbPath string, rocksOpts *RocksDBOptions) (*RocksDBBacken
 	}
 	indexDeltasOpts.SetBlockBasedTableFactory(indexDeltasBBTO)
 
+	// bitmap_snapshots CF: larger values (serialized roaring bitmaps), prefix scans by segmentID
+	bitmapSnapshotsOpts := grocksdb.NewDefaultOptions()
+	applyRocksDBOptions(bitmapSnapshotsOpts, rocksOpts)
+	bitmapSnapshotsBBTO := grocksdb.NewDefaultBlockBasedTableOptions()
+	bitmapSnapshotsBBTO.SetBlockSize(64 * 1024) // 64 KB blocks for larger bitmap values
+	if rocksOpts != nil && rocksOpts.BloomFilterBitsPerKey > 0 {
+		bitmapSnapshotsBBTO.SetFilterPolicy(grocksdb.NewBloomFilter(float64(rocksOpts.BloomFilterBitsPerKey)))
+	}
+	bitmapSnapshotsOpts.SetBlockBasedTableFactory(bitmapSnapshotsBBTO)
+
 	cfNames := []string{
 		CFDefault, CFEvents, CFUnique,
 		CFContractsBM32, CFTopicsBM32,
-		CFIndexDeltas,
+		CFIndexDeltas, CFBitmapSnapshots,
 	}
 	cfOpts := []*grocksdb.Options{
 		defaultOpts, eventsOpts, uniqueOpts,
 		contractsBM32Opts, topicsBM32Opts,
-		indexDeltasOpts,
+		indexDeltasOpts, bitmapSnapshotsOpts,
 	}
 	bbtoList := []*grocksdb.BlockBasedTableOptions{
 		eventsBBTO, uniqueBBTO,
 		contractsBM32BBTO, topicsBM32BBTO,
-		indexDeltasBBTO,
+		indexDeltasBBTO, bitmapSnapshotsBBTO,
 	}
 
 	db, cfHandles, err := grocksdb.OpenDbColumnFamilies(baseOpts, dbPath, cfNames, cfOpts)
@@ -241,7 +253,8 @@ func NewRocksDBBackend(dbPath string, rocksOpts *RocksDBOptions) (*RocksDBBacken
 		cfDefault:     cfHandles[0],
 		cfEvents:      cfHandles[1],
 		cfUnique:      cfHandles[2],
-		cfIndexDeltas: cfHandles[5],
+		cfIndexDeltas:     cfHandles[5],
+		cfBitmapSnapshots: cfHandles[6],
 		baseOpts:      baseOpts,
 		cfOpts:        cfOpts,
 		bbtoList:      bbtoList,
@@ -342,7 +355,7 @@ func (rb *RocksDBBackend) FlushHotCFs() error {
 	defer flushOpts.Destroy()
 	flushOpts.SetWait(true)
 
-	for _, cf := range []*grocksdb.ColumnFamilyHandle{rb.cfIndexDeltas, rb.cfEvents, rb.cfDefault} {
+	for _, cf := range []*grocksdb.ColumnFamilyHandle{rb.cfIndexDeltas, rb.cfEvents, rb.cfDefault, rb.cfBitmapSnapshots} {
 		if err := rb.db.FlushCF(cf, flushOpts); err != nil {
 			return fmt.Errorf("failed to flush hot CF: %w", err)
 		}
@@ -362,6 +375,13 @@ func (rb *RocksDBBackend) DeleteHotSegment(segmentID uint32) error {
 
 	batch.DeleteRangeCF(rb.cfIndexDeltas, startKey, endKey)
 	batch.DeleteRangeCF(rb.cfEvents, startKey, endKey)
+
+	// bitmap_snapshots uses 21-byte keys: [segID:4][fieldIndex:1][termHash:16]
+	snapStart := make([]byte, 4)
+	binary.BigEndian.PutUint32(snapStart, segmentID)
+	snapEnd := make([]byte, 4)
+	binary.BigEndian.PutUint32(snapEnd, segmentID+1)
+	batch.DeleteRangeCF(rb.cfBitmapSnapshots, snapStart, snapEnd)
 
 	// Delete ledger offsets from default CF
 	batch.DeleteCF(rb.cfDefault, SegmentLedgerOffsetsKey(segmentID))

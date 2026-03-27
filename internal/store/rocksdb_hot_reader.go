@@ -132,6 +132,19 @@ func (r *RocksDBHotSegmentReader) getSegment(segmentID uint32) (*rocksDBHotState
 }
 
 func (r *RocksDBHotSegmentReader) loadHotSegment(segID uint32) (*rocksDBHotState, error) {
+	// TODO: enable bitmap snapshot fast path once validated
+	// state, err := r.loadFromBitmapSnapshots(segID)
+	// if err != nil {
+	// 	fmt.Fprintf(os.Stderr, "[hot-rocksdb %06d] bitmap_snapshots failed, falling back: %v\n", segID, err)
+	// }
+	// if state != nil {
+	// 	return state, nil
+	// }
+
+	return r.loadFromIndexDeltas(segID)
+}
+
+func (r *RocksDBHotSegmentReader) loadFromIndexDeltas(segID uint32) (*rocksDBHotState, error) {
 	rebuildStart := time.Now()
 	fmt.Fprintf(os.Stderr, "[hot-rocksdb %06d] rebuilding bitmaps from index_deltas CF...\n", segID)
 
@@ -245,6 +258,121 @@ func (r *RocksDBHotSegmentReader) loadHotSegment(segID uint32) (*rocksDBHotState
 
 	rebuildTime := time.Since(rebuildStart)
 	fmt.Fprintf(os.Stderr, "[hot-rocksdb %06d] events: %d, rebuild time: %v\n", segID, eventCount, rebuildTime)
+
+	return &rocksDBHotState{
+		segmentID:  segID,
+		contracts:  contracts,
+		topics:     topics,
+		ledgerOffs: ledgerOffs,
+		eventCount: eventCount,
+	}, nil
+}
+
+// loadFromBitmapSnapshots loads pre-serialized bitmaps from the bitmap_snapshots CF.
+// Returns nil state (no error) if no snapshots exist for this segment.
+func (r *RocksDBHotSegmentReader) loadFromBitmapSnapshots(segID uint32) (*rocksDBHotState, error) {
+	loadStart := time.Now()
+
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+	it := r.backend.db.NewIteratorCF(ro, r.backend.cfBitmapSnapshots)
+	defer it.Close()
+
+	prefix := make([]byte, 4)
+	binary.BigEndian.PutUint32(prefix, segID)
+	endPrefix := make([]byte, 4)
+	binary.BigEndian.PutUint32(endPrefix, segID+1)
+
+	contracts := make(map[[16]byte]*roaring.Bitmap)
+	var topics [4]map[[16]byte]*roaring.Bitmap
+	for i := range topics {
+		topics[i] = make(map[[16]byte]*roaring.Bitmap)
+	}
+
+	var termCount int
+	var totalBytes int64
+
+	for it.Seek(prefix); it.Valid(); it.Next() {
+		key := it.Key()
+		keyData := key.Data()
+		if len(keyData) < 21 || bytes.Compare(keyData[:4], endPrefix) >= 0 {
+			key.Free()
+			break
+		}
+
+		fieldIndex := keyData[4]
+		var termHash [16]byte
+		copy(termHash[:], keyData[5:21])
+		key.Free()
+
+		value := it.Value()
+		valData := make([]byte, value.Size())
+		copy(valData, value.Data())
+		totalBytes += int64(value.Size())
+		value.Free()
+
+		bm := roaring.New()
+		if _, err := bm.FromBuffer(valData); err != nil {
+			return nil, fmt.Errorf("decode bitmap snapshot field %d: %w", fieldIndex, err)
+		}
+
+		termCount++
+
+		if fieldIndex == 0 {
+			contracts[termHash] = bm
+		} else if fieldIndex >= 1 && fieldIndex <= 4 {
+			topics[fieldIndex-1][termHash] = bm
+		}
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("iterate bitmap_snapshots for segment %d: %w", segID, err)
+	}
+
+	if termCount == 0 {
+		return nil, nil // no snapshots, fall back to delta replay
+	}
+
+	// Load ledger offsets from default CF
+	loKey := SegmentLedgerOffsetsKey(segID)
+	loValue, err := r.backend.db.GetCF(r.backend.ro, r.backend.cfDefault, loKey)
+	if err != nil {
+		return nil, fmt.Errorf("load ledger offsets for segment %d: %w", segID, err)
+	}
+	defer loValue.Free()
+
+	if loValue.Size() == 0 {
+		return nil, fmt.Errorf("no ledger offsets for hot segment %d", segID)
+	}
+
+	paddedData := make([]byte, SegmentLedgerOffsetsSize)
+	copy(paddedData, loValue.Data())
+	ledgerOffs := &SegmentLedgerOffsets{SegmentID: segID, Data: paddedData}
+
+	// Derive event count from bitmap max IDs
+	eventCount := 0
+	for _, bm := range contracts {
+		if !bm.IsEmpty() {
+			if m := int(bm.Maximum()) + 1; m > eventCount {
+				eventCount = m
+			}
+		}
+	}
+	for i := range topics {
+		for _, bm := range topics[i] {
+			if !bm.IsEmpty() {
+				if m := int(bm.Maximum()) + 1; m > eventCount {
+					eventCount = m
+				}
+			}
+		}
+	}
+	if te := int(ledgerOffs.TotalEvents()); te > eventCount {
+		eventCount = te
+	}
+
+	loadTime := time.Since(loadStart)
+	fmt.Fprintf(os.Stderr, "[hot-rocksdb %06d] loaded %d bitmap snapshots (%s) in %v (fast path)\n",
+		segID, termCount, formatBytesStore(totalBytes), loadTime)
 
 	return &rocksDBHotState{
 		segmentID:  segID,

@@ -509,6 +509,14 @@ func (s *IndexStore) SegmentTermCounts(segmentID uint32) (int, int, int, int, in
 	return len(fd.Contracts), t[0], t[1], t[2], t[3]
 }
 
+// PeekSegmentTerms returns cached bitmap terms for a segment without removing them.
+func (s *IndexStore) PeekSegmentTerms(segmentID uint32) *FlushedSegmentData {
+	if s.flushedTerms == nil {
+		return nil
+	}
+	return s.flushedTerms[segmentID]
+}
+
 // PopSegmentTerms returns cached bitmap terms for a segment and removes them from the cache.
 // Returns nil if no cached data exists (caller should fall back to RocksDB scan).
 func (s *IndexStore) PopSegmentTerms(segmentID uint32) *FlushedSegmentData {

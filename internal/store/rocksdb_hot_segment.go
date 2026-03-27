@@ -311,6 +311,44 @@ func (w *RocksDBHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *Seg
 	return nil
 }
 
+// WriteBitmapSnapshots serializes the flushed in-memory bitmaps to the
+// bitmap_snapshots CF for fast query-time loading. Must be called after
+// indexStore.Flush() and before PopSegmentTerms().
+func (w *RocksDBHotSegmentWriter) WriteBitmapSnapshots(indexStore *IndexStore) error {
+	fd := indexStore.PeekSegmentTerms(w.segmentID)
+	if fd == nil {
+		return nil
+	}
+
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+
+	for _, t := range fd.Contracts {
+		key := bitmapSnapshotKey(w.segmentID, 0x00, t.TermHash)
+		batch.PutCF(w.backend.cfBitmapSnapshots, key, t.BitmapData)
+	}
+	for pos := 0; pos < 4; pos++ {
+		for _, t := range fd.Topics[pos] {
+			key := bitmapSnapshotKey(w.segmentID, byte(pos+1), t.TermHash)
+			batch.PutCF(w.backend.cfBitmapSnapshots, key, t.BitmapData)
+		}
+	}
+
+	if batch.Count() > 0 {
+		return w.backend.db.Write(w.backend.wo, batch)
+	}
+	return nil
+}
+
+// bitmapSnapshotKey builds a 21-byte key: [segmentID:4 BE][fieldIndex:1][termHash:16].
+func bitmapSnapshotKey(segmentID uint32, fieldIndex byte, termHash [16]byte) []byte {
+	key := make([]byte, 21)
+	binary.BigEndian.PutUint32(key[0:4], segmentID)
+	key[4] = fieldIndex
+	copy(key[5:21], termHash[:])
+	return key
+}
+
 // Close is a no-op for RocksDB (backend lifecycle is managed externally).
 func (w *RocksDBHotSegmentWriter) Close() error {
 	return nil

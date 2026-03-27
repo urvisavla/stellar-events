@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -211,6 +212,9 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 		}
 	}()
 
+	// Per-ledger write latency tracking (non-empty ledgers only)
+	var writeDurations []time.Duration
+
 	// Collect results in order and write to hot segment
 	pending := make(map[uint32]*ingest.LedgerResult)
 	nextSeq := startLedger
@@ -304,6 +308,12 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 						hotWriter.Close()
 						// Flush bitmaps and populate term counts (normally done inside ConvertToCold)
 						indexStore.Flush()
+						// TODO: enable bitmap snapshot writes once validated
+						// if rw, ok := hotWriter.(*store.RocksDBHotSegmentWriter); ok {
+						// 	if err := rw.WriteBitmapSnapshots(indexStore); err != nil {
+						// 		fmt.Fprintf(os.Stderr, "[segment %06d] warning: failed to write bitmap snapshots: %v\n", currentSegID, err)
+						// 	}
+						// }
 						c, t0, t1, t2, t3 := indexStore.SegmentTermCounts(currentSegID)
 						segStats.ContractTerms = c
 						segStats.Topic0Terms = t0
@@ -353,12 +363,12 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 
 			// Write this ledger directly (including empty ledgers for correct
 			// cumulative offset tracking in the ledger offsets array).
-			writeStart := time.Now()
+			ledgerWriteStart := time.Now()
 			if err := hotWriter.WriteLedger(r.Events, indexStore); err != nil {
 				pipelineErr = fmtErr("write ledger to hot segment: %v", err)
 				break
 			}
-			atomic.AddInt64(&writeTimeNs, time.Since(writeStart).Nanoseconds())
+			atomic.AddInt64(&writeTimeNs, time.Since(ledgerWriteStart).Nanoseconds())
 			if !disableFsync && len(r.Events) > 0 {
 				fsyncStart := time.Now()
 				if err := hotWriter.Fsync(); err != nil {
@@ -366,6 +376,9 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 					break
 				}
 				atomic.AddInt64(&fsyncTimeNs, time.Since(fsyncStart).Nanoseconds())
+			}
+			if len(r.Events) > 0 {
+				writeDurations = append(writeDurations, time.Since(ledgerWriteStart))
 			}
 
 			atomic.AddInt64(&rawBytesTotal, r.RawBytes)
@@ -449,6 +462,12 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 			hotWriter.Close()
 			// Flush bitmaps and populate term counts (normally done inside ConvertToCold)
 			indexStore.Flush()
+			// TODO: enable bitmap snapshot writes once validated
+			// if rw, ok := hotWriter.(*store.RocksDBHotSegmentWriter); ok {
+			// 	if err := rw.WriteBitmapSnapshots(indexStore); err != nil {
+			// 		fmt.Fprintf(os.Stderr, "[segment %06d] warning: failed to write bitmap snapshots: %v\n", currentSegID, err)
+			// 	}
+			// }
 			c, t0, t1, t2, t3 := indexStore.SegmentTermCounts(currentSegID)
 			segStats.ContractTerms = c
 			segStats.Topic0Terms = t0
@@ -542,6 +561,18 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 		summary.WriteString(fmt.Sprintf("  Avg bytes/event:         %.f\n", rawBytesPerEvent))
 	}
 
+	if len(writeDurations) > 0 {
+		wMin, wAvg, wP50, wP99, wMax := writeLatencyStats(writeDurations)
+		summary.WriteString("\n")
+		summary.WriteString("Per-Ledger Write Latency (non-empty ledgers):\n")
+		summary.WriteString(fmt.Sprintf("  Samples:                 %d\n", len(writeDurations)))
+		summary.WriteString(fmt.Sprintf("  Min:                     %v\n", wMin))
+		summary.WriteString(fmt.Sprintf("  Avg:                     %v\n", wAvg))
+		summary.WriteString(fmt.Sprintf("  P50:                     %v\n", wP50))
+		summary.WriteString(fmt.Sprintf("  P99:                     %v\n", wP99))
+		summary.WriteString(fmt.Sprintf("  Max:                     %v\n", wMax))
+	}
+
 	writeSegmentMetricsSummary(&summary, allSegmentMetrics)
 
 	fmt.Fprint(os.Stderr, summary.String())
@@ -606,6 +637,24 @@ func groupEventsByLedger(events []*event.IngestEvent) [][]*event.IngestEvent {
 	}
 
 	return result
+}
+
+// writeLatencyStats computes min/avg/p50/p99/max from a slice of durations.
+func writeLatencyStats(durations []time.Duration) (min, avg, p50, p99, max time.Duration) {
+	if len(durations) == 0 {
+		return
+	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	min = durations[0]
+	max = durations[len(durations)-1]
+	p50 = durations[len(durations)*50/100]
+	p99 = durations[len(durations)*99/100]
+	var total time.Duration
+	for _, d := range durations {
+		total += d
+	}
+	avg = total / time.Duration(len(durations))
+	return
 }
 
 // fmtErr creates a formatted error.
