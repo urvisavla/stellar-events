@@ -423,6 +423,9 @@ type Config struct {
 	WriteSegmentFiles bool   // write index + data files during ingest
 	CompressData      bool   // zstd-compress event data in segment files
 	BlockSize         int    // group size for compressed event blocks
+
+	// Hot writer type: "flatfile", "rocksdb", "live"
+	HotWriter string
 }
 
 // New creates a Store from the given options.
@@ -460,7 +463,18 @@ func New(opts Config) (*Store, error) {
 		coldPath := filepath.Join(opts.SegmentPath, "cold")
 		coldReader := NewSegmentReader(coldPath)
 
-		if es.rocksDB != nil {
+		if opts.HotWriter == "live" {
+			// LiveWriter hot segments: events.pack in hot/ + index_deltas.dat
+			liveReader, hotErr := NewLiveHotSegmentReader(opts.SegmentPath)
+			if hotErr == nil && liveReader.HasSegments() {
+				es.queryBackend = NewHybridReader(coldReader, liveReader, coldPath)
+			} else {
+				if hotErr != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to load live hot segments: %v\n", hotErr)
+				}
+				es.queryBackend = coldReader
+			}
+		} else if es.rocksDB != nil {
 			// Check for RocksDB-backed hot segments first
 			rocksHotReader, hotErr := NewRocksDBHotSegmentReader(es.rocksDB)
 			if hotErr == nil && rocksHotReader.HasSegments() {

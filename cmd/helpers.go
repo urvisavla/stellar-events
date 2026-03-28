@@ -27,6 +27,7 @@ func openStore(cfg *config.Config) (*store.Store, error) {
 		WriteSegmentFiles: cfg.Storage.SegmentFiles,
 		CompressData:      cfg.Storage.CompressData,
 		BlockSize:         cfg.Storage.BlockSize,
+		HotWriter:         cfg.Storage.HotWriter,
 	}
 
 	if cfg.Storage.RocksDB {

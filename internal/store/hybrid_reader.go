@@ -62,6 +62,9 @@ func (h *HybridReader) isSegmentHot(segmentID uint32) bool {
 	if rhr, ok := h.hotReader.(*RocksDBHotSegmentReader); ok {
 		return rhr.HasSegment(segmentID)
 	}
+	if lhr, ok := h.hotReader.(*LiveHotSegmentReader); ok {
+		return lhr.HasSegment(segmentID)
+	}
 	// For RocksDB bitmap reader, any non-finalized segment is considered hot
 	return true
 }

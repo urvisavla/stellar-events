@@ -38,9 +38,6 @@ type LiveHotSegmentWriter struct {
 	indexDeltas    *os.File
 	indexDeltasBuf []byte // manual buffer to reduce syscalls
 
-	// Ledger offsets file (for crash recovery)
-	ledgerOffs *os.File
-
 	compressEvents bool
 	blockSize      int
 }
@@ -81,21 +78,12 @@ func NewLiveHotSegmentWriter(basePath string, segmentID uint32, compressEvents b
 		return nil, fmt.Errorf("open index_deltas.dat: %w", err)
 	}
 
-	// Open ledger_offsets.dat for crash recovery
-	ledgerOffs, err := os.OpenFile(filepath.Join(hotDir, hotLedgerOffsFile), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		lw.Close()
-		indexDeltas.Close()
-		return nil, fmt.Errorf("open ledger_offsets.dat: %w", err)
-	}
-
 	return &LiveHotSegmentWriter{
 		segmentPath:    basePath,
 		segmentID:      segmentID,
 		hotDir:         hotDir,
 		lw:             lw,
-		indexDeltas:     indexDeltas,
-		ledgerOffs:     ledgerOffs,
+		indexDeltas:    indexDeltas,
 		compressEvents: compressEvents,
 		blockSize:      blockSize,
 	}, nil
@@ -109,9 +97,6 @@ func (w *LiveHotSegmentWriter) WriteLedger(events []*event.IngestEvent, indexSto
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], w.cumulativeEvents)
 		w.ledgerOffsData = append(w.ledgerOffsData, buf[:]...)
-		if _, err := w.ledgerOffs.Write(buf[:]); err != nil {
-			return fmt.Errorf("write ledger_offsets.dat: %w", err)
-		}
 		return nil
 	}
 
@@ -151,15 +136,12 @@ func (w *LiveHotSegmentWriter) WriteLedger(events []*event.IngestEvent, indexSto
 
 	w.nextEventID = startID + uint32(len(events))
 
-	// Update cumulative counts
+	// Update cumulative counts (in-memory only; embedded in events.pack on Freeze)
 	w.cumulativeEvents += uint32(len(events))
 	w.ledgersWritten++
 	var cumBuf [4]byte
 	binary.LittleEndian.PutUint32(cumBuf[:], w.cumulativeEvents)
 	w.ledgerOffsData = append(w.ledgerOffsData, cumBuf[:]...)
-	if _, err := w.ledgerOffs.Write(cumBuf[:]); err != nil {
-		return fmt.Errorf("write ledger_offsets.dat: %w", err)
-	}
 
 	// Flush index deltas buffer
 	if len(w.indexDeltasBuf) > 0 {
@@ -186,16 +168,13 @@ func (w *LiveHotSegmentWriter) FlushBuffers() error {
 	return nil
 }
 
-// Fsync syncs the live packfile and auxiliary files.
+// Fsync syncs the live packfile and index deltas file.
 func (w *LiveHotSegmentWriter) Fsync() error {
 	if _, err := w.lw.Sync(); err != nil {
 		return fmt.Errorf("sync live packfile: %w", err)
 	}
 	if err := w.indexDeltas.Sync(); err != nil {
 		return fmt.Errorf("fsync index_deltas.dat: %w", err)
-	}
-	if err := w.ledgerOffs.Sync(); err != nil {
-		return fmt.Errorf("fsync ledger_offsets.dat: %w", err)
 	}
 	return nil
 }
@@ -358,9 +337,5 @@ func (w *LiveHotSegmentWriter) closeFiles() {
 	if w.indexDeltas != nil {
 		w.indexDeltas.Close()
 		w.indexDeltas = nil
-	}
-	if w.ledgerOffs != nil {
-		w.ledgerOffs.Close()
-		w.ledgerOffs = nil
 	}
 }
