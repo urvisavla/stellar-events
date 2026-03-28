@@ -24,8 +24,7 @@ import (
 type LiveHotSegmentWriter struct {
 	segmentPath string // top-level segment path (e.g. <basePath>)
 	segmentID   uint32
-	coldDir     string // full path: <basePath>/cold/NNNNNN
-	hotDir      string // full path: <basePath>/hot/NNNNNN (for index_deltas + ledger_offsets)
+	hotDir      string // full path: <basePath>/hot/NNNNNN
 
 	lw *packfile.LiveWriter
 
@@ -55,12 +54,8 @@ func NewLiveHotSegmentWriter(basePath string, segmentID uint32, compressEvents b
 	}
 
 	dirName := fmt.Sprintf("%06d", segmentID)
-	coldDir := filepath.Join(basePath, "cold", dirName)
 	hotDir := filepath.Join(basePath, hotDirName, dirName)
 
-	if err := os.MkdirAll(coldDir, 0755); err != nil {
-		return nil, fmt.Errorf("create cold dir %s: %w", coldDir, err)
-	}
 	if err := os.MkdirAll(hotDir, 0755); err != nil {
 		return nil, fmt.Errorf("create hot dir %s: %w", hotDir, err)
 	}
@@ -70,7 +65,7 @@ func NewLiveHotSegmentWriter(basePath string, segmentID uint32, compressEvents b
 		format = packfile.Uncompressed
 	}
 
-	lw, err := packfile.CreateLive(filepath.Join(coldDir, EventsFileName), packfile.WriterOptions{
+	lw, err := packfile.CreateLive(filepath.Join(hotDir, EventsFileName), packfile.WriterOptions{
 		RecordSize:   blockSize,
 		Format:       format,
 		BytesPerSync: 1 << 20, // 1 MB
@@ -97,7 +92,6 @@ func NewLiveHotSegmentWriter(basePath string, segmentID uint32, compressEvents b
 	return &LiveHotSegmentWriter{
 		segmentPath:    basePath,
 		segmentID:      segmentID,
-		coldDir:        coldDir,
 		hotDir:         hotDir,
 		lw:             lw,
 		indexDeltas:     indexDeltas,
@@ -216,13 +210,14 @@ func (w *LiveHotSegmentWriter) CommittedLengths() HotSegmentMeta {
 	}
 }
 
-// ConvertToCold finalizes the live packfile in-place and builds MPHF indexes.
-// The events.pack file is already at cold/NNNNNN/events.pack — Freeze just
-// writes the index/trailer. No event re-reading or re-packing needed.
+// ConvertToCold freezes the live packfile, moves it from hot/ to cold/,
+// and builds MPHF indexes. No event re-reading or re-packing needed.
 func (w *LiveHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDataWriter, stats *progress.SegmentStats) error {
 	totalStart := time.Now()
 	segID := w.segmentID
 	coldBasePath := filepath.Join(w.segmentPath, "cold")
+	dirName := fmt.Sprintf("%06d", segID)
+	coldDir := filepath.Join(coldBasePath, dirName)
 
 	fmt.Fprintf(os.Stderr, "\n[hot→cold %06d] starting conversion (live packfile, %d events, %d ledgers)\n",
 		segID, w.nextEventID, w.ledgersWritten)
@@ -251,7 +246,6 @@ func (w *LiveHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *Segmen
 	}
 
 	// Step 2: Freeze the live packfile with ledger offsets as appData.
-	// This writes the packfile index + trailer in-place — no event re-reading.
 	t1 := time.Now()
 	paddedLedgerOffs := make([]byte, SegmentLedgerOffsetsSize)
 	copy(paddedLedgerOffs, w.ledgerOffsData)
@@ -259,10 +253,22 @@ func (w *LiveHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *Segmen
 	if err := w.lw.Freeze(paddedLedgerOffs); err != nil {
 		return fmt.Errorf("freeze live packfile: %w", err)
 	}
+	w.lw.Close()
+	w.lw = nil
 	freezeTime := time.Since(t1)
 	fmt.Fprintf(os.Stderr, "  [hot→cold %06d] freeze events.pack (%d events): %v\n", segID, w.nextEventID, freezeTime)
 
-	// Step 3: Build MPHF index from flushed bitmaps (same as other writers)
+	// Step 3: Move events.pack from hot/ to cold/
+	if err := os.MkdirAll(coldDir, 0755); err != nil {
+		return fmt.Errorf("create cold dir: %w", err)
+	}
+	hotPackPath := filepath.Join(w.hotDir, EventsFileName)
+	coldPackPath := filepath.Join(coldDir, EventsFileName)
+	if err := os.Rename(hotPackPath, coldPackPath); err != nil {
+		return fmt.Errorf("move events.pack to cold: %w", err)
+	}
+
+	// Step 4: Build MPHF index from flushed bitmaps (same as other writers)
 	t2 := time.Now()
 	if err := WriteSegmentDir(coldBasePath, segID, cached.Contracts, cached.Topics); err != nil {
 		return fmt.Errorf("write cold index files: %w", err)
@@ -270,7 +276,7 @@ func (w *LiveHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *Segmen
 	mphfTime := time.Since(t2)
 	fmt.Fprintf(os.Stderr, "  [hot→cold %06d] MPHF index build: %v\n", segID, mphfTime)
 
-	// Step 4: Clean up hot directory (index_deltas.dat, ledger_offsets.dat)
+	// Step 5: Clean up hot directory
 	t3 := time.Now()
 	w.closeFiles()
 	os.RemoveAll(w.hotDir)
@@ -309,7 +315,6 @@ func (w *LiveHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *Segmen
 		}
 		stats.IndexTerms = stats.ContractTerms + stats.Topic0Terms + stats.Topic1Terms + stats.Topic2Terms + stats.Topic3Terms
 
-		coldDir := filepath.Join(coldBasePath, fmt.Sprintf("%06d", segID))
 		for _, name := range []string{"index.hash", "index.pack"} {
 			if fi, err := os.Stat(filepath.Join(coldDir, name)); err == nil {
 				stats.ColdIndexBytes += fi.Size()
@@ -323,9 +328,9 @@ func (w *LiveHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *Segmen
 	return nil
 }
 
-// Close freezes the packfile (so Writer.Close won't delete it) and closes
-// all file handles. The resulting events.pack is a valid packfile with
-// ledger offsets embedded as appData.
+// Close closes auxiliary files and the LiveWriter. For --no-freeze, the
+// events.pack stays in hot/ as a valid frozen packfile (Freeze is called
+// to prevent Writer.Close from deleting the file).
 func (w *LiveHotSegmentWriter) Close() error {
 	w.closeFiles()
 	if w.lw != nil {
@@ -334,7 +339,9 @@ func (w *LiveHotSegmentWriter) Close() error {
 		paddedOffs := make([]byte, SegmentLedgerOffsetsSize)
 		copy(paddedOffs, w.ledgerOffsData)
 		w.lw.Freeze(paddedOffs)
-		return w.lw.Close()
+		err := w.lw.Close()
+		w.lw = nil
+		return err
 	}
 	return nil
 }
