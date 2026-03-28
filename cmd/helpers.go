@@ -49,10 +49,12 @@ func openStoreForDatastore(cfg *config.Config, datastore string) (*store.Store, 
 		opts.SegmentPath = cfg.Storage.SegmentPath
 		opts.CompressData = cfg.Storage.CompressData
 		opts.BlockSize = cfg.Storage.BlockSize
+		opts.HotWriter = cfg.Storage.HotWriter
 	case "flatfiles":
 		opts.SegmentPath = cfg.Storage.SegmentPath
 		opts.CompressData = cfg.Storage.CompressData
 		opts.BlockSize = cfg.Storage.BlockSize
+		opts.HotWriter = cfg.Storage.HotWriter
 		fmt.Fprintf(os.Stderr, "[flatfiles] segment_path=%q\n", opts.SegmentPath)
 	default:
 		return nil, fmt.Errorf("unknown datastore: %s", datastore)
