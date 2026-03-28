@@ -110,5 +110,5 @@ require (
 
 replace (
 	github.com/linxGnu/grocksdb => github.com/linxGnu/grocksdb v1.10.3
-	github.com/tamir/events-analysis => github.com/tamirms/event-analysis v0.0.0-20260303135025-d9bd75a6f8a5
+	github.com/tamir/events-analysis => ../event-analysis
 )

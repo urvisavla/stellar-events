@@ -345,9 +345,16 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 			// Open new hot writer if needed
 			if hotWriter == nil || segID != currentSegID {
 				var err error
-				if rocksBackend != nil {
-					hotWriter = store.NewRocksDBHotSegmentWriter(rocksBackend, segmentPath, segID)
-				} else {
+				switch cfg.Storage.HotWriter {
+				case "live":
+					hotWriter, err = store.NewLiveHotSegmentWriter(segmentPath, segID, cfg.Storage.CompressData, cfg.Storage.BlockSize)
+				case "rocksdb":
+					if rocksBackend != nil {
+						hotWriter = store.NewRocksDBHotSegmentWriter(rocksBackend, segmentPath, segID)
+					} else {
+						err = fmtErr("hot_writer=rocksdb requires rocksdb=true")
+					}
+				default: // "flatfile" or empty
 					hotWriter, err = store.NewHotSegmentWriter(segmentPath, segID)
 				}
 				if err != nil {

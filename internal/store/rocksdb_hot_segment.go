@@ -196,6 +196,8 @@ func (w *RocksDBHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *Seg
 	paddedLedgerOffs := make([]byte, SegmentLedgerOffsetsSize)
 	copy(paddedLedgerOffs, w.ledgerOffsData)
 
+	var iterTime, copyTime, appendTime time.Duration
+
 	if sdw != nil {
 		if err := sdw.StartChunk(segID); err != nil {
 			return fmt.Errorf("start cold chunk: %w", err)
@@ -211,6 +213,7 @@ func (w *RocksDBHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *Seg
 		endKey := EncodeKey(segID+1, 0)
 
 		eventIdx := uint32(0)
+		iterStart := time.Now()
 		for it.Seek(startKey); it.Valid(); it.Next() {
 			key := it.Key()
 			keyData := key.Data()
@@ -218,7 +221,6 @@ func (w *RocksDBHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *Seg
 				key.Free()
 				break
 			}
-			// Check if we've gone past this segment
 			if bytes.Compare(keyData, endKey) >= 0 {
 				key.Free()
 				break
@@ -226,14 +228,22 @@ func (w *RocksDBHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *Seg
 			key.Free()
 
 			value := it.Value()
+			iterTime += time.Since(iterStart)
+
+			copyStart := time.Now()
 			eventData := make([]byte, value.Size())
 			copy(eventData, value.Data())
 			value.Free()
+			copyTime += time.Since(copyStart)
 
+			appendStart := time.Now()
 			if err := sdw.AppendEvent(eventIdx, eventData); err != nil {
 				return fmt.Errorf("append event %d to cold pack: %w", eventIdx, err)
 			}
+			appendTime += time.Since(appendStart)
+
 			eventIdx++
+			iterStart = time.Now()
 		}
 		if err := it.Err(); err != nil {
 			return fmt.Errorf("iterate events CF for segment %d: %w", segID, err)
@@ -245,7 +255,8 @@ func (w *RocksDBHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *Seg
 	}
 
 	eventsPackTime := time.Since(t1)
-	fmt.Fprintf(os.Stderr, "  [hot→cold %06d] events.pack (%d events): %v\n", segID, w.nextEventID, eventsPackTime)
+	fmt.Fprintf(os.Stderr, "  [hot→cold %06d] events.pack (%d events): %v (iter=%v copy=%v append=%v)\n",
+		segID, w.nextEventID, eventsPackTime, iterTime, copyTime, appendTime)
 
 	// Step 2b: Build index files from flushed bitmaps
 	t2 := time.Now()

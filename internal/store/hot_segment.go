@@ -331,6 +331,7 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 	eventsIdxPath := filepath.Join(w.hotDir, hotEventsIdxFile)
 	eventsDatPath := filepath.Join(w.hotDir, hotEventsDatFile)
 
+	readStart := time.Now()
 	idxData, err := os.ReadFile(eventsIdxPath)
 	if err != nil {
 		return fmt.Errorf("read events.idx: %w", err)
@@ -339,8 +340,11 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 	if err != nil {
 		return fmt.Errorf("read events.dat: %w", err)
 	}
+	readTime := time.Since(readStart)
 
 	numEvents := len(idxData) / 8
+
+	var appendTime time.Duration
 
 	// Start the SegmentDataWriter chunk for cold output
 	if sdw != nil {
@@ -360,9 +364,11 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 			}
 
 			eventData := datData[offset:eventEnd]
+			appendStart := time.Now()
 			if err := sdw.AppendEvent(uint32(i), eventData); err != nil {
 				return fmt.Errorf("append event %d to cold pack: %w", i, err)
 			}
+			appendTime += time.Since(appendStart)
 		}
 
 		if err := sdw.FinalizeChunk(appData); err != nil {
@@ -371,7 +377,8 @@ func (w *HotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *SegmentDat
 	}
 
 	eventsPackTime := time.Since(t1)
-	fmt.Fprintf(os.Stderr, "  [hot→cold %06d] events.pack (%d events): %v\n", segID, numEvents, eventsPackTime)
+	fmt.Fprintf(os.Stderr, "  [hot→cold %06d] events.pack (%d events): %v (read=%v append=%v)\n",
+		segID, numEvents, eventsPackTime, readTime, appendTime)
 
 	// Step 2b: Build index.hash + index.pack from flushed bitmaps
 	t2 := time.Now()

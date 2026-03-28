@@ -43,8 +43,9 @@ type SourceConfig struct {
 // At least one backend (RocksDB or flat files) must be enabled.
 type StorageConfig struct {
 	// --- Backend selection ---
-	RocksDB      bool `toml:"rocksdb"`       // Enable RocksDB backend (default: true)
-	SegmentFiles bool `toml:"segment_files"` // Enable flat file segment backend (default: false)
+	RocksDB      bool   `toml:"rocksdb"`       // Enable RocksDB backend (default: true)
+	SegmentFiles bool   `toml:"segment_files"` // Enable flat file segment backend (default: false)
+	HotWriter    string `toml:"hot_writer"`    // Hot segment writer: "flatfile" (default), "rocksdb", "live"
 
 	// --- RocksDB options (ignored when rocksdb = false) ---
 	DBPath string `toml:"db_path"` // Path to RocksDB database directory
