@@ -323,10 +323,17 @@ func (w *LiveHotSegmentWriter) ConvertToCold(indexStore *IndexStore, sdw *Segmen
 	return nil
 }
 
-// Close closes the LiveWriter and auxiliary files without deleting.
+// Close freezes the packfile (so Writer.Close won't delete it) and closes
+// all file handles. The resulting events.pack is a valid packfile with
+// ledger offsets embedded as appData.
 func (w *LiveHotSegmentWriter) Close() error {
 	w.closeFiles()
 	if w.lw != nil {
+		// Freeze before Close — without Freeze, packfile.Writer.Close
+		// deletes the file ("Finish was never called").
+		paddedOffs := make([]byte, SegmentLedgerOffsetsSize)
+		copy(paddedOffs, w.ledgerOffsData)
+		w.lw.Freeze(paddedOffs)
 		return w.lw.Close()
 	}
 	return nil
