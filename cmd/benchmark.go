@@ -1339,6 +1339,10 @@ func executeQueryBenchmark(eventStore *store.Store, startLedger, endLedger uint3
 		return &QueryResult{Error: err}
 	}
 
+	fmt.Fprintf(os.Stderr, "[debug] store.TotalTime=%v idx=%v evt=%v decode=%v filter=%v matches=%d events=%d\n",
+		stats.TotalTime, stats.IndexLookupTime, stats.EventFetchTime, stats.DecodeTime, stats.FilterTime,
+		stats.MatchingLocalIDs, len(events))
+
 	return &QueryResult{
 		EventsReturned:      len(events),
 		EventsScanned:       stats.EventsScanned,
