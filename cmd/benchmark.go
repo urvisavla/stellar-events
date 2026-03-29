@@ -1350,7 +1350,7 @@ func executeQueryBenchmark(eventStore *store.Store, startLedger, endLedger uint3
 		IndexReadTime:       stats.IndexReadTime,
 		IndexDecodeTime:     stats.IndexDecodeTime,
 		IndexIntersectTime:  stats.IndexIntersectTime,
-		EventTime:           stats.EventFetchTime,
+		EventTime:           stats.EventFetchTime + stats.DecodeTime,
 		EventFetchTime:      stats.EventFetchTime,
 		EventDecodeTime:     stats.DecodeTime,
 		EventFilterTime:     stats.FilterTime,
