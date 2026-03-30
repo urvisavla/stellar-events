@@ -339,7 +339,11 @@ func (r *LiveHotSegmentReader) FetchByIDs(perSegment map[uint32]*roaring.Bitmap,
 		}
 
 		bitmap := perSegment[segID]
-		denseIDs := make([]uint32, 0, bitmap.GetCardinality())
+		idCap := int(bitmap.GetCardinality())
+		if remaining := fetchCap - len(events); remaining < idCap {
+			idCap = remaining
+		}
+		denseIDs := make([]uint32, 0, idCap)
 		bitmapIter := bitmap.Iterator()
 		for bitmapIter.HasNext() {
 			if len(denseIDs)+len(events) >= fetchCap {

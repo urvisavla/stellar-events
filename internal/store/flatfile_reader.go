@@ -498,8 +498,12 @@ func (r *SegmentReader) FetchByIDs(perSegment map[uint32]*roaring.Bitmap, limit 
 
 		bitmap := perSegment[segID]
 
-		// Collect dense IDs for this segment (sorted by bitmap iterator)
-		denseIDs := make([]uint32, 0, bitmap.GetCardinality())
+		// Collect dense IDs for this segment (capped at remaining fetch limit)
+		idCap := int(bitmap.GetCardinality())
+		if remaining := fetchCap - len(events); remaining < idCap {
+			idCap = remaining
+		}
+		denseIDs := make([]uint32, 0, idCap)
 		bitmapIter := bitmap.Iterator()
 		for bitmapIter.HasNext() {
 			if len(denseIDs)+len(events) >= fetchCap {
