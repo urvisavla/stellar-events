@@ -292,6 +292,13 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 					fmt.Fprintf(os.Stderr, "[segment %06d] %.0f events/s, heap: %d MB, wall: %.0fms\n",
 						currentSegID, eventsPerSec, heapMB, wallMs)
 
+					// Log WriteLedger timing breakdown if available
+					if hw, ok := hotWriter.(*store.HotSegmentWriter); ok {
+						t := hw.Timings()
+						fmt.Fprintf(os.Stderr, "[segment %06d] write breakdown: encode=%v, event_write=%v, delta_write=%v, bitmap_add=%v\n",
+							currentSegID, t.EncodeTime, t.EventWriteTime, t.DeltaWriteTime, t.BitmapAddTime)
+					}
+
 					segStats := progress.SegmentStats{
 						SegmentID:     currentSegID,
 						Ledgers:       segLedgers,
@@ -452,6 +459,13 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 			formatBytes(meta.EventsDatLen), avgEventBytes)
 		fmt.Fprintf(os.Stderr, "[segment %06d] %.0f events/s, heap: %d MB, wall: %.0fms\n",
 			currentSegID, eventsPerSec, heapMB, wallMs)
+
+		// Log WriteLedger timing breakdown if available
+		if hw, ok := hotWriter.(*store.HotSegmentWriter); ok {
+			t := hw.Timings()
+			fmt.Fprintf(os.Stderr, "[segment %06d] write breakdown: encode=%v, event_write=%v, delta_write=%v, bitmap_add=%v\n",
+				currentSegID, t.EncodeTime, t.EventWriteTime, t.DeltaWriteTime, t.BitmapAddTime)
+		}
 
 		segStats := progress.SegmentStats{
 			SegmentID:     currentSegID,

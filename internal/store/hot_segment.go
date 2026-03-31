@@ -62,6 +62,14 @@ type HotSegmentMeta struct {
 	LedgerOffsLen  int64
 }
 
+// WriteLedgerTimings accumulates per-component timing within WriteLedger.
+type WriteLedgerTimings struct {
+	EncodeTime     time.Duration // event.EncodeBinaryEvent
+	EventWriteTime time.Duration // events.dat + events.idx writes
+	DeltaWriteTime time.Duration // index_deltas.dat writes
+	BitmapAddTime  time.Duration // indexStore.AddContractEvent/AddTopicEvent
+}
+
 // HotSegmentWriter writes incoming ledger data into hot append-only files
 // within a single segment directory. It tracks the next event ID and writes
 // to four files per ledger batch. All writes go through bufio.Writer to
@@ -75,6 +83,9 @@ type HotSegmentWriter struct {
 	cumulativeEvents uint32 // running cumulative event count for ledger_offsets.dat
 	ledgersWritten   uint32 // number of ledger offset entries written
 	eventsDatPos     int64  // tracked in memory to avoid Seek syscall
+
+	// Per-component timing accumulators
+	timings WriteLedgerTimings
 
 	// Raw file handles (for fsync)
 	eventsDat   *os.File
@@ -167,9 +178,12 @@ func (w *HotSegmentWriter) WriteLedger(events []*event.IngestEvent, indexStore *
 		eventID := startID + uint32(i)
 
 		// Step 2: Serialize event and append to events.dat
+		encStart := time.Now()
 		encoded := event.EncodeBinaryEvent(ev)
+		w.timings.EncodeTime += time.Since(encStart)
 
 		// Record byte offset in events.idx (uint64 LE)
+		ewStart := time.Now()
 		var offBuf [8]byte
 		binary.LittleEndian.PutUint64(offBuf[:], uint64(datPos))
 		if _, err := w.eventsIdxBuf.Write(offBuf[:]); err != nil {
@@ -180,8 +194,10 @@ func (w *HotSegmentWriter) WriteLedger(events []*event.IngestEvent, indexStore *
 			return fmt.Errorf("write events.dat: %w", err)
 		}
 		datPos += int64(len(encoded))
+		w.timings.EventWriteTime += time.Since(ewStart)
 
 		// Step 3: Write term deltas to index_deltas.dat
+		dwStart := time.Now()
 		if len(ev.ContractID) > 0 {
 			termHash := ContractTermKey(ev.ContractID)
 			if err := w.writeIndexDelta(0x00, termHash, eventID); err != nil {
@@ -197,14 +213,17 @@ func (w *HotSegmentWriter) WriteLedger(events []*event.IngestEvent, indexStore *
 				return err
 			}
 		}
+		w.timings.DeltaWriteTime += time.Since(dwStart)
 
 		// Step 4: Update in-memory bitmaps
+		bmStart := time.Now()
 		if len(ev.ContractID) > 0 {
 			indexStore.AddContractEvent(ev.ContractID, w.segmentID, eventID)
 		}
 		for pos, topicBytes := range ev.Topics {
 			indexStore.AddTopicEvent(pos, topicBytes, w.segmentID, eventID)
 		}
+		w.timings.BitmapAddTime += time.Since(bmStart)
 	}
 
 	w.eventsDatPos = datPos
@@ -274,6 +293,11 @@ func (w *HotSegmentWriter) CommittedLengths() HotSegmentMeta {
 		IndexDeltasLen: stat(w.indexDeltas),
 		LedgerOffsLen:  stat(w.ledgerOffs),
 	}
+}
+
+// Timings returns accumulated per-component timing from WriteLedger calls.
+func (w *HotSegmentWriter) Timings() WriteLedgerTimings {
+	return w.timings
 }
 
 // ConvertToCold converts this hot segment to cold format with per-step timing.
