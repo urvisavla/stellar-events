@@ -213,6 +213,17 @@ func (r *RocksDBHotSegmentReader) loadFromIndexDeltas(segID uint32) (*rocksDBHot
 		return nil, fmt.Errorf("iterate index_deltas for segment %d: %w", segID, err)
 	}
 
+	// Run-optimize all bitmaps to convert array/bitmap containers to
+	// run-length encoding where beneficial. Reduces memory and speeds up Clone().
+	for _, bm := range contracts {
+		bm.RunOptimize()
+	}
+	for i := range topics {
+		for _, bm := range topics[i] {
+			bm.RunOptimize()
+		}
+	}
+
 	fmt.Fprintf(os.Stderr, "[hot-rocksdb %06d] index_deltas: %d entries (contracts: %d, topic0: %d, topic1: %d, topic2: %d, topic3: %d)\n",
 		segID, numDeltas, deltaCountPerField[0], deltaCountPerField[1], deltaCountPerField[2], deltaCountPerField[3], deltaCountPerField[4])
 

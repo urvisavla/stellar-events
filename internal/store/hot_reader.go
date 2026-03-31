@@ -183,6 +183,17 @@ func loadHotSegment(segDir string, segID uint32) (*hotSegmentState, error) {
 		}
 	}
 
+	// Run-optimize all bitmaps to convert array/bitmap containers to
+	// run-length encoding where beneficial. Reduces memory and speeds up Clone().
+	for _, bm := range contracts {
+		bm.RunOptimize()
+	}
+	for i := range topics {
+		for _, bm := range topics[i] {
+			bm.RunOptimize()
+		}
+	}
+
 	// Compute per-field stats
 	fieldNames := [5]string{"contracts", "topic0", "topic1", "topic2", "topic3"}
 	fieldMaps := [5]map[[16]byte]*roaring.Bitmap{contracts, topics[0], topics[1], topics[2], topics[3]}
