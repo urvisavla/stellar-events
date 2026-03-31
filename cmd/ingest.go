@@ -295,8 +295,8 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 					// Log WriteLedger timing breakdown if available
 					if hw, ok := hotWriter.(*store.HotSegmentWriter); ok {
 						t := hw.Timings()
-						fmt.Fprintf(os.Stderr, "[segment %06d] write breakdown: encode=%v, event_write=%v, delta_write=%v, bitmap_add=%v\n",
-							currentSegID, t.EncodeTime, t.EventWriteTime, t.DeltaWriteTime, t.BitmapAddTime)
+						fmt.Fprintf(os.Stderr, "[segment %06d] write breakdown: encode=%v, event_write=%v, hash=%v, delta_write=%v, bitmap_add=%v\n",
+							currentSegID, t.EncodeTime, t.EventWriteTime, t.HashTime, t.DeltaWriteTime, t.BitmapAddTime)
 					}
 
 					segStats := progress.SegmentStats{
@@ -463,8 +463,8 @@ func cmdIngest(cfg *config.Config, startLedger, endLedger uint32, noFreeze bool)
 		// Log WriteLedger timing breakdown if available
 		if hw, ok := hotWriter.(*store.HotSegmentWriter); ok {
 			t := hw.Timings()
-			fmt.Fprintf(os.Stderr, "[segment %06d] write breakdown: encode=%v, event_write=%v, delta_write=%v, bitmap_add=%v\n",
-				currentSegID, t.EncodeTime, t.EventWriteTime, t.DeltaWriteTime, t.BitmapAddTime)
+			fmt.Fprintf(os.Stderr, "[segment %06d] write breakdown: encode=%v, event_write=%v, hash=%v, delta_write=%v, bitmap_add=%v\n",
+				currentSegID, t.EncodeTime, t.EventWriteTime, t.HashTime, t.DeltaWriteTime, t.BitmapAddTime)
 		}
 
 		segStats := progress.SegmentStats{

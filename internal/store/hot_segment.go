@@ -66,6 +66,7 @@ type HotSegmentMeta struct {
 type WriteLedgerTimings struct {
 	EncodeTime     time.Duration // event.EncodeBinaryEvent
 	EventWriteTime time.Duration // events.dat + events.idx writes
+	HashTime       time.Duration // ContractTermKey/TopicTermKey (xxhash128)
 	DeltaWriteTime time.Duration // index_deltas.dat writes
 	BitmapAddTime  time.Duration // indexStore.AddContractEvent/AddTopicEvent
 }
@@ -196,32 +197,48 @@ func (w *HotSegmentWriter) WriteLedger(events []*event.IngestEvent, indexStore *
 		datPos += int64(len(encoded))
 		w.timings.EventWriteTime += time.Since(ewStart)
 
-		// Step 3: Write term deltas to index_deltas.dat
-		dwStart := time.Now()
+		// Compute term hashes once (shared by delta write + bitmap add)
+		hashStart := time.Now()
+		var contractHash [16]byte
+		var hasContract bool
 		if len(ev.ContractID) > 0 {
-			termHash := ContractTermKey(ev.ContractID)
-			if err := w.writeIndexDelta(0x00, termHash, eventID); err != nil {
-				return err
-			}
+			contractHash = ContractTermKey(ev.ContractID)
+			hasContract = true
 		}
+		type topicHash struct {
+			hash [16]byte
+			pos  int
+		}
+		var topicHashes []topicHash
 		for pos, topicBytes := range ev.Topics {
 			if pos > 3 {
 				break
 			}
-			termHash := TopicTermKey(topicBytes)
-			if err := w.writeIndexDelta(byte(pos+1), termHash, eventID); err != nil {
+			topicHashes = append(topicHashes, topicHash{hash: TopicTermKey(topicBytes), pos: pos})
+		}
+		w.timings.HashTime += time.Since(hashStart)
+
+		// Step 3: Write term deltas to index_deltas.dat
+		dwStart := time.Now()
+		if hasContract {
+			if err := w.writeIndexDelta(0x00, contractHash, eventID); err != nil {
+				return err
+			}
+		}
+		for _, th := range topicHashes {
+			if err := w.writeIndexDelta(byte(th.pos+1), th.hash, eventID); err != nil {
 				return err
 			}
 		}
 		w.timings.DeltaWriteTime += time.Since(dwStart)
 
-		// Step 4: Update in-memory bitmaps
+		// Step 4: Update in-memory bitmaps (reuse pre-computed hashes)
 		bmStart := time.Now()
-		if len(ev.ContractID) > 0 {
-			indexStore.AddContractEvent(ev.ContractID, w.segmentID, eventID)
+		if hasContract {
+			indexStore.AddContractEventByHash(contractHash, w.segmentID, eventID)
 		}
-		for pos, topicBytes := range ev.Topics {
-			indexStore.AddTopicEvent(pos, topicBytes, w.segmentID, eventID)
+		for _, th := range topicHashes {
+			indexStore.AddTopicEventByHash(th.pos, th.hash, w.segmentID, eventID)
 		}
 		w.timings.BitmapAddTime += time.Since(bmStart)
 	}

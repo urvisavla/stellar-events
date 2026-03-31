@@ -135,6 +135,11 @@ func (bi *eventBitmap32Index) AssignDenseLocalID(segmentID uint32, ledger uint32
 // AddContractEvent adds an event to the contract index using a dense local ID.
 func (bi *eventBitmap32Index) AddContractEvent(contractID []byte, segmentID uint32, denseLocalID uint32) {
 	termKey := ContractTermKey(contractID)
+	bi.AddContractEventByHash(termKey, segmentID, denseLocalID)
+}
+
+// AddContractEventByHash adds an event using a pre-computed term hash.
+func (bi *eventBitmap32Index) AddContractEventByHash(termKey [16]byte, segmentID uint32, denseLocalID uint32) {
 	key := makeIndexKey(termKey, segmentID)
 
 	bitmap, exists := bi.contracts[key]
@@ -153,6 +158,11 @@ func (bi *eventBitmap32Index) AddContractEvent(contractID []byte, segmentID uint
 // AddTopicEvent adds an event to the topic index (positional) using a dense local ID.
 func (bi *eventBitmap32Index) AddTopicEvent(pos int, topicValue []byte, segmentID uint32, denseLocalID uint32) {
 	termKey := TopicTermKey(topicValue)
+	bi.AddTopicEventByHash(pos, termKey, segmentID, denseLocalID)
+}
+
+// AddTopicEventByHash adds an event using a pre-computed term hash.
+func (bi *eventBitmap32Index) AddTopicEventByHash(pos int, termKey [16]byte, segmentID uint32, denseLocalID uint32) {
 	key := makeIndexKey(termKey, segmentID)
 
 	m := bi.topicMapForPos(pos)
@@ -536,9 +546,19 @@ func (s *IndexStore) AddContractEvent(contractID []byte, segmentID uint32, dense
 	s.bitmap.AddContractEvent(contractID, segmentID, denseLocalID)
 }
 
+// AddContractEventByHash adds an event using a pre-computed term hash.
+func (s *IndexStore) AddContractEventByHash(termKey [16]byte, segmentID uint32, denseLocalID uint32) {
+	s.bitmap.AddContractEventByHash(termKey, segmentID, denseLocalID)
+}
+
 // AddTopicEvent adds an event to the topic index (positional) using a dense local ID.
 func (s *IndexStore) AddTopicEvent(pos int, topic []byte, segmentID uint32, denseLocalID uint32) {
 	s.bitmap.AddTopicEvent(pos, topic, segmentID, denseLocalID)
+}
+
+// AddTopicEventByHash adds an event using a pre-computed term hash.
+func (s *IndexStore) AddTopicEventByHash(pos int, termKey [16]byte, segmentID uint32, denseLocalID uint32) {
+	s.bitmap.AddTopicEventByHash(pos, termKey, segmentID, denseLocalID)
 }
 
 // AssignDenseLocalID assigns the next dense local ID for an event within a segment.
