@@ -207,10 +207,33 @@ func loadHotSegment(segDir string, segID uint32) (*hotSegmentState, error) {
 
 	var termCounts [5]int
 	var bitmapSizes [5]uint64
+	var singleContainer [5]int  // terms with exactly 1 roaring container
+	var multiContainer [5]int   // terms with 2+ containers
+	var cardBuckets [5][5]int   // per-field: [card=1, card=2-5, card=6-50, card=51-1000, card=1000+]
+
 	for f := 0; f < 5; f++ {
 		termCounts[f] = len(fieldMaps[f])
 		for _, bm := range fieldMaps[f] {
 			bitmapSizes[f] += bm.GetSizeInBytes()
+			stats := bm.Stats()
+			if stats.Containers <= 1 {
+				singleContainer[f]++
+			} else {
+				multiContainer[f]++
+			}
+			card := bm.GetCardinality()
+			switch {
+			case card <= 1:
+				cardBuckets[f][0]++
+			case card <= 5:
+				cardBuckets[f][1]++
+			case card <= 50:
+				cardBuckets[f][2]++
+			case card <= 1000:
+				cardBuckets[f][3]++
+			default:
+				cardBuckets[f][4]++
+			}
 		}
 		totalTerms += termCounts[f]
 		totalBitmapBytes += bitmapSizes[f]
@@ -234,6 +257,17 @@ func loadHotSegment(segDir string, segID uint32) (*hotSegmentState, error) {
 
 	totalInMem := totalBitmapBytes + totalOverhead
 	fmt.Fprintf(os.Stderr, "[hot %06d] total in-memory: %s\n", segID, formatBytesStore(int64(totalInMem)))
+
+	for f := 0; f < 5; f++ {
+		if termCounts[f] == 0 {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "[hot %06d] %s containers: single=%d (%d%%), multi=%d (%d%%) | cardinality: 1=%d, 2-5=%d, 6-50=%d, 51-1K=%d, 1K+=%d\n",
+			segID, fieldNames[f],
+			singleContainer[f], singleContainer[f]*100/termCounts[f],
+			multiContainer[f], multiContainer[f]*100/termCounts[f],
+			cardBuckets[f][0], cardBuckets[f][1], cardBuckets[f][2], cardBuckets[f][3], cardBuckets[f][4])
+	}
 
 	// Read ledger_offsets.dat and pad to SegmentLedgerOffsetsSize
 	ledgerOffsPath := filepath.Join(segDir, hotLedgerOffsFile)

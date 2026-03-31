@@ -75,6 +75,8 @@ func main() {
 		runBenchmark(cfg, args)
 	case "inspect":
 		runInspect(cfg, args)
+	case "bitmap-stats":
+		runBitmapStats(cfg, args)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
 		printUsage()

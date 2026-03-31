@@ -303,6 +303,9 @@ type SegmentMemStats struct {
 // 20 (key) + 8 (pointer) + ~50 (map bucket) + ~100 (bitmap object) = 178
 const perEntryOverhead = 178
 
+// PerEntryOverhead is the exported version for use by cmd tools.
+const PerEntryOverhead = perEntryOverhead
+
 // counterSize is the memory for a segmentEventCounter:
 // [SegmentSize]uint32 (4*10000=40000) + nextDenseID uint32 (4) = 40004
 const counterSize = 40004

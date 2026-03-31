@@ -49,6 +49,9 @@ const (
 	// indexDeltaSize is the fixed size of one index_deltas.dat entry:
 	// [fieldIndex:1][termHash:16][eventID:4] = 21 bytes
 	indexDeltaSize = 21
+
+	// IndexDeltaSize is the exported version of indexDeltaSize for use by cmd tools.
+	IndexDeltaSize = indexDeltaSize
 )
 
 // HotSegmentMeta holds current file lengths for potential RocksDB commit checkpointing.
