@@ -439,6 +439,7 @@ func (r *RocksDBHotSegmentReader) LoadTermBitmap(segmentID uint32, fieldIndex in
 	result := bm.Clone()
 
 	// Trim to ledger range
+	trimStart := time.Now()
 	segmentStart := segmentID * SegmentSize
 	var startOff uint16
 	if startLedger > segmentStart {
@@ -461,6 +462,7 @@ func (r *RocksDBHotSegmentReader) LoadTermBitmap(segmentID uint32, fieldIndex in
 			}
 		}
 	}
+	stats.TrimTime = time.Since(trimStart)
 
 	stats.TotalTime = time.Since(totalStart)
 	if result.IsEmpty() {

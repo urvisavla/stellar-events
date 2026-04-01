@@ -84,7 +84,8 @@ type BitmapLoadStats struct {
 	BytesRead  int64
 	ReadTime   time.Duration // Hash lookup + mmap access + offset reads (I/O)
 	DecodeTime time.Duration // Bitmap decode (CPU)
-	TotalTime  time.Duration // Full LoadTermBitmap call including trim
+	TrimTime   time.Duration // Ledger range trim (narrowing bitmap to query range)
+	TotalTime  time.Duration // Full LoadTermBitmap call
 }
 
 // EventFetcher provides event blob retrieval from a storage backend.
@@ -947,8 +948,9 @@ func collectBitmaps(
 					continue
 				}
 				result.IndexBytesRead += stats.BytesRead
-				result.IndexReadTime += stats.TotalTime - stats.DecodeTime
+				result.IndexReadTime += stats.TotalTime - stats.DecodeTime - stats.TrimTime
 				result.IndexDecodeTime += stats.DecodeTime
+				result.IndexIntersectTime += stats.TrimTime
 				if bm != nil && !bm.IsEmpty() {
 					result.SegmentsScanned++
 					groups[0].bitmaps[segID] = append(groups[0].bitmaps[segID], bm)
@@ -975,8 +977,9 @@ func collectBitmaps(
 					continue
 				}
 				result.IndexBytesRead += stats.BytesRead
-				result.IndexReadTime += stats.TotalTime - stats.DecodeTime
+				result.IndexReadTime += stats.TotalTime - stats.DecodeTime - stats.TrimTime
 				result.IndexDecodeTime += stats.DecodeTime
+				result.IndexIntersectTime += stats.TrimTime
 				if bm != nil && !bm.IsEmpty() {
 					result.SegmentsScanned++
 					groups[groupIdx].bitmaps[segID] = append(groups[groupIdx].bitmaps[segID], bm)
@@ -1052,7 +1055,7 @@ func collectBitmaps(
 			result.MatchingLocalIDs += int(sr.bm.GetCardinality())
 		}
 	}
-	result.IndexIntersectTime = time.Since(intersectStart)
+	result.IndexIntersectTime += time.Since(intersectStart)
 	result.IndexLookupTime = time.Since(indexStart)
 
 	return perSegment, nil

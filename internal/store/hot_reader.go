@@ -364,6 +364,7 @@ func (r *HotSegmentReader) LoadTermBitmap(segmentID uint32, fieldIndex int, term
 	result := bm.Clone()
 
 	// Trim to ledger range
+	trimStart := time.Now()
 	segmentStart := segmentID * SegmentSize
 
 	var startOff uint16
@@ -387,6 +388,7 @@ func (r *HotSegmentReader) LoadTermBitmap(segmentID uint32, fieldIndex int, term
 			}
 		}
 	}
+	stats.TrimTime = time.Since(trimStart)
 
 	stats.TotalTime = time.Since(totalStart)
 	if result.IsEmpty() {

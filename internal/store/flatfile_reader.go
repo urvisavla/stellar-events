@@ -112,7 +112,9 @@ func (r *SegmentReader) LoadTermBitmap(segmentID uint32, fieldIndex int, termKey
 	}
 
 	// Trim to ledger range.
+	trimStart := time.Now()
 	bm = r.trimToLedgerRange(segmentID, bm, startLedger, endLedger)
+	stats.TrimTime = time.Since(trimStart)
 	stats.TotalTime = time.Since(totalStart)
 	if bm == nil || bm.IsEmpty() {
 		return nil, stats, nil
