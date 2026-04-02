@@ -106,6 +106,7 @@ func (w *SegmentDataWriter) StartChunk(chunkID uint32) error {
 	pw, err := packfile.Create(filepath.Join(dirPath, EventsFileName), packfile.WriterOptions{
 		RecordSize:   w.blockSize,
 		Format:       format,
+		Concurrency:  8,
 		BytesPerSync: 1 << 20,
 	})
 	if err != nil {

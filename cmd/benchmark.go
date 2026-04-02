@@ -88,17 +88,26 @@ type BenchmarkResult struct {
 	// Test config
 	Iterations int
 
-	// Timing (p50/p99 only)
-	P50Time            time.Duration
-	P99Time            time.Duration
-	P99IndexTime          time.Duration // P99 time for index lookup
-	P99IndexReadTime      time.Duration // P99 time reading index from storage (I/O)
-	P99IndexDecodeTime    time.Duration // P99 time decoding index (CPU)
-	P99IndexIntersectTime time.Duration // P99 time intersecting index results
-	P99EventTime          time.Duration // P99 time for event operations (total)
-	P99EventFetchTime  time.Duration // P99 time fetching events from storage (I/O)
-	P99EventDecodeTime time.Duration // P99 time decoding events (CPU)
-	P99EventFilterTime time.Duration // P99 time filtering events (CPU)
+	// Timing
+	P50Time                time.Duration
+	P99Time                time.Duration
+	P99IndexTime           time.Duration // P99 total index time
+	P99IndexLookupTime     time.Duration // P99 MPHF hash + slot lookup
+	P99IndexDecodeTime     time.Duration // P99 bitmap decode (FromBuffer)
+	P99IndexIntersectTime  time.Duration // P99 trim + AND/OR
+	P99EventTime           time.Duration // P99 total event time (fetch + decode)
+	P99EventFetchTime      time.Duration // P99 event I/O
+	P99EventDecodeTime     time.Duration // P99 event decode
+	P99EventFilterTime     time.Duration // P99 post-filter
+	AvgTime                time.Duration // Average total time
+	AvgIndexTime           time.Duration
+	AvgIndexLookupTime     time.Duration
+	AvgIndexDecodeTime     time.Duration
+	AvgIndexIntersectTime  time.Duration
+	AvgEventTime           time.Duration
+	AvgEventFetchTime      time.Duration
+	AvgEventDecodeTime     time.Duration
+	AvgEventFilterTime     time.Duration
 
 	// Index stats
 	SegmentsTouched   int   // Number of segments touched by the query
@@ -395,7 +404,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		}
 		defer logWriter.Close()
 		// Write CSV header
-		fmt.Fprintln(logWriter, "timestamp,query_name,datastore,events_returned,index_matches,segments_touched,index_bytes,event_bytes,groups_decompressed,p99_idx_read_ms,p99_idx_decode_ms,p99_idx_intersect_ms,p99_idx_ms,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,p99_total_ms,error")
+		fmt.Fprintln(logWriter, "timestamp,query_name,datastore,events_returned,index_matches,segments_touched,index_bytes,event_bytes,groups_decompressed,p99_idx_lookup_ms,p99_idx_decode_ms,p99_idx_intersect_ms,p99_idx_ms,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,p99_total_ms,avg_idx_lookup_ms,avg_idx_decode_ms,avg_idx_intersect_ms,avg_idx_ms,avg_evt_ms,avg_evt_fetch_ms,avg_evt_decode_ms,avg_evt_filter_ms,avg_total_ms,error")
 		logWriter.Sync()
 	}
 
@@ -421,7 +430,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 		defer outputWriter.Close()
 		// Write CSV header for results
 		if outputFileFormat == "csv" {
-			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,datastore,start_ledger,end_ledger,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
+			fmt.Fprintln(outputWriter, "query_name,contract_id,topic0,topic1,topic2,topic3,datastore,start_ledger,end_ledger,p50_total_ms,p99_total_ms,p99_idx_ms,idx_lookup_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
 			outputWriter.Sync()
 		}
 		fmt.Fprintf(os.Stderr, "Output file: %s (format: %s)\n", *outputFile, outputFileFormat)
@@ -506,7 +515,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 			// Log query result
 			if logWriter != nil {
 				errStr := result.Error
-				fmt.Fprintf(logWriter, "%s,%s,%s,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s\n",
+				fmt.Fprintf(logWriter, "%s,%s,%s,%d,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s\n",
 					time.Now().Format(time.RFC3339),
 					result.Query.Name,
 					result.Datastore,
@@ -516,7 +525,7 @@ func runBenchmark(cfg *config.Config, args []string) {
 					result.IndexBytes,
 					result.EventBytes,
 					result.GroupsDecompressed,
-					float64(result.P99IndexReadTime.Microseconds())/1000.0,
+					float64(result.P99IndexLookupTime.Microseconds())/1000.0,
 					float64(result.P99IndexDecodeTime.Microseconds())/1000.0,
 					float64(result.P99IndexIntersectTime.Microseconds())/1000.0,
 					float64(result.P99IndexTime.Microseconds())/1000.0,
@@ -525,6 +534,15 @@ func runBenchmark(cfg *config.Config, args []string) {
 					float64(result.P99EventDecodeTime.Microseconds())/1000.0,
 					float64(result.P99EventFilterTime.Microseconds())/1000.0,
 					float64(result.P99Time.Microseconds())/1000.0,
+					float64(result.AvgIndexLookupTime.Microseconds())/1000.0,
+					float64(result.AvgIndexDecodeTime.Microseconds())/1000.0,
+					float64(result.AvgIndexIntersectTime.Microseconds())/1000.0,
+					float64(result.AvgIndexTime.Microseconds())/1000.0,
+					float64(result.AvgEventTime.Microseconds())/1000.0,
+					float64(result.AvgEventFetchTime.Microseconds())/1000.0,
+					float64(result.AvgEventDecodeTime.Microseconds())/1000.0,
+					float64(result.AvgEventFilterTime.Microseconds())/1000.0,
+					float64(result.AvgTime.Microseconds())/1000.0,
 					errStr,
 				)
 				logWriter.Sync() // Flush to disk immediately
@@ -1151,7 +1169,7 @@ func runQueryBenchmark(eventStore *store.Store, data *BenchmarkData, spec QueryS
 	type iterationTiming struct {
 		total          time.Duration
 		index          time.Duration
-		indexRead      time.Duration
+		indexLookup      time.Duration
 		indexDecode    time.Duration
 		indexIntersect time.Duration
 		event          time.Duration
@@ -1239,7 +1257,7 @@ func runQueryBenchmark(eventStore *store.Store, data *BenchmarkData, spec QueryS
 
 		makeIterTiming := func(qr *QueryResult) iterationTiming {
 			return iterationTiming{
-				total: elapsed, index: qr.IndexTime, indexRead: qr.IndexReadTime, indexDecode: qr.IndexDecodeTime, indexIntersect: qr.IndexIntersectTime,
+				total: elapsed, index: qr.IndexTime, indexLookup: qr.IndexLookupTime, indexDecode: qr.IndexDecodeTime, indexIntersect: qr.IndexIntersectTime,
 				event: qr.EventTime, eventFetch: qr.EventFetchTime, eventDecode: qr.EventDecodeTime, eventFilter: qr.EventFilterTime,
 			}
 		}
@@ -1276,13 +1294,36 @@ func runQueryBenchmark(eventStore *store.Store, data *BenchmarkData, spec QueryS
 		p99Idx := int(float64(len(timings)) * 0.99)
 		result.P99Time = timings[p99Idx].total
 		result.P99IndexTime = timings[p99Idx].index
-		result.P99IndexReadTime = timings[p99Idx].indexRead
+		result.P99IndexLookupTime = timings[p99Idx].indexLookup
 		result.P99IndexDecodeTime = timings[p99Idx].indexDecode
 		result.P99IndexIntersectTime = timings[p99Idx].indexIntersect
 		result.P99EventTime = timings[p99Idx].event
 		result.P99EventFetchTime = timings[p99Idx].eventFetch
 		result.P99EventDecodeTime = timings[p99Idx].eventDecode
 		result.P99EventFilterTime = timings[p99Idx].eventFilter
+
+		// Average across all iterations
+		n := time.Duration(len(timings))
+		for _, t := range timings {
+			result.AvgTime += t.total
+			result.AvgIndexTime += t.index
+			result.AvgIndexLookupTime += t.indexLookup
+			result.AvgIndexDecodeTime += t.indexDecode
+			result.AvgIndexIntersectTime += t.indexIntersect
+			result.AvgEventTime += t.event
+			result.AvgEventFetchTime += t.eventFetch
+			result.AvgEventDecodeTime += t.eventDecode
+			result.AvgEventFilterTime += t.eventFilter
+		}
+		result.AvgTime /= n
+		result.AvgIndexTime /= n
+		result.AvgIndexLookupTime /= n
+		result.AvgIndexDecodeTime /= n
+		result.AvgIndexIntersectTime /= n
+		result.AvgEventTime /= n
+		result.AvgEventFetchTime /= n
+		result.AvgEventDecodeTime /= n
+		result.AvgEventFilterTime /= n
 	}
 
 	return result
@@ -1319,7 +1360,7 @@ type QueryResult struct {
 
 	// Index timing
 	IndexTime          time.Duration // Time spent on index operations (total)
-	IndexReadTime      time.Duration // Time spent reading index from storage (I/O)
+	IndexLookupTime      time.Duration // Time spent reading index from storage (I/O)
 	IndexDecodeTime    time.Duration // Time spent decoding index (CPU)
 	IndexIntersectTime time.Duration // Time spent intersecting index results
 
@@ -1351,7 +1392,7 @@ func executeQueryBenchmark(eventStore *store.Store, startLedger, endLedger uint3
 		EventBytes:          stats.EventBytesRead,
 		IndexMatches:        stats.MatchingLocalIDs,
 		IndexTime:           stats.IndexLookupTime,
-		IndexReadTime:       stats.IndexReadTime,
+		IndexLookupTime:       stats.IndexTermLookupTime,
 		IndexDecodeTime:     stats.IndexDecodeTime,
 		IndexIntersectTime:  stats.IndexIntersectTime,
 		EventTime:           stats.EventFetchTime + stats.DecodeTime,
@@ -1450,7 +1491,7 @@ func printSummaryStats(results []BenchmarkResult, datastores []string) {
 
 func outputCSV(results []BenchmarkResult) {
 	// Header: query | timing | index | event | test
-	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,datastore,p50_total_ms,p99_total_ms,p99_idx_ms,idx_read_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
+	fmt.Println("query_name,contract_id,topic0,topic1,topic2,topic3,datastore,p50_total_ms,p99_total_ms,p99_idx_ms,idx_lookup_ms,idx_decode_ms,idx_intersect_ms,segments_touched,index_matches,index_bytes,smallest_list,largest_list,p99_evt_ms,evt_fetch_ms,evt_decode_ms,evt_filter_ms,events_returned,events_scanned,event_bytes,groups_decompressed,iterations,error")
 
 	for _, r := range results {
 		contractID := strings.Join(r.Query.ContractIDs, "|")
@@ -1475,7 +1516,7 @@ func outputCSV(results []BenchmarkResult) {
 			float64(r.P50Time.Microseconds())/1000.0,
 			float64(r.P99Time.Microseconds())/1000.0,
 			float64(r.P99IndexTime.Microseconds())/1000.0,
-			float64(r.P99IndexReadTime.Microseconds())/1000.0,
+			float64(r.P99IndexLookupTime.Microseconds())/1000.0,
 			float64(r.P99IndexDecodeTime.Microseconds())/1000.0,
 			float64(r.P99IndexIntersectTime.Microseconds())/1000.0,
 			r.SegmentsTouched,
@@ -1511,7 +1552,7 @@ func outputJSON(results []BenchmarkResult) {
 
 		// Index stats
 		P99IndexMs       float64 `json:"p99_idx_ms"`
-		IdxReadMs        float64 `json:"idx_read_ms"`
+		IdxLookupMs        float64 `json:"idx_lookup_ms"`
 		IdxDecodeMs      float64 `json:"idx_decode_ms"`
 		IdxIntersectMs   float64 `json:"idx_intersect_ms"`
 		SegmentsTouched   int     `json:"segments_touched"`
@@ -1545,7 +1586,7 @@ func outputJSON(results []BenchmarkResult) {
 			P50Ms:            float64(r.P50Time.Microseconds()) / 1000.0,
 			P99Ms:            float64(r.P99Time.Microseconds()) / 1000.0,
 			P99IndexMs:       float64(r.P99IndexTime.Microseconds()) / 1000.0,
-			IdxReadMs:        float64(r.P99IndexReadTime.Microseconds()) / 1000.0,
+			IdxLookupMs:        float64(r.P99IndexLookupTime.Microseconds()) / 1000.0,
 			IdxDecodeMs:      float64(r.P99IndexDecodeTime.Microseconds()) / 1000.0,
 			IdxIntersectMs:   float64(r.P99IndexIntersectTime.Microseconds()) / 1000.0,
 			SegmentsTouched:   r.SegmentsTouched,
@@ -1590,7 +1631,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 
 			// Index stats
 			P99IndexMs       float64 `json:"p99_idx_ms"`
-			IdxReadMs        float64 `json:"idx_read_ms"`
+			IdxLookupMs        float64 `json:"idx_lookup_ms"`
 			IdxDecodeMs      float64 `json:"idx_decode_ms"`
 			IdxIntersectMs   float64 `json:"idx_intersect_ms"`
 			SegmentsTouched   int     `json:"segments_touched"`
@@ -1622,7 +1663,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			P50Ms:            float64(r.P50Time.Microseconds()) / 1000.0,
 			P99Ms:            float64(r.P99Time.Microseconds()) / 1000.0,
 			P99IndexMs:       float64(r.P99IndexTime.Microseconds()) / 1000.0,
-			IdxReadMs:        float64(r.P99IndexReadTime.Microseconds()) / 1000.0,
+			IdxLookupMs:        float64(r.P99IndexLookupTime.Microseconds()) / 1000.0,
 			IdxDecodeMs:      float64(r.P99IndexDecodeTime.Microseconds()) / 1000.0,
 			IdxIntersectMs:   float64(r.P99IndexIntersectTime.Microseconds()) / 1000.0,
 			SegmentsTouched:   r.SegmentsTouched,
@@ -1667,7 +1708,7 @@ func writeResultIncremental(w *os.File, r BenchmarkResult, format string) {
 			float64(r.P50Time.Microseconds())/1000.0,
 			float64(r.P99Time.Microseconds())/1000.0,
 			float64(r.P99IndexTime.Microseconds())/1000.0,
-			float64(r.P99IndexReadTime.Microseconds())/1000.0,
+			float64(r.P99IndexLookupTime.Microseconds())/1000.0,
 			float64(r.P99IndexDecodeTime.Microseconds())/1000.0,
 			float64(r.P99IndexIntersectTime.Microseconds())/1000.0,
 			r.SegmentsTouched,

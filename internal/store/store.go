@@ -153,7 +153,7 @@ type QueryResult struct {
 
 	// Timing breakdown
 	IndexLookupTime    time.Duration // Total wall-clock time for index operations (read + decode + intersect + overhead)
-	IndexReadTime      time.Duration // Time per-term: hash lookup, mmap access, I/O, trim (everything except decode)
+	IndexTermLookupTime      time.Duration // Time per-term: hash lookup, mmap access, I/O, trim (everything except decode)
 	IndexDecodeTime    time.Duration // Time decoding bitmaps (CPU - near zero with FromBuffer)
 	IndexIntersectTime time.Duration // Time spent on bitmap OR/AND operations
 	EventFetchTime     time.Duration // Time fetching events
@@ -948,7 +948,7 @@ func collectBitmaps(
 					continue
 				}
 				result.IndexBytesRead += stats.BytesRead
-				result.IndexReadTime += stats.TotalTime - stats.DecodeTime - stats.TrimTime
+				result.IndexTermLookupTime += stats.TotalTime - stats.DecodeTime - stats.TrimTime
 				result.IndexDecodeTime += stats.DecodeTime
 				result.IndexIntersectTime += stats.TrimTime
 				if bm != nil && !bm.IsEmpty() {
@@ -977,7 +977,7 @@ func collectBitmaps(
 					continue
 				}
 				result.IndexBytesRead += stats.BytesRead
-				result.IndexReadTime += stats.TotalTime - stats.DecodeTime - stats.TrimTime
+				result.IndexTermLookupTime += stats.TotalTime - stats.DecodeTime - stats.TrimTime
 				result.IndexDecodeTime += stats.DecodeTime
 				result.IndexIntersectTime += stats.TrimTime
 				if bm != nil && !bm.IsEmpty() {
