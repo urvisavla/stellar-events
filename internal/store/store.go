@@ -410,8 +410,9 @@ type Store struct {
 	lastLedgerSeq  uint32
 
 	// Timing accumulators (ingest vs freeze)
-	TotalIngestTime time.Duration // Time spent in StoreEvents (event write + bitmap)
-	TotalFreezeTime time.Duration // Time spent in finalizeCompletedSegment
+	TotalIngestTime  time.Duration // Time spent in StoreEvents (event write + bitmap)
+	TotalFreezeTime  time.Duration // Time spent in finalizeCompletedSegment
+	StoreEventsCalls int           // Number of StoreEvents calls (for debugging)
 
 	// Collected segment metrics
 	segmentMetrics []progress.SegmentStats
@@ -535,6 +536,7 @@ func (es *Store) IndexStore() *IndexStore {
 func (es *Store) StoreEvents(events []*event.IngestEvent, opts *StoreOptions) (int64, error) {
 	ingestStart := time.Now()
 	freezeBefore := es.TotalFreezeTime
+	es.StoreEventsCalls++
 	defer func() {
 		freezeDelta := es.TotalFreezeTime - freezeBefore
 		es.TotalIngestTime += time.Since(ingestStart) - freezeDelta

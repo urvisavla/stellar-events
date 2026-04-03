@@ -260,7 +260,7 @@ func cmdBackfill(cfg *config.Config, startLedger, endLedger uint32) {
 	}
 
 	summary.WriteString(fmt.Sprintf("\nWrite Breakdown:\n"))
-	summary.WriteString(fmt.Sprintf("  Ingest (encode+bitmap):  %s\n", formatElapsed(ingestTime)))
+	summary.WriteString(fmt.Sprintf("  Ingest (encode+bitmap):  %s  (%d StoreEvents calls)\n", formatElapsed(ingestTime), eventStore.StoreEventsCalls))
 	summary.WriteString(fmt.Sprintf("  Freeze (index+pack):     %s\n", formatElapsed(freezeTime)))
 	if ingestTime > 0 {
 		ingestEventsPerSec := float64(totalEvents) / ingestTime.Seconds()

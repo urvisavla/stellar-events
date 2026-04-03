@@ -160,6 +160,49 @@ Measured with flat file hot writer on mainnet data (ledgers 59M-60M). Numbers ar
 | Query API (cold) | eventstore.Reader | eventstore.Reader | eventstore.Reader |
 | Crash recovery | Manual truncation | RocksDB WAL | Packfile Checkpoint (caller-persisted) |
 
+### Query performance
+
+Measured on cold cache, single segment (~9M events), MPHF index. Numbers are indicative; absolute values will change with the final storage design.
+
+**Index lookup (cold cache, single segment, MPHF):**
+
+Single-term:
+
+| Index bytes | idx_lookup (MPHF) | idx_decode (bitmap load) | idx_intersect (trim + AND/OR) | p99_idx |
+|---|---|---|---|---|
+| 1.10 MB | 2.9ms | 0.3ms | 1.7ms | 4.9ms |
+| 1.01 MB | 1.7ms | 1.8ms | 0.7ms | 4.3ms |
+| 648 KB | 1.5ms | 1.4ms | 0.8ms | 3.8ms |
+| 39 KB | 1.7ms | 0.0ms | 0.1ms | 1.8ms |
+| 474 B | 1.7ms | 0.0ms | 0.0ms | 1.8ms |
+
+Multi-term:
+
+| Terms | Operation | Index bytes | idx_lookup | idx_decode | idx_intersect | p99_idx |
+|---|---|---|---|---|---|---|
+| 2 | OR | 706 KB | 2.5ms | 1.6ms | 5.4ms | 9.5ms |
+| 2 | OR | 39 KB | 2.3ms | 0.1ms | 0.1ms | 2.5ms |
+| 3 | AND | 1.77 MB | 2.5ms | 1.9ms | 4.3ms | 8.7ms |
+| 3 | AND | 2.81 MB | 2.8ms | 3.6ms | 4.8ms | 11.3ms |
+| 15 | 5-field AND (3 per field) | 7.59 MB | 9.8ms | 9.4ms | 33.7ms | 52.9ms |
+
+**Event fetch (cold cache, single segment, limit=1000):**
+
+| Groups decompressed | Avg event size | evt_fetch | evt_decode | p99_evt |
+|---|---|---|---|---|
+| 12-17 (dense) | 175-291 bytes | 1.3-2.6ms | 4.3-6.4ms | 5.8-8.3ms |
+| 45-97 (moderate) | 245-298 bytes | 1.3-4.5ms | 5.2-6.8ms | 6.9-10.8ms |
+| 178-322 (sparse) | 262-301 bytes | 4.1-7.4ms | 6.0-7.3ms | 11.0-14.7ms |
+| 489-805 (very sparse) | 300-421 bytes | 11.8-19.1ms | 6.3-8.8ms | 19.9-26.0ms |
+| 998 (worst) | 179 bytes | 27.1ms | 3.9ms | 31.0ms |
+
+Notes:
+- `idx_lookup` has a ~1.7ms constant cost (MPHF hash + slot resolution). Does not scale with bitmap size.
+- `idx_decode` scales with bitmap size (page faults on mmap'd bitmap data). Near-zero for small bitmaps.
+- `idx_intersect` includes ledger range trim + FastOr/FastAnd. Sub-millisecond for single terms, scales with term count for multi-term AND.
+- `evt_fetch` scales linearly with groups decompressed (~0.03ms per group).
+- `evt_decode` is constant per event size (~4-9ms for 1000 events), independent of fetch pattern.
+
 ### Implementation status
 
 `LiveHotSegmentWriter` and `LiveHotSegmentReader` are implemented and functional. Selectable via `hot_writer = "live"` in `config.toml`. Flat file and RocksDB paths remain available as `hot_writer = "flatfile"` and `hot_writer = "rocksdb"`.
