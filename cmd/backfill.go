@@ -245,6 +245,9 @@ func cmdBackfill(cfg *config.Config, startLedger, endLedger uint32) {
 		summary.WriteString(fmt.Sprintf("  Avg events/sec:          %.0f\n", eventsPerSec))
 	}
 
+	ingestTime := eventStore.TotalIngestTime
+	freezeTime := eventStore.TotalFreezeTime
+
 	totalWorkerTime := diskReadTime + decompressTime + unmarshalTime + writeTime
 	summary.WriteString("\n")
 	summary.WriteString("Backfill Time Breakdown:\n")
@@ -254,6 +257,22 @@ func cmdBackfill(cfg *config.Config, startLedger, endLedger uint32) {
 		summary.WriteString(fmt.Sprintf("  Decompress (zstd):       %s (%.1f%%)\n", formatElapsed(decompressTime), float64(decompressTime)/float64(totalWorkerTime)*100))
 		summary.WriteString(fmt.Sprintf("  XDR unmarshal:           %s (%.1f%%)\n", formatElapsed(unmarshalTime), float64(unmarshalTime)/float64(totalWorkerTime)*100))
 		summary.WriteString(fmt.Sprintf("  Write (store):           %s (%.1f%%)\n", formatElapsed(writeTime), float64(writeTime)/float64(totalWorkerTime)*100))
+	}
+
+	summary.WriteString(fmt.Sprintf("\nWrite Breakdown:\n"))
+	summary.WriteString(fmt.Sprintf("  Ingest (encode+bitmap):  %s\n", formatElapsed(ingestTime)))
+	summary.WriteString(fmt.Sprintf("  Freeze (index+pack):     %s\n", formatElapsed(freezeTime)))
+	if ingestTime > 0 {
+		ingestEventsPerSec := float64(totalEvents) / ingestTime.Seconds()
+		summary.WriteString(fmt.Sprintf("  Ingest throughput:       %.0f events/sec\n", ingestEventsPerSec))
+	}
+
+	if ledgerCount > 0 && ingestTime > 0 {
+		avgIngestPerLedger := ingestTime / time.Duration(ledgerCount)
+		avgEventsPerLedger := float64(totalEvents) / float64(ledgerCount)
+		summary.WriteString(fmt.Sprintf("\nAvg Per-Ledger:\n"))
+		summary.WriteString(fmt.Sprintf("  Avg ingest time/ledger:  %v\n", avgIngestPerLedger))
+		summary.WriteString(fmt.Sprintf("  Avg events/ledger:       %.0f\n", avgEventsPerLedger))
 	}
 
 	summary.WriteString("\n")

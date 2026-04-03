@@ -409,6 +409,10 @@ type Store struct {
 	segEventBytes  int64
 	lastLedgerSeq  uint32
 
+	// Timing accumulators (ingest vs freeze)
+	TotalIngestTime time.Duration // Time spent in StoreEvents (event write + bitmap)
+	TotalFreezeTime time.Duration // Time spent in finalizeCompletedSegment
+
 	// Collected segment metrics
 	segmentMetrics []progress.SegmentStats
 }
@@ -529,6 +533,13 @@ func (es *Store) IndexStore() *IndexStore {
 // Automatically finalizes completed segments when a segment boundary is crossed.
 // Returns the number of bytes written.
 func (es *Store) StoreEvents(events []*event.IngestEvent, opts *StoreOptions) (int64, error) {
+	ingestStart := time.Now()
+	freezeBefore := es.TotalFreezeTime
+	defer func() {
+		freezeDelta := es.TotalFreezeTime - freezeBefore
+		es.TotalIngestTime += time.Since(ingestStart) - freezeDelta
+	}()
+
 	var totalBytes int64
 
 	if opts == nil {
@@ -548,9 +559,11 @@ func (es *Store) StoreEvents(events []*event.IngestEvent, opts *StoreOptions) (i
 
 			// Auto-finalize completed segment on boundary crossing.
 			if es.hasLastSegment && segmentID != es.lastSegmentID {
+				freezeStart := time.Now()
 				if err := es.finalizeCompletedSegment(es.lastSegmentID); err != nil {
 					return 0, fmt.Errorf("failed to finalize segment %d: %w", es.lastSegmentID, err)
 				}
+				es.TotalFreezeTime += time.Since(freezeStart)
 				// Reset per-segment accumulators for the new segment
 				es.segStartTime = time.Now()
 				es.segEvents = 0
@@ -597,8 +610,7 @@ func (es *Store) StoreEvents(events []*event.IngestEvent, opts *StoreOptions) (i
 						return 0, fmt.Errorf("failed to start segment data chunk %d: %w", segmentID, err)
 					}
 				}
-				v4Data := event.EncodeBinaryEvent(ev)
-				if err := es.segmentDataWriter.AppendEvent(denseLocalID, v4Data); err != nil {
+				if err := es.segmentDataWriter.AppendEvent(denseLocalID, value); err != nil {
 					return 0, fmt.Errorf("failed to append event to file store: %w", err)
 				}
 			}
